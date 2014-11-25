@@ -21,12 +21,16 @@ BUILT_MODULE_LOCATION[4]="xc-v4v"
 BUILT_MODULE_NAME[5]="xc-audio"
 BUILT_MODULE_LOCATION[5]="xc-audio"
 
+BUILT_MODULE_NAME[6]="xc-vusb"
+BUILT_MODULE_LOCATION[6]="xc-vusb"
+
 DEST_MODULE_LOCATION[0]="/kernel/driver/xen"
 DEST_MODULE_LOCATION[1]="/kernel/driver/xen"
 DEST_MODULE_LOCATION[2]="/kernel/driver/xen"
 DEST_MODULE_LOCATION[3]="/kernel/driver/xen"
 DEST_MODULE_LOCATION[4]="/kernel/driver/xen"
 DEST_MODULE_LOCATION[5]="/kernel/driver/xen"
+DEST_MODULE_LOCATION[6]="/kernel/driver/xen"
 
 REMAKE_INITRD="yes"
 AUTOINSTALL="yes"
