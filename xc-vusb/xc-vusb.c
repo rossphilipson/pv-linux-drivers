@@ -44,25 +44,24 @@
 #include <linux/aio.h>
 #endif
 
+/* TODO looks like we use some old HCD interface, update */
 #if ( LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,35) || (defined(RHEL_RELEASE_CODE)) )
 #include <linux/usb/hcd.h>
 #else
 #include <linux/old-core-hcd.h>
 #endif
 
-#include <linux/v4v_dev.h>
-
 #define VUSB_MAX_PACKET_SIZE 1024*256
 
-#define DRIVER_DESC	"OpenXT USB Host Controller"
+#define DRIVER_DESC	"OpenXT Virtual USB Host Controller"
 #define DRIVER_VERSION  "1.0.0"
 
 #define POWER_BUDGET	5000 /* mA */
 
-#define D_V4V1 (1 << 0)
-#define D_V4V2 (1 << 1)
-#define D_URB1 (1 << 2)
-#define D_URB2 (1 << 3)
+#define D_VUSB1 (1 << 0)
+#define D_VUSB2 (1 << 1)
+#define D_URB1  (1 << 2)
+#define D_URB2  (1 << 3)
 #define D_STATE (1 << 4)
 #define D_PORT1 (1 << 5)
 #define D_PORT2 (1 << 6)
@@ -73,8 +72,7 @@
 
 #define DEBUGMASK (D_STATE | D_PORT1 | D_URB1 | D_PM)
 
-// Enable debug
-// #define VUSB_DEBUG
+/* #define VUSB_DEBUG */
 
 #ifdef VUSB_DEBUG
 #  define dprintk(mask, args...)					\
@@ -113,12 +111,9 @@
 #define VUSB_URB_SHORT_OK          0x0002
 #define VUSB_URB_ISO_TRANSFER_ASAP 0x0004
 
-/* V4V port and domid used to connect to vusb daemon */
-#define VUSB_V4V_PORT 3136200
-#define VUSB_V4V_DOMID 0
-
-static const char	driver_name [] = "vusb_hcd";
-static const char	driver_desc [] = DRIVER_DESC;
+/* TODO use different names for HCD and platform drivers? */
+static const char driver_name [] = "vusb_hcd";
+static const char driver_desc [] = DRIVER_DESC;
 
 /* Port are numbered from 1 in linux */
 #define vusb_device_by_port(v, port) (&(v)->device[(port) - 1])
@@ -131,14 +126,6 @@ do {								\
 	}							\
 } while (0)
 
-/* USB HCD */
-
-enum vusb_rh_state {
-	VUSB_RH_RESET,
-	VUSB_RH_SUSPENDED,
-	VUSB_RH_RUNNING
-};
-
 /* Possible state of an urbp */
 enum vusb_urbp_state {
 	VUSB_URBP_NEW,
@@ -148,6 +135,7 @@ enum vusb_urbp_state {
 	VUSB_URBP_CANCEL,
 };
 
+/* URB tracking structure */
 struct urbp {
 	struct urb		*urb;
 	enum vusb_urbp_state	state;
@@ -156,21 +144,29 @@ struct urbp {
 	int                     port;
 };
 
+/* Virtual USB device on of the RH ports */
 struct vusb_device {
-	unsigned              present:1;
-	unsigned              reset:2;
-	u16                   deviceid;
-	u32                   port_status;
+	unsigned		present:1;
+	unsigned		reset:2;
+	u16			deviceid;
+	u32			port_status;
 	/* TODO: is it usefull? It's only set during SetAddress control command and never used */
-	u16                   address;
+	u16			address;
 	/**
 	 * Use only for debugging. It's use full to know the index of the
 	 * structure in device
 	 * */
-	u16					  port;
+	u16			port;
 
-	enum usb_device_speed speed;
-	struct usb_device     *udev;
+	enum usb_device_speed	speed;
+	struct usb_device	*udev;
+};
+
+/* Virtual USB HCD/RH pieces */
+enum vusb_rh_state {
+	VUSB_RH_RESET,
+	VUSB_RH_SUSPENDED,
+	VUSB_RH_RUNNING
 };
 
 enum vusb_state {
@@ -196,11 +192,9 @@ struct vusb {
 	unsigned long			re_timeout;
 	struct list_head                urbp_list;
 	u16                   		urb_handle;
-	/* File operation for the v4v connection */
-	struct file 			*fp;
 	/* Main thread */
 	struct task_struct 		*kthread;
-	enum vusb_state		state;
+	enum vusb_state			state;
 };
 
 static struct platform_device *the_vusb_hcd_pdev;
@@ -208,8 +202,6 @@ static struct platform_device *the_vusb_hcd_pdev;
 static u8 *pbuf = NULL;
 
 /* Forward declarations */
-static int vusb_open(struct vusb *v);
-static void vusb_close(struct vusb *v);
 static int vusb_threadfunc(void *data);
 static void vusb_urbp_release(struct vusb *v,
 			struct vusb_device *dev,
@@ -222,13 +214,13 @@ hcd_to_vusb(struct usb_hcd *hcd)
 }
 
 static inline struct usb_hcd*
-vusb_to_hcd (struct vusb *v)
+vusb_to_hcd(struct vusb *v)
 {
 	return container_of((void *) v, struct usb_hcd, hcd_priv);
 }
 
 static inline struct device*
-vusb_dev (struct vusb *v)
+vusb_dev(struct vusb *v)
 {
 	return vusb_to_hcd(v)->self.controller;
 }
@@ -286,7 +278,7 @@ vusb_state_to_string(const struct urbp *urbp)
 	case VUSB_URBP_CANCEL:
 		return "CANCEL";
 	default:
-		return "unknow";
+		return "unknown";
 	}
 }
 
@@ -309,24 +301,18 @@ vusb_worker_start(struct vusb *v)
 
 	v->rh_state = VUSB_INACTIVE;
 
-	/* Open v4v connection */
-	ret = vusb_open(v);
-	if (ret != 0)
-		goto err_conn;
+	/* TODO Opened v4v connection here - the vusb devices will do this for their rings*/
 
 	/* Create the main thread */
 	v->kthread = kthread_run(vusb_threadfunc, v, "vusb");
 	if (IS_ERR(v->kthread)) {
 		ret = PTR_ERR(v->kthread);
 		eprintk("unable to start the thread: %d", ret);
-		vusb_close(v);
-		goto err_thread;
+		goto err;
 	}
 
 	return 0;
-err_thread:
-	vusb_close(v);
-err_conn:
+err:
 	return ret;
 }
 
@@ -340,8 +326,6 @@ vusb_worker_cleanup(struct vusb *v)
 	unsigned long flags;
 
 	dprintk(D_PM, "Clean up the worker\n");
-
-	vusb_close(v);
 
 	spin_lock_irqsave(&v->lock, flags);
 	v->rh_state = VUSB_INACTIVE;
@@ -436,7 +420,7 @@ static inline u16 usb_speed_to_port_stat(enum usb_device_speed speed)
 }
 
 static void
-set_link_state (struct vusb *v, struct vusb_device *dev)
+set_link_state(struct vusb *v, struct vusb_device *dev)
 {
 	u32 newstatus, diff;
 
@@ -557,7 +541,7 @@ clear_port_feature(struct vusb *v, struct vusb_device *dev, u16 val)
 
 /* HCD start */
 static int
-vusb_start (struct usb_hcd *hcd)
+vusb_start(struct usb_hcd *hcd)
 {
 	struct vusb *v = hcd_to_vusb(hcd);
 
@@ -577,7 +561,7 @@ vusb_start (struct usb_hcd *hcd)
 }
 
 /* HCD stop */
-static void vusb_stop (struct usb_hcd *hcd)
+static void vusb_stop(struct usb_hcd *hcd)
 {
 	struct vusb		*v;
 
@@ -585,13 +569,13 @@ static void vusb_stop (struct usb_hcd *hcd)
 
 	dprintk(D_MISC, ">vusb_stop\n");
 
-	v = hcd_to_vusb (hcd);
+	v = hcd_to_vusb(hcd);
 
 	hcd->state = HC_STATE_HALT;
 	/* TODO: remove all URBs */
 
 	//device_remove_file (dummy_dev(dum), &dev_attr_urbs);
-	dev_info (vusb_dev(v), "stopped\n");
+	dev_info(vusb_dev(v), "stopped\n");
 	dprintk(D_MISC, "<vusb_stop\n");
 }
 
@@ -614,7 +598,7 @@ vusb_get_urb_handle(struct vusb *v)
  */
 static void
 vusb_urbp_release(struct vusb *v, struct vusb_device *dev,
-		struct urbp *urbp)
+		  struct urbp *urbp)
 {
 	struct urb *urb = urbp->urb;
 
@@ -661,12 +645,12 @@ vusb_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 
 	dprintk(D_MISC, ">vusb_urb_enqueue\n");
 
-	v = hcd_to_vusb (hcd);
+	v = hcd_to_vusb(hcd);
 
 	if (!urb->transfer_buffer && urb->transfer_buffer_length)
 		return -EINVAL;
 
-	urbp = kmalloc (sizeof *urbp, mem_flags);
+	urbp = kmalloc(sizeof *urbp, mem_flags);
 	if (!urbp)
 		return -ENOMEM;
 
@@ -674,7 +658,7 @@ vusb_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	/* Port numbered from 1 */
 	urbp->port = urb->dev->portnum;
 	urbp->urb = urb;
-	spin_lock_irqsave (&v->lock, flags);
+	spin_lock_irqsave(&v->lock, flags);
 	dev = vusb_device_by_port(v, urbp->port);
 	/* Allocate a handle */
 	urbp->handle = vusb_get_urb_handle(v);
@@ -696,7 +680,7 @@ vusb_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	vusb_worker_notify(v);
 
 done:
-	spin_unlock_irqrestore (&v->lock, flags);
+	spin_unlock_irqrestore(&v->lock, flags);
 
 	return r;
 }
@@ -710,9 +694,9 @@ vusb_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 	struct urbp *urbp;
 
 	dprintk(D_MISC, "*vusb_urb_dequeue\n");
-	v = hcd_to_vusb (hcd);
+	v = hcd_to_vusb(hcd);
 
-	spin_lock_irqsave (&v->lock, flags);
+	spin_lock_irqsave(&v->lock, flags);
 
 	rc = usb_hcd_check_unlink_urb(hcd, urb, status);
 
@@ -734,7 +718,7 @@ vusb_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 		wprintk("Try do dequeue an unhandle URB\n");
 
 out_dequeue:
-	spin_unlock_irqrestore (&v->lock, flags);
+	spin_unlock_irqrestore(&v->lock, flags);
 
 	return rc;
 }
@@ -745,7 +729,7 @@ vusb_get_frame(struct usb_hcd *hcd)
 	struct timeval	tv;
 
 	dprintk(D_MISC, "*vusb_get_frame\n");
-	do_gettimeofday (&tv);
+	do_gettimeofday(&tv);
 
 	return tv.tv_usec / 1000;
 }
@@ -851,8 +835,8 @@ vusb_hub_descriptor(struct usb_hub_descriptor *desc)
 }
 
 static int
-vusb_hub_control(struct usb_hcd *hcd, u16	typeReq, u16 wValue,
-				   u16	wIndex, char *buf, u16	wLength)
+vusb_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
+		u16 wIndex, char *buf, u16 wLength)
 {
 	struct vusb *v;
 	int	retval = 0;
@@ -965,7 +949,7 @@ static const struct hc_driver vusb_hcd = {
 
 	.flags = HCD_USB2,
 
-//	.reset = vusb_setup,
+	/* TODO removed ? .reset = vusb_setup,*/
 	.start = vusb_start,
 	.stop =	vusb_stop,
 
@@ -982,103 +966,28 @@ static const struct hc_driver vusb_hcd = {
 #endif /* CONFIG_PM */
 };
 
-#define CHECK_OPS(v, opname)				\
-	do {						\
-		if (!(v)->fp->f_op->opname) {		\
-			eprintk("missing "#opname"\n");	\
-			r = -EBADF;			\
-			goto err;			\
-		}					\
-	} while (0)
-
-/* Create a v4v socket */
-static int
-vusb_open(struct vusb *v)
-{
-	int r;
-	v4v_addr_t v4v_addr;
-	mm_segment_t oldfs;
-
-	/* Use kernel address-space to avoid -EFAULT during address checking */
-	oldfs = get_fs();
-	set_fs(get_ds());
-
-	/* TODO: create a special V4V API for linux module */
-	v->fp = filp_open("/dev/v4v_stream", FMODE_READ | FMODE_WRITE, 0);
-	if (IS_ERR(v->fp)) {
-		r = PTR_ERR(v->fp);
-		eprintk("could not open /dev/v4v_stream: %d\n", r);
-		return r;
-	}
-
-	/* Sanity check on file operations */
-	CHECK_OPS(v, unlocked_ioctl);
-	CHECK_OPS(v, write);
-	CHECK_OPS(v, read);
-
-	v4v_addr.port = VUSB_V4V_PORT;
-	v4v_addr.domain = VUSB_V4V_DOMID;
-
-	r = v->fp->f_op->unlocked_ioctl(v->fp, V4VIOCCONNECT,
-			(unsigned long)&v4v_addr);
-	if (r < 0) {
-		eprintk("ioctl(V4VIOCCONNECT) failed: %d\n", r);
-		goto err;
-	}
-
-	dprintk(D_V4V1, "connection succeeded\n");
-
-	/* Restore the previous address-space */
-	set_fs(oldfs);
-
-	return 0;
-
-err:
-	filp_close(v->fp, NULL);
-
-	/* Restore the previous address-space */
-	set_fs(oldfs);
-
-	return r;
-}
-
-#undef CHECK_OPS
-
-/* Close v4v socket */
-static void
-vusb_close(struct vusb *v)
-{
-	iprintk("V4V close\n");
-	filp_close(v->fp, NULL);
-}
-
-/* Write on v4v socket. FIXME not signal safe */
 static int
 vusb_write(struct vusb *v, const void *buf, u32 len)
 {
-	int r;
+	dprintk(D_VUSB2, "vusb_write %d\n", len);
 
-	dprintk(D_V4V2, "v4v_write %d\n", len);
+	/* TODO maybe reuse this write routine r = v->fp->f_op->write(v->fp, buf, len, NULL);*/
 
-	r = v->fp->f_op->write(v->fp, buf, len, NULL);
+	dprintk(D_VUSB2, "write returned %d\n", r);
 
-	dprintk(D_V4V2, "write returned %d\n", r);
-
-	return r;
+	return 0;
 }
 
 static int
 vusb_read(struct vusb *v, void *buf, u32 len)
 {
-	int r;
+	dprintk(D_VUSB2, "vusb_read %d\n", len);
 
-	dprintk(D_V4V2, "v4v_read %d\n", len);
+	/* TODO maybe reuse this read routine r = v->fp->f_op->read(v->fp, buf, len, 0L);*/
 
-	r = v->fp->f_op->read(v->fp, buf, len, 0L);
+	dprintk(D_VUSB2, "read returned %d\n", r);
 
-	dprintk(D_V4V2, "read returned %d\n", r);
-
-	return r;
+	return 0;
 }
 
 /**
@@ -1099,39 +1008,14 @@ vusb_initialize_packet(struct vusb *v, void *packet, u16 devid,
 
 /*
  * Send a request to the host
- * A packet is describe as multiple iovec
- * TODO: Need to be implement in v4v
+ * A packet is describe as multiple vectors
  */
 static int
 vusb_send_packet(struct vusb *v, const struct iovec *iovec, size_t niov)
 {
-	int r, s;
-	size_t i;
+	/* TODO this was a r = vusb_write(v, iovec[i].iov_base, iovec[i].iov_len);*/
 
-	r = 0;
-	s = 0;
-
-	for (i = 0; i < niov; i++) {
-		/* TODO: Add branch prediction */
-		if (!iovec[i].iov_base || !iovec[i].iov_len)
-			continue;
-		dprint_hex_dump(D_URB2, "UC: ", DUMP_PREFIX_OFFSET, 16, 1,
-				iovec[i].iov_base, iovec[i].iov_len, true);
-		/* TODO: good check of return (-EINTR, no all data copied...) */
-		r = vusb_write(v, iovec[i].iov_base, iovec[i].iov_len);
-		if (r < 0)
-			goto err_send;
-		s += r;
-	}
-
-	dprintk(D_MISC, "Send return %d\n", s);
-
-	return r;
-
-err_send:
-	dprintk(D_MISC, "Send return %d\n", r);
-
-	return r;
+	return 0;
 }
 
 static int
@@ -1142,6 +1026,7 @@ vusb_add_device(struct vusb *v, u16 id, enum usb_device_speed speed)
 	unsigned long flags;
 	struct vusb_device *dev;
 
+	/* TODO this is where the xenbus devices will be hooked up */
 	spin_lock_irqsave (&v->lock, flags);
 	for (i = 0; i < VUSB_PORTS; i++) {
 		if (v->device[i].present == 0)
@@ -1197,51 +1082,6 @@ out:
 
 #define vusb_set_packet_data(packet, data, dlen)		\
 	vusb_iov_set(packet, 1, data, dlen)
-
-/*
- * Send a bind request
- * Ask the host to open a connection
- * return 0 if the packet was sent
- */
-static int
-vusb_send_bind_request(struct vusb *v)
-{
-	vusb_create_packet(iovec, 1);
-	int r;
-
-	/* STUB setup bind packet */
-
-	r = vusb_send_packet(v, iovec, 1);
-
-	if (r >= 0) { /* Wait the host answer */
-		v->state = VUSB_WAIT_BIND_RESPONSE;
-		r = 0;
-	}
-
-	return r;
-}
-
-/*
- * Send a bind commit
- * Like TCP notify the host we received the ACK
- */
-static int
-vusb_send_bind_commit(struct vusb *v)
-{
-	vusb_create_packet(iovec, 1);
-	int r;
-
-	/* STUB setup bind commit packet to ACK */
-
-	r = vusb_send_packet(v, iovec, 1);
-
-	if (r >= 0) { /* The thread can now run */
-		v->state = VUSB_RUNNING;
-		r = 0;
-	}
-
-	return r;
-}
 
 /**
  * A new device is attached to the guest
@@ -1562,7 +1402,7 @@ vusb_handle_urb_response(struct vusb *v, const void *packet)
 
 	/* STUB sanity check and get response values */
 
-	spin_lock_irqsave (&v->lock, flags);
+	spin_lock_irqsave(&v->lock, flags);
 
 	dev = vusb_device_by_devid(v, 0 /* STUB logical device ID */);
 	if (!dev) {
@@ -1586,7 +1426,7 @@ vusb_handle_urb_status(struct vusb *v, const void *packet)
 
 	/* STUB sanity check and get status values */
 
-	spin_lock_irqsave (&v->lock, flags);
+	spin_lock_irqsave(&v->lock, flags);
 
 	dev = vusb_device_by_devid(v, 0 /* STUB logical device ID */);
 	if (!dev) {
@@ -1610,7 +1450,7 @@ vusb_process_packet(struct vusb *v, const void *packet)
 	case VUSB_WAIT_BIND_RESPONSE:
 		iprintk("Wait bind response send it\n");
 
-		res = vusb_send_bind_commit(v);
+		/* TODO this is all v4v stuffs, fix res = vusb_send_bind_commit(v);*/
 		if (res != 0) {
 			eprintk("Failed to send bind commit command\n");
 			return res;
@@ -2058,73 +1898,10 @@ vusb_process_urbs(struct vusb *v)
  */
 static void mainloop(struct vusb *v)
 {
-	int nr = 0;
-	int expected = 0 /* STUB packet header length */;
-	int count = 0;
-	int r;
-	/* STUB get packet header */;
-
-	/* FIXME: check return */
-	vusb_send_bind_request(v);
-	do {
-		nr = vusb_read(v, pbuf + count, expected - count);
-
-		dprintk(D_V4V1, "vusb_read: %d\n", nr);
-
-		if (nr == -EINTR || nr == -ERESTARTSYS) { /* Sig INT occured */
-			/* Check if we need to stop */
-			if (kthread_should_stop())
-			        return;
-			flush_signals(current);
-			vusb_process_urbs(v);
-			dprintk(D_V4V1, "vusb: got interrupted, restarting read\n");
-			continue;
-		} else if (nr < 0) { /* TODO: handle EAGAIN EDISCONNECT */
-			wprintk("Unexpected error on read: %d\n", nr);
-			return;
-		} else if (nr == 0) {
-			wprintk("zero read, assuming server close connection\n");
-			/* TODO: Don't close the thread. Check if we can restart the connection */
-			return;
-		}
-
-		count = count + nr;
-
-		if (count < expected) {
-			dprintk(D_V4V2, "Partial read, remaining: %d\n", expected-count);
-			continue;
-		} else  if (expected == 0 /* STUB packet header length */) {
-			expected = 0 /* STUB payload length */;
-			if (expected > VUSB_MAX_PACKET_SIZE) {
-				wprintk("Packet too large (%u)\n", expected);
-				/* TODO: Skip the packet, don't close the connection */
-				return;
-			}
-		}
-
-		if (count > expected) {
-			BUG();
-		}
-		if (count == expected) {
-			dprintk(D_V4V1, "All data received calling handler\n");
-			r = vusb_process_packet(v, (void *)pbuf);
-			if (v->poll) { /* Update Hub status */
-				v->poll = 0;
-				usb_hcd_poll_rh_status(vusb_to_hcd(v));
-			}
-
-			if (r < 0) {
-				return;
-			}
-			if (r == 2) {
-				vusb_process_urbs(v);
-			}
-			expected = 0 /* STUB packet header length */;
-			count = 0;
-		}
-	} while(1);
-
-	return;
+	/* TODO:
+	 * process writes to rings that were full.
+	 * process reads from rings that were empty.
+	 */
 }
 
 static int
@@ -2133,7 +1910,7 @@ vusb_threadfunc(void *data)
 	mm_segment_t oldfs;
 	struct vusb *v = data;
 
-	dprintk(D_V4V1, "tf: In thread\n");
+	dprintk(D_VUSB1, "tf: In thread\n");
 
 	/* Fine now, as we don't return to userspace: */
 	oldfs = get_fs();
@@ -2146,10 +1923,10 @@ vusb_threadfunc(void *data)
 	set_current_state(TASK_INTERRUPTIBLE);
 	mainloop(v);
 
-	dprintk(D_V4V1, "tf: fp closed, thread going idle\n");
+	dprintk(D_VUSB1, "tf: fp closed, thread going idle\n");
 
 	if (!kthread_should_stop())
-		wprintk("Unexpected V4V close\n");
+		wprintk("Unexpected TODO close\n");
 
 	vusb_worker_cleanup(v);
 
@@ -2157,7 +1934,7 @@ vusb_threadfunc(void *data)
 	while (!kthread_should_stop()) {
 		schedule_timeout(100000);
 	}
-	dprintk(D_V4V1, "tf: Thread exiting\n");
+	dprintk(D_VUSB1, "tf: Thread exiting\n");
 	return 0;
 }
 
@@ -2324,7 +2101,7 @@ static struct platform_driver vusb_hcd_driver = {
 
 
 static void
-vusb_cleanup (void)
+vusb_cleanup(void)
 {
 	iprintk("clean up\n");
 	if (pbuf) {
@@ -2347,6 +2124,7 @@ vusb_init (void)
 		return -ENODEV;
 	}
 
+	/* TODO nuke this global buffer */
 	pbuf = kmalloc(VUSB_MAX_PACKET_SIZE, GFP_KERNEL);
 	if (!pbuf) {
 		eprintk("Unable to allocate packet buffer\n");
@@ -2387,4 +2165,6 @@ err_platform_alloc:
 
 module_init (vusb_init);
 module_exit (vusb_cleanup);
+
+MODULE_DESCRIPTION("Xen virtual USB frontend");
 MODULE_LICENSE ("GPL");
