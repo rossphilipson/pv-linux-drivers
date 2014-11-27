@@ -53,8 +53,9 @@
 
 #define VUSB_MAX_PACKET_SIZE 1024*256
 
-#define DRIVER_DESC	"OpenXT Virtual USB Host Controller"
-#define DRIVER_VERSION  "1.0.0"
+#define VUSB_DRIVER_NAME	"vusb_hcd"
+#define VUSB_DRIVER_DESC	"OpenXT Virtual USB Host Controller"
+#define VUSB_DRIVER_VERSION	"1.0.0"
 
 #define POWER_BUDGET	5000 /* mA */
 
@@ -110,10 +111,6 @@
 #define VUSB_URB_DIRECTION_IN      0x0001
 #define VUSB_URB_SHORT_OK          0x0002
 #define VUSB_URB_ISO_TRANSFER_ASAP 0x0004
-
-/* TODO use different names for HCD and platform drivers? */
-static const char driver_name [] = "vusb_hcd";
-static const char driver_desc [] = DRIVER_DESC;
 
 /* Port are numbered from 1 in linux */
 #define vusb_device_by_port(v, port) (&(v)->vdev_ports[(port) - 1])
@@ -940,8 +937,8 @@ vusb_bus_resume(struct usb_hcd *hcd)
 
 
 static const struct hc_driver vusb_hcd = {
-	.description = (char *) driver_name,
-	.product_desc =	DRIVER_DESC,
+	.description = VUSB_DRIVER_NAME,
+	.product_desc =	VUSB_DRIVER_DESC,
 	.hcd_priv_size = sizeof(struct vusb),
 
 	.flags = HCD_USB2,
@@ -1943,7 +1940,7 @@ vusb_hcd_probe(struct platform_device *pdev)
 		return -ENODEV;
 
 	dprintk(D_MISC, ">vusb_hcd_probe\n");
-	dev_info(&pdev->dev, "%s, driver " DRIVER_VERSION "\n", driver_desc);
+	dev_info(&pdev->dev, "%s, driver " VUSB_DRIVER_VERSION "\n", VUSB_DRIVER_DESC);
 
 	hcd = usb_create_hcd(&vusb_hcd, &pdev->dev, dev_name(&pdev->dev));
 	if (!hcd)
@@ -2084,7 +2081,7 @@ static struct platform_driver vusb_hcd_driver = {
 	.probe = vusb_hcd_probe,
 	.remove = vusb_hcd_remove,
 	.driver = {
-		.name = (char *) driver_name,
+		.name = VUSB_DRIVER_NAME,
 		.owner = THIS_MODULE,
 #ifdef CONFIG_PM
 		.pm = &vusb_hcd_pm,
@@ -2125,7 +2122,7 @@ vusb_init (void)
 		return -ENOMEM;
 	}
 
-	the_vusb_hcd_pdev = platform_device_alloc(driver_name, -1);
+	the_vusb_hcd_pdev = platform_device_alloc(VUSB_DRIVER_NAME, -1);
 	if (!the_vusb_hcd_pdev) {
 		eprintk("Unable to allocate platform device\n");
 		r = -ENOMEM;
