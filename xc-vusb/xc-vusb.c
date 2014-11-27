@@ -194,9 +194,7 @@ struct vusb {
 	enum vusb_state			state;
 };
 
-static struct platform_device *the_vusb_hcd_pdev;
-
-static u8 *pbuf = NULL;
+static struct platform_device *vusb_hcd_pdev;
 
 /* Forward declarations */
 static int vusb_threadfunc(void *data);
@@ -1945,10 +1943,11 @@ vusb_hcd_probe(struct platform_device *pdev)
 	hcd = usb_create_hcd(&vusb_hcd, &pdev->dev, dev_name(&pdev->dev));
 	if (!hcd)
 		return -ENOMEM;
+
 	/* Indicate the USB stack that both Super and Full Speed are supported */
 	hcd->has_tt = 1;
 
-	v = hcd_to_vusb (hcd);
+	v = hcd_to_vusb(hcd);
 
 	spin_lock_init(&v->lock);
 	INIT_LIST_HEAD(&v->vdev_list);
@@ -2089,44 +2088,30 @@ static struct platform_driver vusb_hcd_driver = {
 	},
 };
 
-
 static void
 vusb_cleanup(void)
 {
 	iprintk("clean up\n");
-	if (pbuf) {
-		kfree(pbuf);
-	}
-	platform_device_unregister(the_vusb_hcd_pdev);
+	platform_device_unregister(vusb_hcd_pdev);
 	platform_driver_unregister(&vusb_hcd_driver);
 }
 
-
 static int __init
-vusb_init (void)
+vusb_init(void)
 {
-	int r;
+	int r = 0;
 
 	iprintk("OpenXT USB host controller\n");
 
-	if (usb_disabled ()) {
+	if (usb_disabled()) {
 		wprintk("USB is disabled\n");
 		return -ENODEV;
 	}
 
-	/* TODO nuke this global buffer */
-	pbuf = kmalloc(VUSB_MAX_PACKET_SIZE, GFP_KERNEL);
-	if (!pbuf) {
-		eprintk("Unable to allocate packet buffer\n");
-		r = -ENOMEM;
-		return -ENOMEM;
-	}
-
-	the_vusb_hcd_pdev = platform_device_alloc(VUSB_DRIVER_NAME, -1);
-	if (!the_vusb_hcd_pdev) {
+	vusb_hcd_pdev = platform_device_alloc(VUSB_DRIVER_NAME, -1);
+	if (!vusb_hcd_pdev) {
 		eprintk("Unable to allocate platform device\n");
-		r = -ENOMEM;
-		goto err_platform_alloc;
+		return -ENOMEM;
 	}
 
 	r = platform_driver_register(&vusb_hcd_driver);
@@ -2135,7 +2120,7 @@ vusb_init (void)
 		goto err_driver_register;
 	}
 
-	r = platform_device_add(the_vusb_hcd_pdev);
+	r = platform_device_add(vusb_hcd_pdev);
 	if (r < 0) {
 		eprintk("Unable to add the platform\n");
 		goto err_add_hcd;
@@ -2146,15 +2131,13 @@ vusb_init (void)
 err_add_hcd:
 	platform_driver_unregister(&vusb_hcd_driver);
 err_driver_register:
-	platform_device_put(the_vusb_hcd_pdev);
-err_platform_alloc:
-	kfree(pbuf);
+	platform_device_put(vusb_hcd_pdev);
 
 	return r;
 }
 
-module_init (vusb_init);
-module_exit (vusb_cleanup);
+module_init(vusb_init);
+module_exit(vusb_cleanup);
 
 MODULE_DESCRIPTION("Xen virtual USB frontend");
 MODULE_LICENSE ("GPL");
