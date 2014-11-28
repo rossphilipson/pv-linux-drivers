@@ -885,7 +885,7 @@ static const struct hc_driver vusb_hcd_driver = {
 };
 
 /****************************************************************************/
-/* Virtual USB Devices  TODO RJP lots more here...                          */
+/* VUSB Devices  TODO RJP lots more here...                          */
 
 static int
 vusb_write(struct vusb *v, const void *buf, u32 len)
@@ -1004,11 +1004,57 @@ out:
 #define vusb_set_packet_data(packet, data, dlen)		\
 	vusb_iov_set(packet, 1, data, dlen)
 
+/*
+ * Send a bind request
+ * Ask the host to open a connection
+ * return 0 if the packet was sent
+ */
+static int
+vusb_send_bind_request(struct vusb *v)
+{
+	/*vusb_create_packet(iovec, 1);*/
+	int r = 0;
+
+	/* STUB setup bind packet
+
+	r = vusb_send_packet(v, iovec, 1);
+
+	if (r >= 0) { // Wait the host answer 
+		v->state = VUSB_WAIT_BIND_RESPONSE;
+		r = 0;
+	}*/
+
+	return r;
+}
+
+/*
+ * Send a bind commit
+ * Like TCP notify the host we received the ACK
+ */
+static int
+vusb_send_bind_commit(struct vusb *v)
+{
+	/*vusb_create_packet(iovec, 1);*/
+	int r = 0;
+
+	/* STUB setup bind commit packet to ACK 
+
+	r = vusb_send_packet(v, iovec, 1);
+
+	if (r >= 0) { // The thread can now run
+		v->state = VUSB_RUNNING;
+		r = 0;
+	}*/
+
+	return r;
+}
+
+
 /**
  * A new device is attached to the guest
  * TODO: Reject device
  */
-/* TODO RJP move and merge with vusb_add_device into one add routine */
+/* TODO RJP merge with vusb_add_device into one add routine */
 static int
 vusb_handle_announce_device(struct vusb *v, const void *packet)
 {
@@ -1030,6 +1076,7 @@ vusb_handle_announce_device(struct vusb *v, const void *packet)
 		return r;
 
 	/* STUB setup packet and accept the device */
+	/* TODO RJP bunch of stuff gone here, this will be xenbus stuffs now */
 
 	return vusb_send_packet(v, iovec, 1);
 }
@@ -1038,7 +1085,7 @@ vusb_handle_announce_device(struct vusb *v, const void *packet)
  * A device has gone
  * TODO: remove all URB related to this device
  */
-/* TODO RJP move and make into device remove funcion */
+/* TODO RJP make into device remove funcion */
 static void
 vusb_handle_device_gone(struct vusb *v, const void *packet)
 {
@@ -1058,6 +1105,73 @@ vusb_handle_device_gone(struct vusb *v, const void *packet)
 		wprintk("Device gone message for unregister device?!\n");
 
 	spin_unlock_irqrestore(&v->lock, flags);
+}
+
+/* Process packet received from vusb daemon */
+static int
+vusb_process_packet(struct vusb *v, const void *packet)
+{
+	int res = 0;
+
+	switch (v->state) {
+	case VUSB_WAIT_BIND_RESPONSE:
+		iprintk("Wait bind response send it\n");
+
+		/* TODO this is all v4v stuffs, fix res = vusb_send_bind_commit(v);*/
+		if (res != 0) {
+			eprintk("Failed to send bind commit command\n");
+			return res;
+		}
+		break;
+
+	case VUSB_RUNNING:
+		/* STUB handle events calling one of:
+		vusb_handle_announce_device(v, packet);
+		vusb_handle_device_gone(v, packet);
+		vusb_handle_urb_response(v, packet);
+		vusb_handle_urb_status(v, packet);*/
+		break;
+
+	default:
+		wprintk("Invalid state %u in process_packet\n",	v->state);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Send a reset command
+ * TODO: Add return value and check return
+ */
+static void
+vusb_send_reset_device_cmd(struct vusb *v, struct vusb_device *vdev)
+{
+	vusb_create_packet(iovec, 1);
+	void *packet;
+
+	if (!vdev->present) {
+		wprintk("Ignore reset for not present device port %u\n", vdev->port);
+		vdev->reset = 0;
+		set_link_state(v, vdev);
+		return;
+	}
+
+	dprintk(D_URB2, "Send reset command, port = %u\n", vdev->port);
+
+	vusb_initialize_packet(v, &packet, vdev->deviceid,
+			0 /* STUB reset internal command */,
+			0 /* STUB reset length */,
+			0);
+
+	vusb_set_packet_header(iovec, &packet, 0 /* STUB reset length */);
+	vusb_send_packet(v, iovec, 1);
+
+	/* Signal reset completion */
+	vdev->port_status |= (USB_PORT_STAT_C_RESET << 16);
+
+	set_link_state(v, vdev);
+	v->poll = 1;
 }
 
 /****************************************************************************/
@@ -1289,7 +1403,6 @@ vusb_urb_finish(struct vusb *v, struct vusb_device *vdev, u16 handle,
 	urb = urbp->urb;
 	urb->status = vusb_urb_status_to_errno(status);
 
-
 	switch (usb_pipetype(urb->pipe)) {
 	case PIPE_ISOCHRONOUS:
 		vusb_urb_isochronous_finish(v, urbp, len, data);
@@ -1360,40 +1473,6 @@ vusb_handle_urb_status(struct vusb *v, const void *packet)
 	vusb_urb_finish(v, vdev, handle, status, 0, NULL);
 out:
 	spin_unlock_irqrestore(&v->lock, flags);
-}
-
-
-/* Process packet received from vusb daemon */
-static int
-vusb_process_packet(struct vusb *v, const void *packet)
-{
-	int res = 0;
-
-	switch (v->state) {
-	case VUSB_WAIT_BIND_RESPONSE:
-		iprintk("Wait bind response send it\n");
-
-		/* TODO this is all v4v stuffs, fix res = vusb_send_bind_commit(v);*/
-		if (res != 0) {
-			eprintk("Failed to send bind commit command\n");
-			return res;
-		}
-		break;
-
-	case VUSB_RUNNING:
-		/* STUB handle events calling one of: */
-		vusb_handle_announce_device(v, packet);
-		vusb_handle_device_gone(v, packet);
-		vusb_handle_urb_response(v, packet);
-		vusb_handle_urb_status(v, packet);
-		break;
-
-	default:
-		wprintk("Invalid state %u in process_packet\n",	v->state);
-		return -1;
-	}
-
-	return 0;
 }
 
 /*
@@ -1688,40 +1767,6 @@ vusb_send_cancel_urb(struct vusb *v, struct vusb_device *vdev,
 
 	vusb_set_packet_header(iovec, &packet, 0 /* STUB cancel length */);
 	vusb_send_packet(v, iovec, 1);
-}
-
-/*
- * Send a reset command
- * TODO: Add return value and check return
- */
-static void
-vusb_send_reset_device_cmd(struct vusb *v, struct vusb_device *vdev)
-{
-	vusb_create_packet(iovec, 1);
-	void *packet;
-
-	if (!vdev->present) {
-		wprintk("Ignore reset for not present device port %u\n", vdev->port);
-		vdev->reset = 0;
-		set_link_state(v, vdev);
-		return;
-	}
-
-	dprintk(D_URB2, "Send reset command, port = %u\n", vdev->port);
-
-	vusb_initialize_packet(v, &packet, vdev->deviceid,
-			0 /* STUB reset internal command */,
-			0 /* STUB reset length */,
-			0);
-
-	vusb_set_packet_header(iovec, &packet, 0 /* STUB reset length */);
-	vusb_send_packet(v, iovec, 1);
-
-	/* Signal reset completion */
-	vdev->port_status |= (USB_PORT_STAT_C_RESET << 16);
-
-	set_link_state(v, vdev);
-	v->poll = 1;
 }
 
 /* Send an URB */
