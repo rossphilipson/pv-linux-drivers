@@ -44,6 +44,16 @@
 #include <linux/aio.h>
 #endif
 
+#include <xen/xen.h>
+#include <xen/xenbus.h>
+#include <xen/events.h>
+#include <xen/page.h>
+#include <xen/grant_table.h>
+
+#include <xen/interface/io/usbif.h>
+#include <xen/interface/memory.h>
+#include <xen/interface/grant_table.h>
+
 /* TODO looks like we use some old HCD interface, update */
 #if ( LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,35) || (defined(RHEL_RELEASE_CODE)) )
 #include <linux/usb/hcd.h>
@@ -156,6 +166,9 @@ struct vusb_device {
 	 * */
 	u16			port;
 
+	/* This VUSB device's list of pending URBs */
+	struct list_head        urbp_list;
+
 	enum usb_device_speed	speed;
 	struct usb_device	*udev;
 };
@@ -180,6 +193,7 @@ struct vusb {
 	enum vusb_rh_state		rh_state;
 	
 	struct vusb_device		vdev_ports[VUSB_PORTS];
+	/* TODO RJP this will go away */
 	struct list_head                urbp_list;
 	u16				urb_handle;
 
@@ -194,6 +208,7 @@ struct vusb {
 };
 
 static struct platform_device *vusb_platform_device = NULL;
+static DEFINE_MUTEX(xenusb_pm_mutex);
 
 /****************************************************************************/
 /* Miscellaneous Routines                                                   */
@@ -973,6 +988,7 @@ vusb_add_device(struct vusb *v, u16 id, enum usb_device_speed speed)
 	vdev->port_status |= usb_speed_to_port_stat(speed)
 					 | USB_PORT_STAT_CONNECTION
 					 | USB_PORT_STAT_C_CONNECTION << 16;
+	INIT_LIST_HEAD(&vdev->urbp_list);
 
 	dprintk(D_PORT1, "new status: 0x%08x speed: 0x%04x\n",
 			vdev->port_status, speed);
@@ -1065,6 +1081,7 @@ vusb_handle_announce_device(struct vusb *v, const void *packet)
 	/* STUB got announcement of new device */
 
 	/* STUB set speed... 
+	 * RJP see vusb_get_speed in backend and UsbConfig.cpp in win fe
 	speed = USB_SPEED_LOW;
 	speed = USB_SPEED_FULL;
 	speed = USB_SPEED_HIGH;
@@ -2051,6 +2068,174 @@ vusb_worker_stop(struct vusb *v)
 
 	send_sig(SIGINT, v->kthread, 0); /* To left the function read */
 	kthread_stop(v->kthread);
+}
+
+/****************************************************************************/
+/* VUSB Xen Devices & Driver                                                */
+
+static int vusb_usbfront_probe(struct xenbus_device *dev,
+			       const struct xenbus_device_id *id)
+{
+	return 0; /* TODO RJP device add here */
+}
+
+/**
+ * Callback received when the backend's state changes.
+ */
+static void vusb_usbback_changed(struct xenbus_device *dev,
+				 enum xenbus_state backend_state)
+{
+	/* TODO RJP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
+
+	dev_dbg(&dev->dev, "%s\n", xc_xenbus_strstate(backend_state));
+	dev_dbg(&dev->dev, "Mine: %s\n", xc_xenbus_strstate(dev->state));
+
+	switch (backend_state) {
+	case XenbusStateUnknown:
+		/* if the backend vanishes from xenstore, close frontend */
+		if (!xc_xenbus_exists(XBT_NIL, dev->otherend, "")) {
+			if (dev->state != XenbusStateClosed) {
+				printk(KERN_INFO "backend vanished, closing frontend\n");
+				/* TODO RJP netfront_close(dev);*/
+			}
+		}
+		break;
+	case XenbusStateInitialising:
+		/* Have to sit this one out; The backend nodes detailing the features can yet not be written,
+		   as they are written in the probe() function, just before switch to InitWait state. This is now necessary
+		   because we do not assume the frontend domain is started later than backend domain,
+		   which used to be giving the backend driver time to write the nodes.
+		 */
+		break;
+	case XenbusStateInitialised:
+	case XenbusStateReconfiguring:
+	case XenbusStateReconfigured:
+	case XenbusStateConnected:
+		break;
+
+	case XenbusStateInitWait:
+		if (dev->state != XenbusStateInitialising && dev->state != XenbusStateClosed)
+			break;
+		/* TODO RJP if (xennet_connect(netdev) != 0)
+			break;*/
+		xc_xenbus_switch_state(dev, XenbusStateConnected);
+		break;
+
+	case XenbusStateClosing:
+	case XenbusStateClosed:
+                /*if (np->suspending)
+                        break;*/
+		if (dev->state != XenbusStateClosed)
+			/* TODO RJP netfront_close(dev);*/
+			;
+		else 
+			xc_xenbus_switch_state(dev, XenbusStateInitialising);
+		break;
+	}
+}
+
+static int vusb_xenusb_remove(struct xenbus_device *dev)
+{
+	/* TODO JRP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
+
+	dev_dbg(&dev->dev, "%s\n", dev->nodename);
+
+	/* TODO RJP this causes vusb device removal
+	xennet_disconnect_backend(info);
+	del_timer_sync(&info->rx_refill_timer);
+	xennet_sysfs_delif(info->netdev);
+	unregister_netdev(info->netdev);
+	free_netdev(info->netdev);*/
+
+	return 0;
+}
+
+static int vusb_usbfront_suspend(struct xenbus_device *dev)
+{
+	/* TODO JRP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
+
+	mutex_lock(&xenusb_pm_mutex);
+	printk(KERN_INFO "xen_netif: pm freeze event received, detaching netfront\n");
+	/*
+        info->suspending = 1;
+
+	spin_lock_bh(&info->rx_lock);
+	spin_lock_irq(&info->tx_lock);
+	netif_carrier_off(info->netdev);
+	spin_unlock_irq(&info->tx_lock);
+	spin_unlock_bh(&info->rx_lock);
+
+	xennet_disconnect_backend(info);
+	xennet_uninit(info->netdev);
+	*/
+
+	mutex_unlock(&xenusb_pm_mutex);
+	return 0;
+}
+
+static int vusb_usbfront_resume(struct xenbus_device *dev)
+{
+	int err = 0;
+	/* TODO JRP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
+
+	mutex_lock(&xenusb_pm_mutex);
+	printk(KERN_INFO "xen_usbif: pm restore event received, unregister net device\n");
+        /*info->suspending = 0;
+	err = xennet_init_rings(info);
+	if (!err)
+		xc_xenbus_switch_state(dev, XenbusStateClosed);
+	mutex_unlock(&xennet_pm_mutex);*/
+	return err;
+}
+
+static struct xenbus_device_id vusb_usbfront_ids[] = {
+	{ "vusb" },
+	{ "" }
+};
+
+static struct xenbus_driver vusb_usbfront_driver = {
+	.name = "xc-vusb",
+	.owner = THIS_MODULE,
+	.ids = vusb_usbfront_ids,
+	.probe = vusb_usbfront_probe,
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,8,0))
+	.remove = vusb_xenusb_remove,
+#else
+	.remove = __devexit_p(vusb_xenusb_remove),
+#endif
+
+	.suspend = vusb_usbfront_suspend,
+	.resume = vusb_usbfront_resume,
+
+	.otherend_changed = vusb_usbback_changed,
+};
+
+static int vusb_xen_init(void)
+{
+
+	int rc = 0;
+
+	mutex_lock(&xenusb_pm_mutex);
+	if (!xen_hvm_domain()) {
+		rc = -ENODEV;
+		goto out;
+	}
+
+	rc = xenbus_register_frontend(&vusb_usbfront_driver);
+	if (rc)
+		goto out;
+
+	printk(KERN_INFO "xen_usbif initialized\n");
+out:
+	mutex_unlock(&xenusb_pm_mutex);
+	return rc;
+}
+
+static void vusb_xen_unregister(void)
+{
+	mutex_lock(&xenusb_pm_mutex);
+	xc_xenbus_unregister_driver(&vusb_usbfront_driver);
+	mutex_unlock(&xenusb_pm_mutex);
 }
 
 /****************************************************************************/
