@@ -174,8 +174,6 @@ struct vusb_urbp {
 
 /* Virtual USB device on of the RH ports */
 struct vusb_device {
-	unsigned		present:1;
-	unsigned		reset:2;
 	u16			deviceid;
 	u32			port_status;
 	/* TODO: is it usefull? It's only set during SetAddress control command and never used */
@@ -186,11 +184,18 @@ struct vusb_device {
 	 * */
 	u16			port;
 
+	/* The Xenbus device associated with this vusb device */
+	struct xenbus_device    *xendev;
+
 	/* This VUSB device's list of pending URBs */
 	struct list_head        urbp_list;
 
 	enum usb_device_speed	speed;
 	struct usb_device	*udev;
+
+	unsigned		present:1;
+	unsigned		connecting:1;
+	unsigned		reset:2;
 };
 
 /* Virtual USB HCD/RH pieces */
@@ -206,7 +211,7 @@ enum vusb_state {
 	VUSB_RUNNING,
 };
 
-struct vusb {
+struct vusb_vhcd {
 	spinlock_t			lock;
 
 	enum vusb_state			state;
@@ -231,41 +236,41 @@ static struct platform_device *vusb_platform_device = NULL;
 static DEFINE_MUTEX(vusb_xen_pm_mutex);
 
 static int
-vusb_send_packet(struct vusb *v, const struct iovec *iovec, size_t niov);
+vusb_send_packet(struct vusb_vhcd *vhcd, const struct iovec *iovec, size_t niov);
 static void
-vusb_initialize_packet(struct vusb *v, void *packet, u16 devid,
+vusb_initialize_packet(struct vusb_vhcd *vhcd, void *packet, u16 devid,
 		u8 command, u32 hlen, u32 dlen);
 static void
-vusb_send_reset_device_cmd(struct vusb *v, struct vusb_device *vdev);
+vusb_send_reset_device_cmd(struct vusb_vhcd *vhcd, struct vusb_device *vdev);
 
 /****************************************************************************/
 /* Miscellaneous Routines                                                   */
 
-static inline struct vusb*
-hcd_to_vusb(struct usb_hcd *hcd)
+static inline struct vusb_vhcd*
+hcd_to_vhcd(struct usb_hcd *hcd)
 {
-	return (struct vusb *)(hcd->hcd_priv);
+	return (struct vusb_vhcd *)(hcd->hcd_priv);
 }
 
 static inline struct usb_hcd*
-vusb_to_hcd(struct vusb *v)
+vhcd_to_hcd(struct vusb_vhcd *vhcd)
 {
-	return container_of((void *) v, struct usb_hcd, hcd_priv);
+	return container_of((void *)vhcd, struct usb_hcd, hcd_priv);
 }
 
 static inline struct device*
-vusb_dev(struct vusb *v)
+vusb_dev(struct vusb_vhcd *vhcd)
 {
-	return vusb_to_hcd(v)->self.controller;
+	return vhcd_to_hcd(vhcd)->self.controller;
 }
 
 #ifdef VUSB_DEBUG
 
 /* Convert Root Hub state in a string */
 static const char*
-vusb_rhstate_to_string(const struct vusb *v)
+vusb_rhstate_to_string(const struct vusb_vhcd *vhcd)
 {
-	switch (v->rh_state) {
+	switch (vhcd->rh_state) {
 	case VUSB_RH_RESET:
 		return "RESET";
 	case VUSB_RH_SUSPENDED:
@@ -324,22 +329,22 @@ vusb_state_to_string(const struct vusb_urbp *urbp)
  * a pending queue
  */
 static inline void
-vusb_worker_notify(struct vusb *v)
+vusb_worker_notify(struct vusb_vhcd *vhcd)
 {
-	send_sig(SIGINT, v->kthread, 0);
+	send_sig(SIGINT, vhcd->kthread, 0);
 }
 
 /* Dump the URBp list */
 static inline void
-vusb_urbp_list_dump(const struct vusb *v, const char *fn)
+vusb_urbp_list_dump(const struct vusb_vhcd *vhcd, const char *fn)
 {
 	const struct vusb_urbp *urbp;
 
 	dprintk(D_URB2, "===== Current URB List in %s =====\n", fn);
-	list_for_each_entry(urbp, &v->urbp_list, urbp_list) {
+	list_for_each_entry(urbp, &vhcd->urbp_list, urbp_list) {
 		dprintk(D_URB1, "URB handle 0x%x port %u device %u\n",
 			urbp->handle, urbp->port,
-			vusb_device_by_port(v, urbp->port)->deviceid);
+			vusb_device_by_port(vhcd, urbp->port)->deviceid);
 	}
 	dprintk(D_URB2, "===== End URB List in %s ====\n", fn);
 }
@@ -347,7 +352,7 @@ vusb_urbp_list_dump(const struct vusb *v, const char *fn)
 #ifdef VUSB_DEBUG
 /* Dump URBp */
 static inline void
-vusb_urbp_dump(const struct vusb *v, struct vusb_urbp *urbp)
+vusb_urbp_dump(struct vusb_urbp *urbp)
 {
 	struct urb *urb = urbp->urb;
 	unsigned int type;
@@ -379,7 +384,7 @@ usb_speed_to_port_stat(enum usb_device_speed speed)
 }
 
 static void
-set_link_state(struct vusb *v, struct vusb_device *vdev)
+vusb_set_link_state(struct vusb_device *vdev)
 {
 	u32 newstatus, diff;
 
@@ -409,7 +414,7 @@ set_link_state(struct vusb *v, struct vusb_device *vdev)
 	    (diff & USB_PORT_STAT_CONNECTION)) {
 		newstatus |= (USB_PORT_STAT_C_CONNECTION << 16);
 		dprintk(D_STATE, "Port %u connection state changed: %08x\n",
-				dev->port, newstatus);
+				vdev->port, newstatus);
 	}
 
 	vdev->port_status = newstatus;
@@ -420,7 +425,7 @@ set_link_state(struct vusb *v, struct vusb_device *vdev)
 
 /* SetFeaturePort(PORT_RESET) */
 static void
-vusb_port_reset(struct vusb *v, struct vusb_device *vdev)
+vusb_port_reset(struct vusb_vhcd *vhcd, struct vusb_device *vdev)
 {
 	printk(KERN_DEBUG"vusb: port reset %u 0x%08x",
 		   vdev->port, vdev->port_status);
@@ -429,11 +434,11 @@ vusb_port_reset(struct vusb *v, struct vusb_device *vdev)
 
 	vdev->reset = 1;
 
-	vusb_worker_notify(v);
+	vusb_worker_notify(vhcd);
 }
 
 static void
-set_port_feature(struct vusb *v, struct vusb_device *vdev, u16 val)
+set_port_feature(struct vusb_vhcd *vhcd, struct vusb_device *vdev, u16 val)
 {
 	if (!vdev)
 		return;
@@ -448,7 +453,7 @@ set_port_feature(struct vusb *v, struct vusb_device *vdev, u16 val)
 		vdev->port_status |= USB_PORT_STAT_POWER;
 		break;
 	case USB_PORT_FEAT_RESET:
-		vusb_port_reset(v, vdev);
+		vusb_port_reset(vhcd, vdev);
 		break;
 	case USB_PORT_FEAT_C_CONNECTION:
 	case USB_PORT_FEAT_C_RESET:
@@ -462,11 +467,11 @@ set_port_feature(struct vusb *v, struct vusb_device *vdev, u16 val)
 		/* No change needed */
 		return;
 	}
-	set_link_state(v, vdev);
+	vusb_set_link_state(vdev);
 }
 
 static void
-clear_port_feature(struct vusb *v, struct vusb_device *vdev, u16 val)
+clear_port_feature(struct vusb_device *vdev, u16 val)
 {
 	switch (val) {
 	case USB_PORT_FEAT_INDICATOR:
@@ -476,12 +481,12 @@ clear_port_feature(struct vusb *v, struct vusb_device *vdev, u16 val)
 
 	case USB_PORT_FEAT_ENABLE:
 		vdev->port_status &= ~USB_PORT_STAT_ENABLE;
-		set_link_state(v, vdev);
+		vusb_set_link_state(vdev);
 		break;
 
 	case USB_PORT_FEAT_POWER:
 		vdev->port_status &= ~(USB_PORT_STAT_POWER | USB_PORT_STAT_ENABLE);
-		set_link_state(v, vdev);
+		vusb_set_link_state(vdev);
 		break;
 
 	case USB_PORT_FEAT_C_CONNECTION:
@@ -503,15 +508,15 @@ clear_port_feature(struct vusb *v, struct vusb_device *vdev, u16 val)
 
 /* Get a uniq URB handle */
 static u16
-vusb_get_urb_handle(struct vusb *v)
+vusb_get_urb_handle(struct vusb_vhcd *vhcd)
 {
-	v->urb_handle += 1;
+	vhcd->urb_handle += 1;
 
-	if (v->urb_handle >= 0xfff0)
+	if (vhcd->urb_handle >= 0xfff0)
 		/* reset to 0 we never have lots URB in the list */
-		v->urb_handle = 0;
+		vhcd->urb_handle = 0;
 
-	return v->urb_handle;
+	return vhcd->urb_handle;
 }
 
 /*
@@ -519,36 +524,36 @@ vusb_get_urb_handle(struct vusb *v)
  * The lock is already taken
  */
 static void
-vusb_urbp_release(struct vusb *v, struct vusb_urbp *urbp)
+vusb_urbp_release(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 {
 	struct urb *urb = urbp->urb;
 
 #ifdef VUSB_DEBUG
 	if (urb->status)
-		vusb_urbp_dump(v, urbp);
+		vusb_urbp_dump(urbp);
 #endif
 
 	dprintk(D_URB1, "Giveback URB 0x%x status %d length %u\n",
 		urbp->handle, urb->status, urb->actual_length);
 	list_del(&urbp->urbp_list);
 	kfree(urbp);
-	usb_hcd_unlink_urb_from_ep(vusb_to_hcd(v), urb);
+	usb_hcd_unlink_urb_from_ep(vhcd_to_hcd(vhcd), urb);
 	/* Unlock the lock before notify the USB stack (could call other cb) */
-	spin_unlock(&v->lock);
-	usb_hcd_giveback_urb(vusb_to_hcd(v), urb, urb->status);
-	spin_lock(&v->lock);
+	spin_unlock(&vhcd->lock);
+	usb_hcd_giveback_urb(vhcd_to_hcd(vhcd), urb, urb->status);
+	spin_lock(&vhcd->lock);
 }
 
 /* Retrieve device by device ID */
 static struct vusb_device *
-vusb_device_by_devid(struct vusb *v, u16 id)
+vusb_device_by_devid(struct vusb_vhcd *vhcd, u16 id)
 {
 	u16 i;
 
 	for (i = 0; i < VUSB_PORTS; i++) {
-		struct vusb_device *vdev = &v->vdev_ports[i];
+		struct vusb_device *vdev = &vhcd->vdev_ports[i];
 		if (vdev->present && vdev->deviceid == id)
-			return &v->vdev_ports[i];
+			return &vhcd->vdev_ports[i];
 	}
 
 	return NULL;
@@ -589,13 +594,13 @@ vusb_hub_descriptor(struct usb_hub_descriptor *desc)
 static int
 vusb_hcd_start(struct usb_hcd *hcd)
 {
-	struct vusb *v = hcd_to_vusb(hcd);
+	struct vusb_vhcd *vhcd = hcd_to_vhcd(hcd);
 
 	iprintk("XEN HCD start\n");
 
 	dprintk(D_MISC, ">vusb_start\n");
 
-	v->rh_state = VUSB_RH_RUNNING;
+	vhcd->rh_state = VUSB_RH_RUNNING;
 
 	hcd->power_budget = POWER_BUDGET;
 	hcd->state = HC_STATE_RUNNING;
@@ -609,26 +614,26 @@ vusb_hcd_start(struct usb_hcd *hcd)
 /* HCD stop */
 static void vusb_hcd_stop(struct usb_hcd *hcd)
 {
-	struct vusb		*v;
+	struct vusb_vhcd *vhcd;
 
 	iprintk("XEN HCD stop\n");
 
 	dprintk(D_MISC, ">vusb_stop\n");
 
-	v = hcd_to_vusb(hcd);
+	vhcd = hcd_to_vhcd(hcd);
 
 	hcd->state = HC_STATE_HALT;
 	/* TODO: remove all URBs */
 
 	//device_remove_file (dummy_dev(dum), &dev_attr_urbs);
-	dev_info(vusb_dev(v), "stopped\n");
+	dev_info(vusb_dev(vhcd), "stopped\n");
 	dprintk(D_MISC, "<vusb_stop\n");
 }
 
 static int
 vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 {
-	struct vusb *v;
+	struct vusb_vhcd *vhcd;
 	unsigned long flags;
 	struct vusb_urbp *urbp;
 	const struct vusb_device *vdev;
@@ -637,7 +642,7 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 
 	dprintk(D_MISC, ">vusb_urb_enqueue\n");
 
-	v = hcd_to_vusb(hcd);
+	vhcd = hcd_to_vhcd(hcd);
 
 	if (!urb->transfer_buffer && urb->transfer_buffer_length)
 		return -EINVAL;
@@ -650,12 +655,12 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	/* Port numbered from 1 */
 	urbp->port = urb->dev->portnum;
 	urbp->urb = urb;
-	spin_lock_irqsave(&v->lock, flags);
-	vdev = vusb_device_by_port(v, urbp->port);
+	spin_lock_irqsave(&vhcd->lock, flags);
+	vdev = vusb_device_by_port(vhcd, urbp->port);
 	/* Allocate a handle */
-	urbp->handle = vusb_get_urb_handle(v);
+	urbp->handle = vusb_get_urb_handle(vhcd);
 
-	if (v->state == VUSB_INACTIVE || !vdev->present) {
+	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
 		dprintk(D_WARN, "Worker is not up\n");
 		kfree(urbp);
 		r = -ESHUTDOWN;
@@ -668,11 +673,11 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 		goto done;
 	}
 
-	list_add_tail(&urbp->urbp_list, &v->urbp_list);
-	vusb_worker_notify(v);
+	list_add_tail(&urbp->urbp_list, &vhcd->urbp_list);
+	vusb_worker_notify(vhcd);
 
 done:
-	spin_unlock_irqrestore(&v->lock, flags);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	return r;
 }
@@ -680,15 +685,15 @@ done:
 static int
 vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 {
-	struct vusb *v;
+	struct vusb_vhcd *vhcd;
 	unsigned long flags;
 	int rc;
 	struct vusb_urbp *urbp;
 
 	dprintk(D_MISC, "*vusb_urb_dequeue\n");
-	v = hcd_to_vusb(hcd);
+	vhcd = hcd_to_vhcd(hcd);
 
-	spin_lock_irqsave(&v->lock, flags);
+	spin_lock_irqsave(&vhcd->lock, flags);
 
 	rc = usb_hcd_check_unlink_urb(hcd, urb, status);
 
@@ -698,19 +703,19 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 	urb->status = status;
 
 	/* Retrieve URBp */
-	list_for_each_entry(urbp, &v->urbp_list, urbp_list) {
+	list_for_each_entry(urbp, &vhcd->urbp_list, urbp_list) {
 		if (urbp->urb == urb)
 			break;
 	}
 
 	if (urbp) {
 		urbp->state = VUSB_URBP_CANCEL;
-		vusb_worker_notify(v);
+		vusb_worker_notify(vhcd);
 	} else
 		wprintk("Try do dequeue an unhandle URB\n");
 
 out_dequeue:
-	spin_unlock_irqrestore(&v->lock, flags);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	return rc;
 }
@@ -736,12 +741,12 @@ vusb_hcd_get_frame(struct usb_hcd *hcd)
 static int
 vusb_hcd_hub_status(struct usb_hcd *hcd, char *buf)
 {
-	struct vusb *v = hcd_to_vusb(hcd);
+	struct vusb_vhcd *vhcd = hcd_to_vhcd(hcd);
 	unsigned long flags;
         int resume = 0;
 	int changed = 0;
 	u16 length = 0;
-	int	ret = 0;
+	int ret = 0;
 	u16 i;
 
 	dprintk(D_MISC, ">vusb_hub_status\n");
@@ -758,14 +763,14 @@ vusb_hcd_hub_status(struct usb_hcd *hcd, char *buf)
 	for (i = 0; i < length; i++)
 		buf[i] = 0;
 
-	spin_lock_irqsave(&v->lock, flags);
+	spin_lock_irqsave(&vhcd->lock, flags);
 
 	for (i = 0; i < VUSB_PORTS; i++) {
-		struct vusb_device *vdev = &v->vdev_ports[i];
+		struct vusb_device *vdev = &vhcd->vdev_ports[i];
 
 		/* Check status for each port */
-		dprintk(D_PORT2, "check port %u (%08x)\n", v->vdev_ports[i].port,
-				v->device[i].port_status);
+		dprintk(D_PORT2, "check port %u (%08x)\n", vhcd->vdev_ports[i].port,
+				vhcd->device[i].port_status);
 		if ((vdev->port_status & PORT_C_MASK) != 0) {
 			if (i < 7)
 				buf[0] |= 1 << (i + 1);
@@ -784,12 +789,12 @@ vusb_hcd_hub_status(struct usb_hcd *hcd, char *buf)
                         resume = 1;
 	}
 
-	if (resume && v->rh_state == VUSB_RH_SUSPENDED)
+	if (resume && vhcd->rh_state == VUSB_RH_SUSPENDED)
 		usb_hcd_resume_root_hub(hcd);
 
 	ret = (changed) ? length : 0;
 
-	spin_unlock_irqrestore(&v->lock, flags);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 	dprintk(D_MISC, "<vusb_hub_status %d\n", ret);
 
 	return ret;
@@ -799,7 +804,7 @@ static int
 vusb_hcd_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 		u16 wIndex, char *buf, u16 wLength)
 {
-	struct vusb *v;
+	struct vusb_vhcd *vhcd;
 	int	retval = 0;
 	unsigned long flags;
 	u32 status;
@@ -812,8 +817,8 @@ vusb_hcd_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 		return -ETIMEDOUT;
 	}
 
-	v = hcd_to_vusb (hcd);
-	spin_lock_irqsave (&v->lock, flags);
+	vhcd = hcd_to_vhcd(hcd);
+	spin_lock_irqsave(&vhcd->lock, flags);
 	switch (typeReq) {
 	case ClearHubFeature:
 		break;
@@ -821,22 +826,22 @@ vusb_hcd_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 		dprintk(D_CTRL, "ClearPortFeature port %d val: 0x%04x\n",
 				wIndex, wValue);
 		vusb_check_port("ClearPortFeature", wIndex);
-	    clear_port_feature(v, vusb_device_by_port(v, wIndex), wValue);
+	    	clear_port_feature(vusb_device_by_port(vhcd, wIndex), wValue);
 		break;
 	case GetHubDescriptor:
-		vusb_hub_descriptor ((struct usb_hub_descriptor *)buf);
+		vusb_hub_descriptor((struct usb_hub_descriptor *)buf);
 		break;
 	case GetHubStatus:
 		/* Always local power supply good and no over-current exists. */
-		*(__le32 *) buf = cpu_to_le32 (0);
+		*(__le32 *)buf = cpu_to_le32(0);
 		break;
 	case GetPortStatus:
 		vusb_check_port("GetPortStatus", wIndex);
-		status = vusb_device_by_port(v, wIndex)->port_status;
-		status = v->vdev_ports[wIndex-1].port_status;
+		status = vusb_device_by_port(vhcd, wIndex)->port_status;
+		status = vhcd->vdev_ports[wIndex-1].port_status;
 		dprintk(D_CTRL, "GetPortStatus port %d = 0x%08x\n", wIndex, status);
-		((__le16 *) buf)[0] = cpu_to_le16 (status);
-		((__le16 *) buf)[1] = cpu_to_le16 (status >> 16);
+		((__le16 *) buf)[0] = cpu_to_le16(status);
+		((__le16 *) buf)[1] = cpu_to_le16(status >> 16);
 		break;
 	case SetHubFeature:
 		retval = -EPIPE;
@@ -844,21 +849,21 @@ vusb_hcd_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 	case SetPortFeature:
 		vusb_check_port("SetPortStatus", wIndex);
 		dprintk(D_CTRL, "SetPortFeature port %d val: 0x%04x\n", wIndex, wValue);
-		set_port_feature(v, vusb_device_by_port(v, wIndex), wValue);
+		set_port_feature(vhcd, vusb_device_by_port(vhcd, wIndex), wValue);
 		break;
 
 	default:
-		dev_dbg (vusb_dev(v),
+		dev_dbg(vusb_dev(vhcd),
 			"hub control req%04x v%04x i%04x l%d\n",
 			typeReq, wValue, wIndex, wLength);
 
 		/* "protocol stall" on error */
 		retval = -EPIPE;
 	}
-	spin_unlock_irqrestore (&v->lock, flags);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	if (wIndex >= 1 && wIndex <= VUSB_PORTS) {
-		if ((vusb_device_by_port(v, wIndex)->port_status & PORT_C_MASK) != 0)
+		if ((vusb_device_by_port(vhcd, wIndex)->port_status & PORT_C_MASK) != 0)
 			 usb_hcd_poll_rh_status (hcd);
 	}
 
@@ -870,14 +875,14 @@ vusb_hcd_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 static int
 vusb_hcd_bus_suspend(struct usb_hcd *hcd)
 {
-	struct vusb *v = hcd_to_vusb(hcd);
+	struct vusb_vhcd *vhcd = hcd_to_vhcd(hcd);
 	unsigned long flags;
 
 	dprintk(D_PM, "Bus suspend\n");
 
-	spin_lock_irqsave(&v->lock, flags);
-	v->rh_state = VUSB_RH_SUSPENDED;
-	spin_unlock_irqrestore(&v->lock, flags);
+	spin_lock_irqsave(&vhcd->lock, flags);
+	vhcd->rh_state = VUSB_RH_SUSPENDED;
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	return 0;
 }
@@ -885,19 +890,19 @@ vusb_hcd_bus_suspend(struct usb_hcd *hcd)
 static int
 vusb_hcd_bus_resume(struct usb_hcd *hcd)
 {
-	struct vusb *v = hcd_to_vusb(hcd);
+	struct vusb_vhcd *vhcd = hcd_to_vhcd(hcd);
 	int rc = 0;
 
 	dprintk(D_PM, "Bus resume\n");
 
-	spin_lock_irq(&v->lock);
+	spin_lock_irq(&vhcd->lock);
 	if (!HCD_HW_ACCESSIBLE(hcd)) {
 		rc = -ESHUTDOWN;
 	} else {
-		v->rh_state = VUSB_RH_RUNNING;
+		vhcd->rh_state = VUSB_RH_RUNNING;
 		hcd->state = HC_STATE_RUNNING;
 	}
-	spin_unlock_irq (&v->lock);
+	spin_unlock_irq(&vhcd->lock);
 	return rc;
 }
 #endif /* CONFIG_PM */
@@ -906,7 +911,7 @@ vusb_hcd_bus_resume(struct usb_hcd *hcd)
 static const struct hc_driver vusb_hcd_driver = {
 	.description = VUSB_HCD_DRIVER_NAME,
 	.product_desc =	VUSB_DRIVER_DESC,
-	.hcd_priv_size = sizeof(struct vusb),
+	.hcd_priv_size = sizeof(struct vusb_vhcd),
 
 	.flags = HCD_USB2,
 
@@ -932,11 +937,11 @@ static const struct hc_driver vusb_hcd_driver = {
 
 /* Retrieve a URB by handle */
 static struct vusb_urbp*
-vusb_urb_by_handle(struct vusb *v, struct vusb_device *vdev, u16 handle)
+vusb_urb_by_handle(struct vusb_vhcd *vhcd, struct vusb_device *vdev, u16 handle)
 {
 	struct vusb_urbp *urbp;
 
-	list_for_each_entry(urbp, &v->urbp_list, urbp_list) {
+	list_for_each_entry(urbp, &vhcd->urbp_list, urbp_list) {
 		/*
 		 * Check both handle and port to avoid to use an URB
 		 * of another device
@@ -947,14 +952,14 @@ vusb_urb_by_handle(struct vusb *v, struct vusb_device *vdev, u16 handle)
 
 	dprintk(D_URB1, "Unable to retrieve URB handle 0x%x port %u\n",
 		handle, vdev->port);
-	vusb_urbp_list_dump(v, __FUNCTION__);
+	vusb_urbp_list_dump(vhcd, __FUNCTION__);
 
 	return NULL;
 }
 
 /* Common part to finish an URB request */
 static void
-vusb_urb_common_finish(struct vusb *v, struct vusb_urbp *urbp, bool in,
+vusb_urb_common_finish(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp, bool in,
 			u32 len, const u8 *data)
 {
 	struct urb *urb = urbp->urb;
@@ -997,14 +1002,14 @@ vusb_urb_common_finish(struct vusb *v, struct vusb_urbp *urbp, bool in,
 		}
 	}
 
-	vusb_urbp_release(v, urbp);
+	vusb_urbp_release(vhcd, urbp);
 }
 
 /*
  * Finish an isochronous URB
  */
 static void
-vusb_urb_isochronous_finish(struct vusb *v, struct vusb_urbp *urbp,
+vusb_urb_isochronous_finish(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp,
 			u32 len, const u8 *data)
 {
 	struct urb *urb = urbp->urb;
@@ -1046,7 +1051,7 @@ vusb_urb_isochronous_finish(struct vusb *v, struct vusb_urbp *urbp,
 
 	urb->actual_length = dlen;
 
-	vusb_urbp_release(v, urbp);
+	vusb_urbp_release(vhcd, urbp);
 	return;
 
 iso_err:
@@ -1057,12 +1062,12 @@ iso_err:
 	}
 	urb->actual_length = 0;
 
-	vusb_urbp_release(v, urbp);
+	vusb_urbp_release(vhcd, urbp);
 }
 
 /* Finish a control URB */
 static void
-vusb_urb_control_finish(struct vusb *v, struct vusb_urbp *urbp, u32 len, const u8 *data)
+vusb_urb_control_finish(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp, u32 len, const u8 *data)
 {
 	const struct usb_ctrlrequest *ctrl;
 	bool in;
@@ -1071,25 +1076,21 @@ vusb_urb_control_finish(struct vusb *v, struct vusb_urbp *urbp, u32 len, const u
 
 	in = (ctrl->bRequestType & USB_DIR_IN) != 0;
 
-	vusb_urb_common_finish(v, urbp, in, len, data);
+	vusb_urb_common_finish(vhcd, urbp, in, len, data);
 }
 
 /* Finish a bulk URB */
 static void
-vusb_urb_bulk_finish(struct vusb *v, struct vusb_urbp *urbp, u32 len, const u8 *data)
+vusb_urb_bulk_finish(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp, u32 len, const u8 *data)
 {
-	vusb_urb_common_finish(v, urbp,
-			usb_urb_dir_in(urbp->urb),
-			len, data);
+	vusb_urb_common_finish(vhcd, urbp, usb_urb_dir_in(urbp->urb), len, data);
 }
 
 /* Finish an interrupt URB */
 static void
-vusb_urb_interrupt_finish(struct vusb *v, struct vusb_urbp *urbp, u32 len, const u8 *data)
+vusb_urb_interrupt_finish(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp, u32 len, const u8 *data)
 {
-	vusb_urb_common_finish(v, urbp,
-			usb_urb_dir_in(urbp->urb),
-			len, data);
+	vusb_urb_common_finish(vhcd, urbp, usb_urb_dir_in(urbp->urb), len, data);
 }
 
 /* Convert status to errno */
@@ -1139,13 +1140,13 @@ vusb_status_to_string(u32 status)
  * @packet: used by isochronous URB because we need the header FIXME
  */
 static void
-vusb_urb_finish(struct vusb *v, struct vusb_device *vdev, u16 handle,
+vusb_urb_finish(struct vusb_vhcd *vhcd, struct vusb_device *vdev, u16 handle,
 		u32 status, u32 len, const u8 *data)
 {
 	struct vusb_urbp *urbp;
 	struct urb *urb;
 
-	urbp = vusb_urb_by_handle(v, vdev, handle);
+	urbp = vusb_urb_by_handle(vhcd, vdev, handle);
 
 	if (!urbp) {
 		dprintk(D_WARN, "Bad handle (0x%x) for Device ID (%u)\n",
@@ -1158,19 +1159,19 @@ vusb_urb_finish(struct vusb *v, struct vusb_device *vdev, u16 handle,
 
 	switch (usb_pipetype(urb->pipe)) {
 	case PIPE_ISOCHRONOUS:
-		vusb_urb_isochronous_finish(v, urbp, len, data);
+		vusb_urb_isochronous_finish(vhcd, urbp, len, data);
 		break;
 
 	case PIPE_CONTROL:
-		vusb_urb_control_finish(v, urbp, len, data);
+		vusb_urb_control_finish(vhcd, urbp, len, data);
 		break;
 
 	case PIPE_INTERRUPT:
-		vusb_urb_interrupt_finish(v, urbp, len, data);
+		vusb_urb_interrupt_finish(vhcd, urbp, len, data);
 		break;
 
 	case PIPE_BULK:
-		vusb_urb_bulk_finish(v, urbp, len, data);
+		vusb_urb_bulk_finish(vhcd, urbp, len, data);
 		break;
 
 	default:
@@ -1181,7 +1182,7 @@ vusb_urb_finish(struct vusb *v, struct vusb_device *vdev, u16 handle,
 
 /* Handle command URB response */
 static void
-vusb_handle_urb_response(struct vusb *v, const void *packet)
+vusb_handle_urb_response(struct vusb_vhcd *vhcd, const void *packet)
 {
 	unsigned long flags;
 	struct vusb_device *vdev;
@@ -1191,22 +1192,22 @@ vusb_handle_urb_response(struct vusb *v, const void *packet)
 
 	/* STUB sanity check and get response values */
 
-	spin_lock_irqsave(&v->lock, flags);
+	spin_lock_irqsave(&vhcd->lock, flags);
 
-	vdev = vusb_device_by_devid(v, 0 /* STUB logical device ID */);
+	vdev = vusb_device_by_devid(vhcd, 0 /* STUB logical device ID */);
 	if (!vdev) {
 		wprintk("Bad device ID (%u) in URB response\n", 0);
 		goto out;
 	}
 
-	vusb_urb_finish(v, vdev, handle, status, len, NULL /* STUB the response data */);
+	vusb_urb_finish(vhcd, vdev, handle, status, len, NULL /* STUB the response data */);
 out:
-	spin_unlock_irqrestore(&v->lock, flags);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
 
 /* Handle command URB status */
 static void
-vusb_handle_urb_status(struct vusb *v, const void *packet)
+vusb_handle_urb_status(struct vusb_vhcd *vhcd, const void *packet)
 {
 	unsigned long flags;
 	struct vusb_device *vdev;
@@ -1215,17 +1216,17 @@ vusb_handle_urb_status(struct vusb *v, const void *packet)
 
 	/* STUB sanity check and get status values */
 
-	spin_lock_irqsave(&v->lock, flags);
+	spin_lock_irqsave(&vhcd->lock, flags);
 
-	vdev = vusb_device_by_devid(v, 0 /* STUB logical device ID */);
+	vdev = vusb_device_by_devid(vhcd, 0 /* STUB logical device ID */);
 	if (!vdev) {
 		wprintk("Bad device ID (%u) in URB Status\n", 0);
 		goto out;
 	}
 
-	vusb_urb_finish(v, vdev, handle, status, 0, NULL);
+	vusb_urb_finish(vhcd, vdev, handle, status, 0, NULL);
 out:
-	spin_unlock_irqrestore(&v->lock, flags);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
 
 /*
@@ -1236,15 +1237,15 @@ out:
  * @has_data: if true, length will be the one of the transfer buffer
  */
 static void
-vusb_initialize_urb_packet(struct vusb *v, void *packet,
+vusb_initialize_urb_packet(struct vusb_vhcd *vhcd, void *packet,
 		const struct vusb_urbp *urbp, struct vusb_device *vdev,
 		u8 command, u32 hlen, bool has_data)
 {
 	if (has_data) /* Outbound request */
-		vusb_initialize_packet(v, packet, vdev->deviceid,
+		vusb_initialize_packet(vhcd, packet, vdev->deviceid,
 				command, hlen, urbp->urb->transfer_buffer_length);
 	else
-		vusb_initialize_packet(v, packet, vdev->deviceid,
+		vusb_initialize_packet(vhcd, packet, vdev->deviceid,
 				command, hlen, 0);
 
 	/* STUB get logical handle: urbp->handle */
@@ -1257,7 +1258,7 @@ vusb_initialize_urb_packet(struct vusb *v, void *packet,
  * Doesn't fit for isochronous request
  */
 static int
-vusb_send_urb_packet(struct vusb *v, struct vusb_urbp *urbp, 
+vusb_send_urb_packet(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp, 
 		void *packet, u32 hlen, bool has_data)
 {
 	vusb_create_packet(iovec, 2);
@@ -1268,7 +1269,7 @@ vusb_send_urb_packet(struct vusb *v, struct vusb_urbp *urbp,
 		vusb_set_packet_data(iovec, urbp->urb->transfer_buffer,
 				urbp->urb->transfer_buffer_length);
 
-	r = vusb_send_packet(v, iovec, (has_data) ? 2 : 1);
+	r = vusb_send_packet(vhcd, iovec, (has_data) ? 2 : 1);
 
 	if (r < 0) {
 		/* An error occured drop the URB and notify the USB stack */
@@ -1317,7 +1318,7 @@ vusb_urb_to_endpoint(struct urb *urb)
 
 /* Send an urb control to the host */
 static void
-vusb_send_control_urb(struct vusb *v, struct vusb_urbp *urbp)
+vusb_send_control_urb(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 {
 	struct urb *urb = urbp->urb;
 	struct vusb_device *vdev;
@@ -1350,7 +1351,7 @@ vusb_send_control_urb(struct vusb *v, struct vusb_urbp *urbp)
 	dprint_hex_dump(D_URB2, "SET: ", DUMP_PREFIX_OFFSET, 16, 1, ctrl, 8, true);
 
 	/* Retrieve the device */
-	vdev = vusb_device_by_port(v, urbp->port);
+	vdev = vusb_device_by_port(vhcd, urbp->port);
 
 	switch (typeReq) {
 	case DeviceOutRequest | USB_REQ_SET_ADDRESS:
@@ -1363,7 +1364,7 @@ vusb_send_control_urb(struct vusb *v, struct vusb_urbp *urbp)
 
 	case DeviceOutRequest | USB_REQ_SET_CONFIGURATION:
 		hlen = 0 /* STUB set configuration length */;
-		vusb_initialize_urb_packet(v, &packet, urbp, vdev,
+		vusb_initialize_urb_packet(vhcd, &packet, urbp, vdev,
 				0 /* STUB set configuration internal command */,
 				hlen, false);
 
@@ -1372,7 +1373,7 @@ vusb_send_control_urb(struct vusb *v, struct vusb_urbp *urbp)
 
 	case InterfaceOutRequest | USB_REQ_SET_INTERFACE:
 		hlen = 0 /* STUB select interface length */;
-		vusb_initialize_urb_packet(v, &packet, urbp, vdev,
+		vusb_initialize_urb_packet(vhcd, &packet, urbp, vdev,
 				0 /* STUB select interface  internal command */,
 				hlen, false);
 
@@ -1381,19 +1382,19 @@ vusb_send_control_urb(struct vusb *v, struct vusb_urbp *urbp)
 
 	default:
 		hlen = 0 /* STUB control length */;
-		vusb_initialize_urb_packet(v, &packet, urbp, vdev,
+		vusb_initialize_urb_packet(vhcd, &packet, urbp, vdev,
 				0 /* STUB control internal command */,
 				hlen, !in);
 
 		/* STUB finish packet setup */
 	}
 
-	vusb_send_urb_packet(v, urbp, &packet, hlen, has_data /* STUB may or may not have data in packet */);
+	vusb_send_urb_packet(vhcd, urbp, &packet, hlen, has_data /* STUB may or may not have data in packet */);
 }
 
 /* Send an URB interrup command */
 static void
-vusb_send_interrupt_urb(struct vusb *v, struct vusb_urbp *urbp)
+vusb_send_interrupt_urb(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 {
 	struct urb *urb = urbp->urb;
 	struct vusb_device *vdev;
@@ -1404,23 +1405,23 @@ vusb_send_interrupt_urb(struct vusb *v, struct vusb_urbp *urbp)
 		usb_pipeendpoint(urb->pipe),
 		usb_urb_dir_in(urb));
 
-	vdev = vusb_device_by_port(v, urbp->port);
+	vdev = vusb_device_by_port(vhcd, urbp->port);
 
-	vusb_initialize_urb_packet(v, &packet, urbp, vdev,
+	vusb_initialize_urb_packet(vhcd, &packet, urbp, vdev,
 			0 /* STUB interrupt internal command */,
 			0 /* STUB interrupt length */,
 			usb_urb_dir_out(urb));
 
 	/* STUB finish packet setup */
 
-	vusb_send_urb_packet(v, urbp, &packet,
+	vusb_send_urb_packet(vhcd, urbp, &packet,
 			0 /* STUB interrupt length */,
 			usb_urb_dir_out(urb));
 }
 
 /* Send an URB bulk command */
 static void
-vusb_send_bulk_urb(struct vusb *v, struct vusb_urbp *urbp)
+vusb_send_bulk_urb(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 {
 	struct urb *urb = urbp->urb;
 	struct vusb_device *vdev;
@@ -1431,23 +1432,23 @@ vusb_send_bulk_urb(struct vusb *v, struct vusb_urbp *urbp)
 		usb_pipeendpoint(urb->pipe),
 		usb_urb_dir_in(urb));
 
-	vdev = vusb_device_by_port(v, urbp->port);
+	vdev = vusb_device_by_port(vhcd, urbp->port);
 
-	vusb_initialize_urb_packet(v, &packet, urbp, vdev,
+	vusb_initialize_urb_packet(vhcd, &packet, urbp, vdev,
 			0 /* STUB bulk internal command */,
 			0 /* STUB bulk length */,
 			usb_urb_dir_out(urb));
 
 	/* STUB finish packet setup */
 
-	vusb_send_urb_packet(v, urbp, &packet,
+	vusb_send_urb_packet(vhcd, urbp, &packet,
 			0 /* STUB bulk length */,
 			usb_urb_dir_out(urb));
 }
 
 /* Send an isochronous urb command */
 static void
-vusb_send_isochronous_urb(struct vusb *v, struct vusb_urbp *urbp)
+vusb_send_isochronous_urb(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 {
 	struct urb *urb = urbp->urb;
 	struct vusb_device *vdev;
@@ -1465,10 +1466,10 @@ vusb_send_isochronous_urb(struct vusb *v, struct vusb_urbp *urbp)
 
 	dprintk(D_URB2, "Number of packets = %u\n", urb->number_of_packets);
 
-	vdev = vusb_device_by_port(v, urbp->port);
+	vdev = vusb_device_by_port(vhcd, urbp->port);
 
 	/* Use the common urb initialization packet but fix ByteCount */
-	vusb_initialize_urb_packet(v, &packet, urbp, vdev,
+	vusb_initialize_urb_packet(vhcd, &packet, urbp, vdev,
 			0 /* STUB isoch internal command */,
 			0 /* STUB isoch length */,
 			usb_urb_dir_out(urb));
@@ -1490,7 +1491,7 @@ vusb_send_isochronous_urb(struct vusb *v, struct vusb_urbp *urbp)
 		vusb_iov_set(iovec, 2, urb->transfer_buffer,
 				urb->transfer_buffer_length);
 
-	r = vusb_send_packet(v, iovec, (usb_urb_dir_out(urb)) ? 3 : 2);
+	r = vusb_send_packet(vhcd, iovec, (usb_urb_dir_out(urb)) ? 3 : 2);
 
 	if (r < 0) {
 		/* An error occured drop the URB and notify the USB stack */
@@ -1502,13 +1503,13 @@ vusb_send_isochronous_urb(struct vusb *v, struct vusb_urbp *urbp)
 
 /* Send a cancel URB command */
 static void
-vusb_send_cancel_urb(struct vusb *v, struct vusb_device *vdev,
+vusb_send_cancel_urb(struct vusb_vhcd *vhcd, struct vusb_device *vdev,
 		struct vusb_urbp *urbp)
 {
 	vusb_create_packet(iovec, 1);
 	void *packet;
 
-	vusb_initialize_packet(v, &packet, vdev->deviceid,
+	vusb_initialize_packet(vhcd, &packet, vdev->deviceid,
 			0 /* STUB cancel internal command */,
 			0 /* STUB cancel length */,
 			0);
@@ -1519,12 +1520,12 @@ vusb_send_cancel_urb(struct vusb *v, struct vusb_device *vdev,
 		vdev->deviceid, vdev->port, urbp->handle);
 
 	vusb_set_packet_header(iovec, &packet, 0 /* STUB cancel length */);
-	vusb_send_packet(v, iovec, 1);
+	vusb_send_packet(vhcd, iovec, 1);
 }
 
 /* Send an URB */
 static void
-vusb_send_urb(struct vusb *v, struct vusb_urbp *urbp)
+vusb_send_urb(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 {
 	struct urb *urb = urbp->urb;
 	struct vusb_device *vdev;
@@ -1536,31 +1537,31 @@ vusb_send_urb(struct vusb *v, struct vusb_urbp *urbp)
 		urbp->handle, vusb_state_to_string(urbp),
 		vusb_pipe_to_string(urb), type);
 
-	vdev = vusb_device_by_port(v, urbp->port);
+	vdev = vusb_device_by_port(vhcd, urbp->port);
 
 	if (urbp->state == VUSB_URBP_NEW) {
 		switch (type) {
 		case PIPE_ISOCHRONOUS:
-			vusb_send_isochronous_urb(v, urbp);
+			vusb_send_isochronous_urb(vhcd, urbp);
 			break;
 
 		case PIPE_INTERRUPT:
-			vusb_send_interrupt_urb(v, urbp);
+			vusb_send_interrupt_urb(vhcd, urbp);
 			break;
 
 		case PIPE_CONTROL:
-			vusb_send_control_urb(v, urbp);
+			vusb_send_control_urb(vhcd, urbp);
 			break;
 
 		case PIPE_BULK:
-			vusb_send_bulk_urb(v, urbp);
+			vusb_send_bulk_urb(vhcd, urbp);
 			break;
 
 		default:
 			wprintk("Unknown urb type %x\n", type);
 		}
 	} else if (urbp->state == VUSB_URBP_CANCEL) {
-		vusb_send_cancel_urb(v, vdev, urbp);
+		vusb_send_cancel_urb(vhcd, vdev, urbp);
 	}
 
 	if (urbp->state == VUSB_URBP_DONE ||
@@ -1569,7 +1570,7 @@ vusb_send_urb(struct vusb *v, struct vusb_urbp *urbp)
 		/* Remove URB */
 		dprintk(D_URB1, "URB immediate %s\n",
 			vusb_state_to_string(urbp));
-		vusb_urbp_release(v, urbp);
+		vusb_urbp_release(vhcd, urbp);
 	}
 }
 
@@ -1579,7 +1580,7 @@ vusb_send_urb(struct vusb *v, struct vusb_urbp *urbp)
  * - Browse and send URB
  */
 static void
-vusb_process_urbs(struct vusb *v)
+vusb_process_urbs(struct vusb_vhcd *vhcd)
 {
 	struct vusb_urbp *urbp;
 	struct vusb_urbp *next;
@@ -1588,26 +1589,26 @@ vusb_process_urbs(struct vusb *v)
 
 	dprintk(D_MISC, "process_urbs()\n");
 
-	spin_lock_irqsave(&v->lock, flags);
+	spin_lock_irqsave(&vhcd->lock, flags);
 
 	/* Check if we need to reset a device */
 	for (i = 0; i < VUSB_PORTS; i++) {
-		if (v->vdev_ports[i].reset == 1) {
-			v->vdev_ports[i].reset = 2;
-			vusb_send_reset_device_cmd(v, &v->vdev_ports[i]);
+		if (vhcd->vdev_ports[i].reset == 1) {
+			vhcd->vdev_ports[i].reset = 2;
+			vusb_send_reset_device_cmd(vhcd, &vhcd->vdev_ports[i]);
 		}
 	}
 
 	/* Browse URB list */
-	list_for_each_entry_safe(urbp, next, &v->urbp_list, urbp_list) {
-		vusb_send_urb(v, urbp);
+	list_for_each_entry_safe(urbp, next, &vhcd->urbp_list, urbp_list) {
+		vusb_send_urb(vhcd, urbp);
 	}
 
-	spin_unlock_irqrestore(&v->lock, flags);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 
-	if (v->poll) { /* Update Hub status */
-		v->poll = 0;
-		usb_hcd_poll_rh_status(vusb_to_hcd(v));
+	if (vhcd->poll) { /* Update Hub status */
+		vhcd->poll = 0;
+		usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
 	}
 }
 
@@ -1616,7 +1617,7 @@ vusb_process_urbs(struct vusb *v)
 
 /* Helper to cleanup data associated to the worker */
 static void
-vusb_worker_cleanup(struct vusb *v)
+vusb_worker_cleanup(struct vusb_vhcd *vhcd)
 {
 	struct vusb_urbp *urbp;
 	struct vusb_urbp *next;
@@ -1625,24 +1626,25 @@ vusb_worker_cleanup(struct vusb *v)
 
 	dprintk(D_PM, "Clean up the worker\n");
 
-	spin_lock_irqsave(&v->lock, flags);
-	v->rh_state = VUSB_INACTIVE;
+	spin_lock_irqsave(&vhcd->lock, flags);
+	vhcd->rh_state = VUSB_INACTIVE;
 
-	list_for_each_entry_safe(urbp, next, &v->urbp_list, urbp_list) {
+	list_for_each_entry_safe(urbp, next, &vhcd->urbp_list, urbp_list) {
 		struct vusb_device *vdev;
 
-		vdev = vusb_device_by_port(v, urbp->port);
+		vdev = vusb_device_by_port(vhcd, urbp->port);
 		urbp->urb->status = -ESHUTDOWN;
-		vusb_urbp_release(v, urbp);
+		vusb_urbp_release(vhcd, urbp);
 	}
 
 	/* Unplug all USB devices */
 	for (i = 0; i < VUSB_PORTS; i++) {
-		v->vdev_ports[i].port = i + 1;
-		v->vdev_ports[i].present = 0;
+		vhcd->vdev_ports[i].port = i + 1;
+		vhcd->vdev_ports[i].connecting = 0;
+		vhcd->vdev_ports[i].present = 0;
 	}
 
-	spin_unlock_irqrestore(&v->lock, flags);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
 
 /*
@@ -1651,7 +1653,7 @@ vusb_worker_cleanup(struct vusb *v)
  * - Send command if the task receive an interrupt (not efficient)
  */
 static void
-vusb_mainloop(struct vusb *v)
+vusb_mainloop(struct vusb_vhcd *vhcd)
 {
 	/* TODO RJP:
 	 * process writes to rings that were full.
@@ -1711,7 +1713,7 @@ vusb_mainloop(struct vusb *v)
 			r = vusb_process_packet(v, (void *)pbuf);
 			if (v->poll) { // Update Hub status
 				v->poll = 0;
-				usb_hcd_poll_rh_status(vusb_to_hcd(v));
+				usb_hcd_poll_rh_status(vhcd_to_hcd(v));
 			}
 
 			if (r < 0) {
@@ -1731,7 +1733,7 @@ static int
 vusb_threadfunc(void *data)
 {
 	mm_segment_t oldfs;
-	struct vusb *v = data;
+	struct vusb_vhcd *vhcd = data;
 
 	dprintk(D_VUSB1, "tf: In thread\n");
 
@@ -1744,14 +1746,14 @@ vusb_threadfunc(void *data)
 
 	/* Main loop */
 	set_current_state(TASK_INTERRUPTIBLE);
-	vusb_mainloop(v);
+	vusb_mainloop(vhcd);
 
 	dprintk(D_VUSB1, "tf: fp closed, thread going idle\n");
 
 	if (!kthread_should_stop())
 		wprintk("Unexpected TODO close\n");
 
-	vusb_worker_cleanup(v);
+	vusb_worker_cleanup(vhcd);
 
 	set_fs(oldfs);
 	while (!kthread_should_stop()) {
@@ -1763,7 +1765,7 @@ vusb_threadfunc(void *data)
 
 /* Helper to create the worker */
 static int
-vusb_worker_start(struct vusb *v)
+vusb_worker_start(struct vusb_vhcd *vhcd)
 {
 	int ret = 0;
 	u16 i = 0;
@@ -1772,18 +1774,19 @@ vusb_worker_start(struct vusb *v)
 
 	/* Initialize ports */
 	for (i = 0; i < VUSB_PORTS; i++) {
-		v->vdev_ports[i].port = i + 1;
-		v->vdev_ports[i].present = 0;
+		vhcd->vdev_ports[i].port = i + 1;
+		vhcd->vdev_ports[i].connecting = 0;
+		vhcd->vdev_ports[i].present = 0;
 	}
 
-	v->rh_state = VUSB_INACTIVE;
+	vhcd->rh_state = VUSB_INACTIVE;
 
 	/* TODO Opened v4v connection here - the vusb devices will do this for their rings*/
 
 	/* Create the main thread */
-	v->kthread = kthread_run(vusb_threadfunc, v, "vusb");
-	if (IS_ERR(v->kthread)) {
-		ret = PTR_ERR(v->kthread);
+	vhcd->kthread = kthread_run(vusb_threadfunc, vhcd, "vusb");
+	if (IS_ERR(vhcd->kthread)) {
+		ret = PTR_ERR(vhcd->kthread);
 		eprintk("unable to start the thread: %d", ret);
 		goto err;
 	}
@@ -1798,19 +1801,19 @@ err:
  * FIXME: there is a race condition with send_sig and kthread_stop
  */
 static inline void
-vusb_worker_stop(struct vusb *v)
+vusb_worker_stop(struct vusb_vhcd *vhcd)
 {
 	dprintk(D_PM, "Stop the worker\n");
 
-	send_sig(SIGINT, v->kthread, 0); /* To left the function read */
-	kthread_stop(v->kthread);
+	send_sig(SIGINT, vhcd->kthread, 0); /* To left the function read */
+	kthread_stop(vhcd->kthread);
 }
 
 /****************************************************************************/
 /* VUSB Devices  TODO RJP lots more here...                          */
 
 static int
-vusb_write(struct vusb *v, const void *buf, u32 len)
+vusb_write(struct vusb_vhcd *vhcd, const void *buf, u32 len)
 {
 	dprintk(D_VUSB2, "vusb_write %d\n", len);
 
@@ -1822,7 +1825,7 @@ vusb_write(struct vusb *v, const void *buf, u32 len)
 }
 
 static int
-vusb_read(struct vusb *v, void *buf, u32 len)
+vusb_read(struct vusb_vhcd *vhcd, void *buf, u32 len)
 {
 	dprintk(D_VUSB2, "vusb_read %d\n", len);
 
@@ -1842,7 +1845,7 @@ vusb_read(struct vusb *v, void *buf, u32 len)
  * @dlen: size of data
  */
 static void
-vusb_initialize_packet(struct vusb *v, void *packet, u16 devid,
+vusb_initialize_packet(struct vusb_vhcd *vhcd, void *packet, u16 devid,
 		u8 command, u32 hlen, u32 dlen)
 {
 	dprintk(D_URB2, "allocate packet len=%u\n",  hlen + dlen);
@@ -1854,7 +1857,7 @@ vusb_initialize_packet(struct vusb *v, void *packet, u16 devid,
  * A packet is describe as multiple vectors
  */
 static int
-vusb_send_packet(struct vusb *v, const struct iovec *iovec, size_t niov)
+vusb_send_packet(struct vusb_vhcd *vhcd, const struct iovec *iovec, size_t niov)
 {
 	/* TODO this was a r = vusb_write(v, iovec[i].iov_base, iovec[i].iov_len);*/
 
@@ -1862,21 +1865,27 @@ vusb_send_packet(struct vusb *v, const struct iovec *iovec, size_t niov)
 }
 
 static int
-vusb_add_device(struct vusb *v, u16 id, enum usb_device_speed speed)
+vusb_create_device(struct xenbus_device *dev)
+{
+	return 0;
+}
+
+static int
+vusb_add_device(struct vusb_vhcd *vhcd, u16 id, enum usb_device_speed speed)
 {
 	u16 i;
 	int retval = 0;
 	unsigned long flags;
 	struct vusb_device *vdev;
 
-	/* TODO this is where the xenbus devices will be hooked up */
-	spin_lock_irqsave (&v->lock, flags);
+	/* TODO RJP this is where the xenbus devices will be hooked up */
+	spin_lock_irqsave(&vhcd->lock, flags);
 	for (i = 0; i < VUSB_PORTS; i++) {
-		if (v->vdev_ports[i].present == 0)
+		if (vhcd->vdev_ports[i].present == 0)
 			break;
-		if (v->vdev_ports[i].deviceid == id) {
+		if (vhcd->vdev_ports[i].deviceid == id) {
 			wprintk("Device id 0x%04x already exists on port %d\n",
-			       id, v->vdev_ports[i].port);
+			       id, vhcd->vdev_ports[i].port);
 			retval = -EEXIST;
 			goto out;
 		}
@@ -1887,7 +1896,7 @@ vusb_add_device(struct vusb *v, u16 id, enum usb_device_speed speed)
 		retval = -ENOMEM;
 		goto out;
 	}
-	vdev = &v->vdev_ports[i];
+	vdev = &vhcd->vdev_ports[i];
 
 	vdev->present = 1;
 	vdev->deviceid = id;
@@ -1897,12 +1906,14 @@ vusb_add_device(struct vusb *v, u16 id, enum usb_device_speed speed)
 					 | USB_PORT_STAT_C_CONNECTION << 16;
 	INIT_LIST_HEAD(&vdev->urbp_list);
 
+	/* TODO RJP get link speed - need to send a packet to the backend to do this */
+
 	dprintk(D_PORT1, "new status: 0x%08x speed: 0x%04x\n",
 			vdev->port_status, speed);
-	set_link_state(v, vdev);
+	vusb_set_link_state(vdev);
 out:
-	spin_unlock_irqrestore(&v->lock, flags);
-	usb_hcd_poll_rh_status(vusb_to_hcd (v));
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+	usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
 	return 0;
 }
 
@@ -1912,7 +1923,7 @@ out:
  * return 0 if the packet was sent
  */
 static int
-vusb_send_bind_request(struct vusb *v)
+vusb_send_bind_request(struct vusb_vhcd *vhcd)
 {
 	/*vusb_create_packet(iovec, 1);*/
 	int r = 0;
@@ -1934,7 +1945,7 @@ vusb_send_bind_request(struct vusb *v)
  * Like TCP notify the host we received the ACK
  */
 static int
-vusb_send_bind_commit(struct vusb *v)
+vusb_send_bind_commit(struct vusb_vhcd *vhcd)
 {
 	/*vusb_create_packet(iovec, 1);*/
 	int r = 0;
@@ -1957,7 +1968,7 @@ vusb_send_bind_commit(struct vusb *v)
  */
 /* TODO RJP merge with vusb_add_device into one add routine */
 static int
-vusb_handle_announce_device(struct vusb *v, const void *packet)
+vusb_handle_announce_device(struct vusb_vhcd *vhcd, const void *packet)
 {
 	vusb_create_packet(iovec, 1);
 	int r;
@@ -1971,8 +1982,9 @@ vusb_handle_announce_device(struct vusb *v, const void *packet)
 	speed = USB_SPEED_FULL;
 	speed = USB_SPEED_HIGH;
 	*/
+	/* TODO RJP this will go away and only the add function will remain */
 
-	r = vusb_add_device(v, 0 /* STUB logical device ID */, speed);
+	r = vusb_add_device(vhcd, 0 /* STUB logical device ID */, speed);
 
 	if (r) /* TODO: Handle reject device here */
 		return r;
@@ -1980,7 +1992,7 @@ vusb_handle_announce_device(struct vusb *v, const void *packet)
 	/* STUB setup packet and accept the device */
 	/* TODO RJP bunch of stuff gone here, this will be xenbus stuffs now */
 
-	return vusb_send_packet(v, iovec, 1);
+	return vusb_send_packet(vhcd, iovec, 1);
 }
 
 /*
@@ -1989,33 +2001,33 @@ vusb_handle_announce_device(struct vusb *v, const void *packet)
  */
 /* TODO RJP make into device remove funcion */
 static void
-vusb_handle_device_gone(struct vusb *v, const void *packet)
+vusb_handle_device_gone(struct vusb_vhcd *vhcd, const void *packet)
 {
 	struct vusb_device *vdev = NULL;
 	unsigned long flags;
 
-	spin_lock_irqsave(&v->lock, flags);
+	spin_lock_irqsave(&vhcd->lock, flags);
 
-	vdev = vusb_device_by_devid(v, 0 /* STUB logical device ID */);
+	vdev = vusb_device_by_devid(vhcd, 0 /* STUB logical device ID */);
 	if (vdev) {
 		dprintk(D_PORT1, "Remove device from port %u\n", vdev->port);
 		vdev->present = 0;
-		set_link_state(v, vdev);
+		vusb_set_link_state(vdev);
 		/* Update hub status */
-		v->poll = 1;
+		vhcd->poll = 1;
 	} else
 		wprintk("Device gone message for unregister device?!\n");
 
-	spin_unlock_irqrestore(&v->lock, flags);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
 
 /* Process packet received from vusb daemon */
 static int
-vusb_process_packet(struct vusb *v, const void *packet)
+vusb_process_packet(struct vusb_vhcd *vhcd, const void *packet)
 {
 	int res = 0;
 
-	switch (v->state) {
+	switch (vhcd->state) {
 	case VUSB_WAIT_BIND_RESPONSE:
 		iprintk("Wait bind response send it\n");
 
@@ -2035,7 +2047,7 @@ vusb_process_packet(struct vusb *v, const void *packet)
 		break;
 
 	default:
-		wprintk("Invalid state %u in process_packet\n",	v->state);
+		wprintk("Invalid state %u in process_packet\n",	vhcd->state);
 		return -1;
 	}
 
@@ -2047,7 +2059,7 @@ vusb_process_packet(struct vusb *v, const void *packet)
  * TODO: Add return value and check return
  */
 static void
-vusb_send_reset_device_cmd(struct vusb *v, struct vusb_device *vdev)
+vusb_send_reset_device_cmd(struct vusb_vhcd *vhcd, struct vusb_device *vdev)
 {
 	vusb_create_packet(iovec, 1);
 	void *packet;
@@ -2055,41 +2067,41 @@ vusb_send_reset_device_cmd(struct vusb *v, struct vusb_device *vdev)
 	if (!vdev->present) {
 		wprintk("Ignore reset for not present device port %u\n", vdev->port);
 		vdev->reset = 0;
-		set_link_state(v, vdev);
+		vusb_set_link_state(vdev);
 		return;
 	}
 
 	dprintk(D_URB2, "Send reset command, port = %u\n", vdev->port);
 
-	vusb_initialize_packet(v, &packet, vdev->deviceid,
+	vusb_initialize_packet(vhcd, &packet, vdev->deviceid,
 			0 /* STUB reset internal command */,
 			0 /* STUB reset length */,
 			0);
 
 	vusb_set_packet_header(iovec, &packet, 0 /* STUB reset length */);
-	vusb_send_packet(v, iovec, 1);
+	vusb_send_packet(vhcd, iovec, 1);
 
 	/* Signal reset completion */
 	vdev->port_status |= (USB_PORT_STAT_C_RESET << 16);
 
-	set_link_state(v, vdev);
-	v->poll = 1;
+	vusb_set_link_state(vdev);
+	vhcd->poll = 1;
 }
 
 /****************************************************************************/
 /* VUSB Xen Devices & Driver                                                */
 
-static int vusb_usbfront_probe(struct xenbus_device *dev,
-			       const struct xenbus_device_id *id)
+static int
+vusb_usbfront_probe(struct xenbus_device *dev, const struct xenbus_device_id *id)
 {
-	return 0; /* TODO RJP device add here */
+	return vusb_create_device(dev); /* TODO RJP device add here */
 }
 
 /**
  * Callback received when the backend's state changes.
  */
-static void vusb_usbback_changed(struct xenbus_device *dev,
-				 enum xenbus_state backend_state)
+static void
+vusb_usbback_changed(struct xenbus_device *dev, enum xenbus_state backend_state)
 {
 	/* TODO RJP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
 
@@ -2102,28 +2114,24 @@ static void vusb_usbback_changed(struct xenbus_device *dev,
 		if (!xc_xenbus_exists(XBT_NIL, dev->otherend, "")) {
 			if (dev->state != XenbusStateClosed) {
 				printk(KERN_INFO "backend vanished, closing frontend\n");
-				/* TODO RJP netfront_close(dev);*/
+				/* TODO RJP netfront_close(dev); --> completely wipe the device*/
 			}
 		}
 		break;
 	case XenbusStateInitialising:
-		/* Have to sit this one out; The backend nodes detailing the features can yet not be written,
-		   as they are written in the probe() function, just before switch to InitWait state. This is now necessary
-		   because we do not assume the frontend domain is started later than backend domain,
-		   which used to be giving the backend driver time to write the nodes.
-		 */
-		break;
 	case XenbusStateInitialised:
 	case XenbusStateReconfiguring:
 	case XenbusStateReconfigured:
 	case XenbusStateConnected:
+		/* TODO RJP init and destroy/close on fail 
+		if (xennet_connect(dev) != 0)
+			break;*/
 		break;
 
 	case XenbusStateInitWait:
 		if (dev->state != XenbusStateInitialising && dev->state != XenbusStateClosed)
 			break;
-		/* TODO RJP if (xennet_connect(netdev) != 0)
-			break;*/
+		/* Frontend drives the backend from InitWait to Connected */
 		xc_xenbus_switch_state(dev, XenbusStateConnected);
 		break;
 
@@ -2132,17 +2140,18 @@ static void vusb_usbback_changed(struct xenbus_device *dev,
                 /*if (np->suspending)
                         break;*/
 		if (dev->state != XenbusStateClosed)
-			/* TODO RJP netfront_close(dev);*/
+			/* TODO RJP netfront_close(dev); --> need surprise removal semantics here too and no reconnect.*/
 			;
 		else 
-			xc_xenbus_switch_state(dev, XenbusStateInitialising);
+			xc_xenbus_switch_state(dev, XenbusStateInitialising); /* TODO RJP NO! */
 		break;
 	}
 }
 
-static int vusb_xenusb_remove(struct xenbus_device *dev)
+static int
+vusb_xenusb_remove(struct xenbus_device *dev)
 {
-	/* TODO JRP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
+	/* TODO RJP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
 
 	dev_dbg(&dev->dev, "%s\n", dev->nodename);
 
@@ -2156,9 +2165,10 @@ static int vusb_xenusb_remove(struct xenbus_device *dev)
 	return 0;
 }
 
-static int vusb_usbfront_suspend(struct xenbus_device *dev)
+static int
+vusb_usbfront_suspend(struct xenbus_device *dev)
 {
-	/* TODO JRP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
+	/* TODO RJP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
 
 	mutex_lock(&vusb_xen_pm_mutex);
 	printk(KERN_INFO "xen_netif: pm freeze event received, detaching netfront\n");
@@ -2179,10 +2189,11 @@ static int vusb_usbfront_suspend(struct xenbus_device *dev)
 	return 0;
 }
 
-static int vusb_usbfront_resume(struct xenbus_device *dev)
+static int
+vusb_usbfront_resume(struct xenbus_device *dev)
 {
 	int err = 0;
-	/* TODO JRP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
+	/* TODO RJP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
 
 	mutex_lock(&vusb_xen_pm_mutex);
 	printk(KERN_INFO "xen_usbif: pm restore event received, unregister net device\n");
@@ -2216,7 +2227,8 @@ static struct xenbus_driver vusb_usbfront_driver = {
 	.otherend_changed = vusb_usbback_changed,
 };
 
-static int vusb_xen_init(void)
+static int
+vusb_xen_init(void)
 {
 
 	int rc = 0;
@@ -2237,7 +2249,8 @@ out:
 	return rc;
 }
 
-static void vusb_xen_unregister(void)
+static void
+vusb_xen_unregister(void)
 {
 	mutex_lock(&vusb_xen_pm_mutex);
 	xc_xenbus_unregister_driver(&vusb_usbfront_driver);
@@ -2253,7 +2266,7 @@ vusb_platform_probe(struct platform_device *pdev)
 {
 	struct usb_hcd *hcd;
 	int retval;
-	struct vusb *v;
+	struct vusb_vhcd *vhcd;
 
 	if (usb_disabled())
 		return -ENODEV;
@@ -2268,12 +2281,12 @@ vusb_platform_probe(struct platform_device *pdev)
 	/* Indicate the USB stack that both Super and Full Speed are supported */
 	hcd->has_tt = 1;
 
-	v = hcd_to_vusb(hcd);
+	vhcd = hcd_to_vhcd(hcd);
 
-	spin_lock_init(&v->lock);
-	INIT_LIST_HEAD(&v->urbp_list);
+	spin_lock_init(&vhcd->lock);
+	INIT_LIST_HEAD(&vhcd->urbp_list);
 
-	retval = vusb_worker_start(v);
+	retval = vusb_worker_start(vhcd);
 	if (retval != 0)
 		goto err_worker;
 
@@ -2286,7 +2299,7 @@ vusb_platform_probe(struct platform_device *pdev)
 	return 0;
 
 err_add:
-	vusb_worker_stop(v);
+	vusb_worker_stop(vhcd);
 err_worker:
 	usb_put_hcd(hcd);
 
@@ -2300,7 +2313,7 @@ static int
 vusb_platform_remove(struct platform_device *pdev)
 {
 	struct usb_hcd *hcd;
-	struct vusb *v;
+	struct vusb_vhcd *vhcd;
 
 	hcd = platform_get_drvdata(pdev);
 
@@ -2314,10 +2327,10 @@ vusb_platform_remove(struct platform_device *pdev)
 
 	usb_remove_hcd(hcd);
 
-	v = hcd_to_vusb(hcd);
+	vhcd = hcd_to_vhcd(hcd);
 
 	/* Stop the main thread and release its memory */
-	vusb_worker_stop(v);
+	vusb_worker_stop(vhcd);
 
 	usb_put_hcd(hcd);
 
@@ -2334,29 +2347,28 @@ vusb_platform_freeze(struct device *dev)
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct usb_hcd *hcd;
-	struct vusb *v;
+	struct vusb_vhcd *vhcd;
 	int rc = 0;
 	unsigned long flags;
 
 	iprintk("HCD freeze\n");
 
 	hcd = platform_get_drvdata(pdev);
-	v = hcd_to_vusb(hcd);
-	spin_lock_irqsave(&v->lock, flags);
+	vhcd = hcd_to_vhcd(hcd);
+	spin_lock_irqsave(&vhcd->lock, flags);
 
-	dprintk(D_PM, "root hub state %s (%u)\n",
-		vusb_rhstate_to_string(v),
-		v->rh_state);
+	dprintk(D_PM, "root hub state %s (%u)\n", vusb_rhstate_to_string(vhcd),
+		vhcd->rh_state);
 
-	if (v->rh_state == VUSB_RH_RUNNING) {
+	if (vhcd->rh_state == VUSB_RH_RUNNING) {
 		wprintk("Root hub isn't suspended!\n");
 		rc = -EBUSY;
 	} else
 		clear_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
-	spin_unlock_irqrestore(&v->lock, flags);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	if (rc == 0)
-		vusb_worker_stop(v);
+		vusb_worker_stop(vhcd);
 
 	return rc;
 }
@@ -2368,21 +2380,21 @@ vusb_platform_restore(struct device *dev)
 	struct platform_device *pdev = to_platform_device(dev);
 	struct usb_hcd *hcd;
 	unsigned long flags;
-	struct vusb *v;
+	struct vusb_vhcd *vhcd;
 	int rc = 0;
 
 	iprintk("HCD restore\n");
 
 	hcd = platform_get_drvdata(pdev);
-	v = hcd_to_vusb(hcd);
+	vhcd = hcd_to_vhcd(hcd);
 
-	spin_lock_irqsave(&v->lock, flags);
+	spin_lock_irqsave(&vhcd->lock, flags);
 	set_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
-	spin_unlock_irqrestore(&v->lock, flags);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 
-	rc = vusb_worker_start(v);
+	rc = vusb_worker_start(vhcd);
 	if (rc != 0)
-		usb_hcd_poll_rh_status (hcd);
+		usb_hcd_poll_rh_status(hcd);
 
 	return rc;
 }
