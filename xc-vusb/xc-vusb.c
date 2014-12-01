@@ -134,6 +134,26 @@ do {								\
 	}							\
 } while (0)
 
+/*
+ * Convenient alias to declare an iovec
+ * @packet: name of the packet
+ * @nchunk: number of chunk (ex: 2 => header + data)
+ */
+#define vusb_create_packet(name, nchunk) struct iovec name[(nchunk)]
+
+/* Convenient alias to set header/data */
+#define vusb_iov_set(packet, off, data, len)			\
+	do {							\
+		(packet)[(off)].iov_base = (data);		\
+		(packet)[(off)].iov_len = (len);		\
+	} while (0)
+
+#define vusb_set_packet_header(packet, header, hlen)		\
+	vusb_iov_set(packet, 0, header, hlen)
+
+#define vusb_set_packet_data(packet, data, dlen)		\
+	vusb_iov_set(packet, 1, data, dlen)
+
 /* Possible state of an urbp */
 enum vusb_urbp_state {
 	VUSB_URBP_NEW,
@@ -208,7 +228,15 @@ struct vusb {
 };
 
 static struct platform_device *vusb_platform_device = NULL;
-static DEFINE_MUTEX(xenusb_pm_mutex);
+static DEFINE_MUTEX(vusb_xen_pm_mutex);
+
+static int
+vusb_send_packet(struct vusb *v, const struct iovec *iovec, size_t niov);
+static void
+vusb_initialize_packet(struct vusb *v, void *packet, u16 devid,
+		u8 command, u32 hlen, u32 dlen);
+static void
+vusb_send_reset_device_cmd(struct vusb *v, struct vusb_device *vdev);
 
 /****************************************************************************/
 /* Miscellaneous Routines                                                   */
@@ -898,298 +926,6 @@ static const struct hc_driver vusb_hcd_driver = {
 	.bus_resume = vusb_hcd_bus_resume,
 #endif /* CONFIG_PM */
 };
-
-/****************************************************************************/
-/* VUSB Devices  TODO RJP lots more here...                          */
-
-static int
-vusb_write(struct vusb *v, const void *buf, u32 len)
-{
-	dprintk(D_VUSB2, "vusb_write %d\n", len);
-
-	/* TODO RJP maybe reuse this write routine r = v->fp->f_op->write(v->fp, buf, len, NULL);*/
-
-	dprintk(D_VUSB2, "write returned %d\n", r);
-
-	return 0;
-}
-
-static int
-vusb_read(struct vusb *v, void *buf, u32 len)
-{
-	dprintk(D_VUSB2, "vusb_read %d\n", len);
-
-	/* TODO RJP maybe reuse this read routine r = v->fp->f_op->read(v->fp, buf, len, 0L);*/
-
-	dprintk(D_VUSB2, "read returned %d\n", r);
-
-	return 0;
-}
-
-/**
- * Inititialize a packet header to send
- * @packet: packet to initialize (already allocated)
- * @devid: device id used to discuss with the host
- * @command: what do we want?
- * @hlen: size of header
- * @dlen: size of data
- */
-static void
-vusb_initialize_packet(struct vusb *v, void *packet, u16 devid,
-		u8 command, u32 hlen, u32 dlen)
-{
-	dprintk(D_URB2, "allocate packet len=%u\n",  hlen + dlen);
-	/* STUB */
-}
-
-/*
- * Send a request to the host
- * A packet is describe as multiple vectors
- */
-static int
-vusb_send_packet(struct vusb *v, const struct iovec *iovec, size_t niov)
-{
-	/* TODO this was a r = vusb_write(v, iovec[i].iov_base, iovec[i].iov_len);*/
-
-	return 0;
-}
-
-static int
-vusb_add_device(struct vusb *v, u16 id, enum usb_device_speed speed)
-{
-	u16 i;
-	int retval = 0;
-	unsigned long flags;
-	struct vusb_device *vdev;
-
-	/* TODO this is where the xenbus devices will be hooked up */
-	spin_lock_irqsave (&v->lock, flags);
-	for (i = 0; i < VUSB_PORTS; i++) {
-		if (v->vdev_ports[i].present == 0)
-			break;
-		if (v->vdev_ports[i].deviceid == id) {
-			wprintk("Device id 0x%04x already exists on port %d\n",
-			       id, v->vdev_ports[i].port);
-			retval = -EEXIST;
-			goto out;
-		}
-	}
-
-	if (i >= VUSB_PORTS) {
-		printk(KERN_INFO "Attempt to add a device but no free ports on the root hub.\n");
-		retval = -ENOMEM;
-		goto out;
-	}
-	vdev = &v->vdev_ports[i];
-
-	vdev->present = 1;
-	vdev->deviceid = id;
-	vdev->speed = speed;
-	vdev->port_status |= usb_speed_to_port_stat(speed)
-					 | USB_PORT_STAT_CONNECTION
-					 | USB_PORT_STAT_C_CONNECTION << 16;
-	INIT_LIST_HEAD(&vdev->urbp_list);
-
-	dprintk(D_PORT1, "new status: 0x%08x speed: 0x%04x\n",
-			vdev->port_status, speed);
-	set_link_state(v, vdev);
-out:
-	spin_unlock_irqrestore(&v->lock, flags);
-	usb_hcd_poll_rh_status(vusb_to_hcd (v));
-	return 0;
-}
-
-/*
- * Convenient alias to declare an iovec
- * @packet: name of the packet
- * @nchunk: number of chunk (ex: 2 => header + data)
- */
-#define vusb_create_packet(name, nchunk) struct iovec name[(nchunk)]
-
-
-/* Convenient alias to set header/data */
-#define vusb_iov_set(packet, off, data, len)			\
-	do {							\
-		(packet)[(off)].iov_base = (data);		\
-		(packet)[(off)].iov_len = (len);		\
-	} while (0)
-
-#define vusb_set_packet_header(packet, header, hlen)		\
-	vusb_iov_set(packet, 0, header, hlen)
-
-#define vusb_set_packet_data(packet, data, dlen)		\
-	vusb_iov_set(packet, 1, data, dlen)
-
-/*
- * Send a bind request
- * Ask the host to open a connection
- * return 0 if the packet was sent
- */
-static int
-vusb_send_bind_request(struct vusb *v)
-{
-	/*vusb_create_packet(iovec, 1);*/
-	int r = 0;
-
-	/* STUB setup bind packet
-
-	r = vusb_send_packet(v, iovec, 1);
-
-	if (r >= 0) { // Wait the host answer 
-		v->state = VUSB_WAIT_BIND_RESPONSE;
-		r = 0;
-	}*/
-
-	return r;
-}
-
-/*
- * Send a bind commit
- * Like TCP notify the host we received the ACK
- */
-static int
-vusb_send_bind_commit(struct vusb *v)
-{
-	/*vusb_create_packet(iovec, 1);*/
-	int r = 0;
-
-	/* STUB setup bind commit packet to ACK 
-
-	r = vusb_send_packet(v, iovec, 1);
-
-	if (r >= 0) { // The thread can now run
-		v->state = VUSB_RUNNING;
-		r = 0;
-	}*/
-
-	return r;
-}
-
-
-/**
- * A new device is attached to the guest
- * TODO: Reject device
- */
-/* TODO RJP merge with vusb_add_device into one add routine */
-static int
-vusb_handle_announce_device(struct vusb *v, const void *packet)
-{
-	vusb_create_packet(iovec, 1);
-	int r;
-	enum usb_device_speed speed = 0;
-
-	/* STUB got announcement of new device */
-
-	/* STUB set speed... 
-	 * RJP see vusb_get_speed in backend and UsbConfig.cpp in win fe
-	speed = USB_SPEED_LOW;
-	speed = USB_SPEED_FULL;
-	speed = USB_SPEED_HIGH;
-	*/
-
-	r = vusb_add_device(v, 0 /* STUB logical device ID */, speed);
-
-	if (r) /* TODO: Handle reject device here */
-		return r;
-
-	/* STUB setup packet and accept the device */
-	/* TODO RJP bunch of stuff gone here, this will be xenbus stuffs now */
-
-	return vusb_send_packet(v, iovec, 1);
-}
-
-/*
- * A device has gone
- * TODO: remove all URB related to this device
- */
-/* TODO RJP make into device remove funcion */
-static void
-vusb_handle_device_gone(struct vusb *v, const void *packet)
-{
-	struct vusb_device *vdev = NULL;
-	unsigned long flags;
-
-	spin_lock_irqsave(&v->lock, flags);
-
-	vdev = vusb_device_by_devid(v, 0 /* STUB logical device ID */);
-	if (vdev) {
-		dprintk(D_PORT1, "Remove device from port %u\n", vdev->port);
-		vdev->present = 0;
-		set_link_state(v, vdev);
-		/* Update hub status */
-		v->poll = 1;
-	} else
-		wprintk("Device gone message for unregister device?!\n");
-
-	spin_unlock_irqrestore(&v->lock, flags);
-}
-
-/* Process packet received from vusb daemon */
-static int
-vusb_process_packet(struct vusb *v, const void *packet)
-{
-	int res = 0;
-
-	switch (v->state) {
-	case VUSB_WAIT_BIND_RESPONSE:
-		iprintk("Wait bind response send it\n");
-
-		/* TODO this is all v4v stuffs, fix res = vusb_send_bind_commit(v);*/
-		if (res != 0) {
-			eprintk("Failed to send bind commit command\n");
-			return res;
-		}
-		break;
-
-	case VUSB_RUNNING:
-		/* STUB handle events calling one of:
-		vusb_handle_announce_device(v, packet);
-		vusb_handle_device_gone(v, packet);
-		vusb_handle_urb_response(v, packet);
-		vusb_handle_urb_status(v, packet);*/
-		break;
-
-	default:
-		wprintk("Invalid state %u in process_packet\n",	v->state);
-		return -1;
-	}
-
-	return 0;
-}
-
-/*
- * Send a reset command
- * TODO: Add return value and check return
- */
-static void
-vusb_send_reset_device_cmd(struct vusb *v, struct vusb_device *vdev)
-{
-	vusb_create_packet(iovec, 1);
-	void *packet;
-
-	if (!vdev->present) {
-		wprintk("Ignore reset for not present device port %u\n", vdev->port);
-		vdev->reset = 0;
-		set_link_state(v, vdev);
-		return;
-	}
-
-	dprintk(D_URB2, "Send reset command, port = %u\n", vdev->port);
-
-	vusb_initialize_packet(v, &packet, vdev->deviceid,
-			0 /* STUB reset internal command */,
-			0 /* STUB reset length */,
-			0);
-
-	vusb_set_packet_header(iovec, &packet, 0 /* STUB reset length */);
-	vusb_send_packet(v, iovec, 1);
-
-	/* Signal reset completion */
-	vdev->port_status |= (USB_PORT_STAT_C_RESET << 16);
-
-	set_link_state(v, vdev);
-	v->poll = 1;
-}
 
 /****************************************************************************/
 /* URB Processing                                                           */
@@ -2071,6 +1807,276 @@ vusb_worker_stop(struct vusb *v)
 }
 
 /****************************************************************************/
+/* VUSB Devices  TODO RJP lots more here...                          */
+
+static int
+vusb_write(struct vusb *v, const void *buf, u32 len)
+{
+	dprintk(D_VUSB2, "vusb_write %d\n", len);
+
+	/* TODO RJP maybe reuse this write routine r = v->fp->f_op->write(v->fp, buf, len, NULL);*/
+
+	dprintk(D_VUSB2, "write returned %d\n", r);
+
+	return 0;
+}
+
+static int
+vusb_read(struct vusb *v, void *buf, u32 len)
+{
+	dprintk(D_VUSB2, "vusb_read %d\n", len);
+
+	/* TODO RJP maybe reuse this read routine r = v->fp->f_op->read(v->fp, buf, len, 0L);*/
+
+	dprintk(D_VUSB2, "read returned %d\n", r);
+
+	return 0;
+}
+
+/**
+ * Inititialize a packet header to send
+ * @packet: packet to initialize (already allocated)
+ * @devid: device id used to discuss with the host
+ * @command: what do we want?
+ * @hlen: size of header
+ * @dlen: size of data
+ */
+static void
+vusb_initialize_packet(struct vusb *v, void *packet, u16 devid,
+		u8 command, u32 hlen, u32 dlen)
+{
+	dprintk(D_URB2, "allocate packet len=%u\n",  hlen + dlen);
+	/* STUB */
+}
+
+/*
+ * Send a request to the host
+ * A packet is describe as multiple vectors
+ */
+static int
+vusb_send_packet(struct vusb *v, const struct iovec *iovec, size_t niov)
+{
+	/* TODO this was a r = vusb_write(v, iovec[i].iov_base, iovec[i].iov_len);*/
+
+	return 0;
+}
+
+static int
+vusb_add_device(struct vusb *v, u16 id, enum usb_device_speed speed)
+{
+	u16 i;
+	int retval = 0;
+	unsigned long flags;
+	struct vusb_device *vdev;
+
+	/* TODO this is where the xenbus devices will be hooked up */
+	spin_lock_irqsave (&v->lock, flags);
+	for (i = 0; i < VUSB_PORTS; i++) {
+		if (v->vdev_ports[i].present == 0)
+			break;
+		if (v->vdev_ports[i].deviceid == id) {
+			wprintk("Device id 0x%04x already exists on port %d\n",
+			       id, v->vdev_ports[i].port);
+			retval = -EEXIST;
+			goto out;
+		}
+	}
+
+	if (i >= VUSB_PORTS) {
+		printk(KERN_INFO "Attempt to add a device but no free ports on the root hub.\n");
+		retval = -ENOMEM;
+		goto out;
+	}
+	vdev = &v->vdev_ports[i];
+
+	vdev->present = 1;
+	vdev->deviceid = id;
+	vdev->speed = speed;
+	vdev->port_status |= usb_speed_to_port_stat(speed)
+					 | USB_PORT_STAT_CONNECTION
+					 | USB_PORT_STAT_C_CONNECTION << 16;
+	INIT_LIST_HEAD(&vdev->urbp_list);
+
+	dprintk(D_PORT1, "new status: 0x%08x speed: 0x%04x\n",
+			vdev->port_status, speed);
+	set_link_state(v, vdev);
+out:
+	spin_unlock_irqrestore(&v->lock, flags);
+	usb_hcd_poll_rh_status(vusb_to_hcd (v));
+	return 0;
+}
+
+/*
+ * Send a bind request
+ * Ask the host to open a connection
+ * return 0 if the packet was sent
+ */
+static int
+vusb_send_bind_request(struct vusb *v)
+{
+	/*vusb_create_packet(iovec, 1);*/
+	int r = 0;
+
+	/* STUB setup bind packet
+
+	r = vusb_send_packet(v, iovec, 1);
+
+	if (r >= 0) { // Wait the host answer 
+		v->state = VUSB_WAIT_BIND_RESPONSE;
+		r = 0;
+	}*/
+
+	return r;
+}
+
+/*
+ * Send a bind commit
+ * Like TCP notify the host we received the ACK
+ */
+static int
+vusb_send_bind_commit(struct vusb *v)
+{
+	/*vusb_create_packet(iovec, 1);*/
+	int r = 0;
+
+	/* STUB setup bind commit packet to ACK 
+
+	r = vusb_send_packet(v, iovec, 1);
+
+	if (r >= 0) { // The thread can now run
+		v->state = VUSB_RUNNING;
+		r = 0;
+	}*/
+
+	return r;
+}
+
+/**
+ * A new device is attached to the guest
+ * TODO: Reject device
+ */
+/* TODO RJP merge with vusb_add_device into one add routine */
+static int
+vusb_handle_announce_device(struct vusb *v, const void *packet)
+{
+	vusb_create_packet(iovec, 1);
+	int r;
+	enum usb_device_speed speed = 0;
+
+	/* STUB got announcement of new device */
+
+	/* STUB set speed... 
+	 * RJP see vusb_get_speed in backend and UsbConfig.cpp in win fe
+	speed = USB_SPEED_LOW;
+	speed = USB_SPEED_FULL;
+	speed = USB_SPEED_HIGH;
+	*/
+
+	r = vusb_add_device(v, 0 /* STUB logical device ID */, speed);
+
+	if (r) /* TODO: Handle reject device here */
+		return r;
+
+	/* STUB setup packet and accept the device */
+	/* TODO RJP bunch of stuff gone here, this will be xenbus stuffs now */
+
+	return vusb_send_packet(v, iovec, 1);
+}
+
+/*
+ * A device has gone
+ * TODO: remove all URB related to this device
+ */
+/* TODO RJP make into device remove funcion */
+static void
+vusb_handle_device_gone(struct vusb *v, const void *packet)
+{
+	struct vusb_device *vdev = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&v->lock, flags);
+
+	vdev = vusb_device_by_devid(v, 0 /* STUB logical device ID */);
+	if (vdev) {
+		dprintk(D_PORT1, "Remove device from port %u\n", vdev->port);
+		vdev->present = 0;
+		set_link_state(v, vdev);
+		/* Update hub status */
+		v->poll = 1;
+	} else
+		wprintk("Device gone message for unregister device?!\n");
+
+	spin_unlock_irqrestore(&v->lock, flags);
+}
+
+/* Process packet received from vusb daemon */
+static int
+vusb_process_packet(struct vusb *v, const void *packet)
+{
+	int res = 0;
+
+	switch (v->state) {
+	case VUSB_WAIT_BIND_RESPONSE:
+		iprintk("Wait bind response send it\n");
+
+		/* TODO this is all v4v stuffs, fix res = vusb_send_bind_commit(v);*/
+		if (res != 0) {
+			eprintk("Failed to send bind commit command\n");
+			return res;
+		}
+		break;
+
+	case VUSB_RUNNING:
+		/* STUB handle events calling one of:
+		vusb_handle_announce_device(v, packet);
+		vusb_handle_device_gone(v, packet);
+		vusb_handle_urb_response(v, packet);
+		vusb_handle_urb_status(v, packet);*/
+		break;
+
+	default:
+		wprintk("Invalid state %u in process_packet\n",	v->state);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Send a reset command
+ * TODO: Add return value and check return
+ */
+static void
+vusb_send_reset_device_cmd(struct vusb *v, struct vusb_device *vdev)
+{
+	vusb_create_packet(iovec, 1);
+	void *packet;
+
+	if (!vdev->present) {
+		wprintk("Ignore reset for not present device port %u\n", vdev->port);
+		vdev->reset = 0;
+		set_link_state(v, vdev);
+		return;
+	}
+
+	dprintk(D_URB2, "Send reset command, port = %u\n", vdev->port);
+
+	vusb_initialize_packet(v, &packet, vdev->deviceid,
+			0 /* STUB reset internal command */,
+			0 /* STUB reset length */,
+			0);
+
+	vusb_set_packet_header(iovec, &packet, 0 /* STUB reset length */);
+	vusb_send_packet(v, iovec, 1);
+
+	/* Signal reset completion */
+	vdev->port_status |= (USB_PORT_STAT_C_RESET << 16);
+
+	set_link_state(v, vdev);
+	v->poll = 1;
+}
+
+/****************************************************************************/
 /* VUSB Xen Devices & Driver                                                */
 
 static int vusb_usbfront_probe(struct xenbus_device *dev,
@@ -2154,7 +2160,7 @@ static int vusb_usbfront_suspend(struct xenbus_device *dev)
 {
 	/* TODO JRP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
 
-	mutex_lock(&xenusb_pm_mutex);
+	mutex_lock(&vusb_xen_pm_mutex);
 	printk(KERN_INFO "xen_netif: pm freeze event received, detaching netfront\n");
 	/*
         info->suspending = 1;
@@ -2169,7 +2175,7 @@ static int vusb_usbfront_suspend(struct xenbus_device *dev)
 	xennet_uninit(info->netdev);
 	*/
 
-	mutex_unlock(&xenusb_pm_mutex);
+	mutex_unlock(&vusb_xen_pm_mutex);
 	return 0;
 }
 
@@ -2178,7 +2184,7 @@ static int vusb_usbfront_resume(struct xenbus_device *dev)
 	int err = 0;
 	/* TODO JRP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
 
-	mutex_lock(&xenusb_pm_mutex);
+	mutex_lock(&vusb_xen_pm_mutex);
 	printk(KERN_INFO "xen_usbif: pm restore event received, unregister net device\n");
         /*info->suspending = 0;
 	err = xennet_init_rings(info);
@@ -2215,7 +2221,7 @@ static int vusb_xen_init(void)
 
 	int rc = 0;
 
-	mutex_lock(&xenusb_pm_mutex);
+	mutex_lock(&vusb_xen_pm_mutex);
 	if (!xen_hvm_domain()) {
 		rc = -ENODEV;
 		goto out;
@@ -2227,15 +2233,15 @@ static int vusb_xen_init(void)
 
 	printk(KERN_INFO "xen_usbif initialized\n");
 out:
-	mutex_unlock(&xenusb_pm_mutex);
+	mutex_unlock(&vusb_xen_pm_mutex);
 	return rc;
 }
 
 static void vusb_xen_unregister(void)
 {
-	mutex_lock(&xenusb_pm_mutex);
+	mutex_lock(&vusb_xen_pm_mutex);
 	xc_xenbus_unregister_driver(&vusb_usbfront_driver);
-	mutex_unlock(&xenusb_pm_mutex);
+	mutex_unlock(&vusb_xen_pm_mutex);
 }
 
 /****************************************************************************/
