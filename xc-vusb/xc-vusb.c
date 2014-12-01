@@ -1871,63 +1871,63 @@ vusb_send_packet(struct vusb_vhcd *vhcd, const struct iovec *iovec, size_t niov)
 }
 
 static int
-vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev)
+vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 {
+	u16 i;
+	int rc = 0;
+	unsigned long flags;
+	struct vusb_device *vdev;
+
 	/* stuff from vusb_add_device */
 	/* setup ring, ec write xenstore - xennet_connect and talk_to_netback stuff*/
 	/* TODO RJP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
 
-	/* Start out in the initializing state */
-	xc_xenbus_switch_state(dev, XenbusStateInitialising);
-	return 0;
-}
-
-static int
-vusb_start_device(struct vusb_device *vdev)
-{
-	/* bits from windows fe for resets and get speed, start sending packets */
-	/* final bits from vusb_add_device to make device known*/
-	return 0;
-}
-
-static int
-vusb_destroy_device(struct vusb_device *vdev)
-{
-	/* there is no shutdown device, just destroy - gone - see vusb_handle_device_gone too */
-	/* not sure, have to cancel urbs, returns them all, disable device */
-	return 0;
-}
-
-static int
-vusb_add_device(struct vusb_vhcd *vhcd, u16 id, enum usb_device_speed speed)
-{
-	u16 i;
-	int retval = 0;
-	unsigned long flags;
-	struct vusb_device *vdev;
-
-	/* TODO RJP this is where the xenbus devices will be hooked up */
+	/* Find a port/device we can use. */
 	spin_lock_irqsave(&vhcd->lock, flags);
 	for (i = 0; i < VUSB_PORTS; i++) {
+		if (vhcd->vdev_ports[i].connecting == 0)
+			continue;
 		if (vhcd->vdev_ports[i].present == 0)
 			break;
 		if (vhcd->vdev_ports[i].deviceid == id) {
 			wprintk("Device id 0x%04x already exists on port %d\n",
 			       id, vhcd->vdev_ports[i].port);
-			retval = -EEXIST;
+			rc = -EEXIST;
 			goto out;
 		}
 	}
 
 	if (i >= VUSB_PORTS) {
 		printk(KERN_INFO "Attempt to add a device but no free ports on the root hub.\n");
-		retval = -ENOMEM;
+		rc = -ENOMEM;
 		goto out;
 	}
 	vdev = &vhcd->vdev_ports[i];
-
-	vdev->present = 1;
 	vdev->deviceid = id;
+	vdev->connecting = 1;
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+
+	/* Start out in the initializing state */
+	xc_xenbus_switch_state(dev, XenbusStateInitialising);
+	return 0;
+out:
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+	return rc;
+}
+
+static int
+vusb_start_device(struct vusb_device *vdev)
+{
+	enum usb_device_speed speed;
+	unsigned long flags;
+	int rc = 0;
+
+	spin_lock_irqsave(&vdev->parent->lock, flags);
+
+	/* bits from windows fe for resets and get speed, start sending packets */
+	/* final bits from vusb_add_device to make device known*/
+	vdev->present = 1;
+	vdev->connecting = 0;
 	vdev->speed = speed;
 	vdev->port_status |= usb_speed_to_port_stat(speed)
 					 | USB_PORT_STAT_CONNECTION
@@ -1939,10 +1939,17 @@ vusb_add_device(struct vusb_vhcd *vhcd, u16 id, enum usb_device_speed speed)
 	dprintk(D_PORT1, "new status: 0x%08x speed: 0x%04x\n",
 			vdev->port_status, speed);
 	vusb_set_link_state(vdev);
-out:
-	spin_unlock_irqrestore(&vhcd->lock, flags);
-	usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
-	return 0;
+/*out:*/
+	spin_unlock_irqrestore(&vdev->parent->lock, flags);
+	usb_hcd_poll_rh_status(vhcd_to_hcd(vdev->parent));
+	return rc;
+}
+
+static void
+vusb_destroy_device(struct vusb_device *vdev)
+{
+	/* there is no shutdown device, just destroy - gone - see vusb_handle_device_gone too */
+	/* not sure, have to cancel urbs, returns them all, disable device */
 }
 
 /*
@@ -1988,39 +1995,6 @@ vusb_send_bind_commit(struct vusb_vhcd *vhcd)
 	}*/
 
 	return r;
-}
-
-/**
- * A new device is attached to the guest
- * TODO: Reject device
- */
-/* TODO RJP merge with vusb_add_device into one add routine */
-static int
-vusb_handle_announce_device(struct vusb_vhcd *vhcd, const void *packet)
-{
-	vusb_create_packet(iovec, 1);
-	int r;
-	enum usb_device_speed speed = 0;
-
-	/* STUB got announcement of new device */
-
-	/* STUB set speed... 
-	 * RJP see vusb_get_speed in backend and UsbConfig.cpp in win fe
-	speed = USB_SPEED_LOW;
-	speed = USB_SPEED_FULL;
-	speed = USB_SPEED_HIGH;
-	*/
-	/* TODO RJP this will go away and only the add function will remain */
-
-	r = vusb_add_device(vhcd, 0 /* STUB logical device ID */, speed);
-
-	if (r) /* TODO: Handle reject device here */
-		return r;
-
-	/* STUB setup packet and accept the device */
-	/* TODO RJP bunch of stuff gone here, this will be xenbus stuffs now */
-
-	return vusb_send_packet(vhcd, iovec, 1);
 }
 
 /*
@@ -2124,7 +2098,9 @@ vusb_usbfront_probe(struct xenbus_device *dev, const struct xenbus_device_id *id
 {
 	struct vusb_vhcd *vhcd = hcd_to_vhcd(platform_get_drvdata(vusb_platform_device));
 
-	return vusb_create_device(vhcd, dev);
+	/* TODO RJP make device ids */
+
+	return vusb_create_device(vhcd, dev, 0);
 }
 
 /**
@@ -2146,6 +2122,7 @@ vusb_usbback_changed(struct xenbus_device *dev, enum xenbus_state backend_state)
 			 * devices. Just destroy the device.
 			 */
 			printk(KERN_INFO "backend vanished, closing frontend\n");
+			xc_xenbus_switch_state(dev, XenbusStateClosed);
 			vusb_destroy_device(vdev);
 		}
 		break;
