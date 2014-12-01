@@ -172,6 +172,8 @@ struct vusb_urbp {
 	int                     port;
 };
 
+struct vusb_vhcd;
+
 /* Virtual USB device on of the RH ports */
 struct vusb_device {
 	u16			deviceid;
@@ -186,6 +188,9 @@ struct vusb_device {
 
 	/* The Xenbus device associated with this vusb device */
 	struct xenbus_device    *xendev;
+
+	/* Pointer back to the parent virtual HCD core device */
+	struct vusb_vhcd        *parent;
 
 	/* This VUSB device's list of pending URBs */
 	struct list_head        urbp_list;
@@ -1775,6 +1780,7 @@ vusb_worker_start(struct vusb_vhcd *vhcd)
 	/* Initialize ports */
 	for (i = 0; i < VUSB_PORTS; i++) {
 		vhcd->vdev_ports[i].port = i + 1;
+		vhcd->vdev_ports[i].parent = vhcd;
 		vhcd->vdev_ports[i].connecting = 0;
 		vhcd->vdev_ports[i].present = 0;
 	}
@@ -1865,8 +1871,30 @@ vusb_send_packet(struct vusb_vhcd *vhcd, const struct iovec *iovec, size_t niov)
 }
 
 static int
-vusb_create_device(struct xenbus_device *dev)
+vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev)
 {
+	/* stuff from vusb_add_device */
+	/* setup ring, ec write xenstore - xennet_connect and talk_to_netback stuff*/
+	/* TODO RJP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
+
+	/* Start out in the initializing state */
+	xc_xenbus_switch_state(dev, XenbusStateInitialising);
+	return 0;
+}
+
+static int
+vusb_start_device(struct vusb_device *vdev)
+{
+	/* bits from windows fe for resets and get speed, start sending packets */
+	/* final bits from vusb_add_device to make device known*/
+	return 0;
+}
+
+static int
+vusb_destroy_device(struct vusb_device *vdev)
+{
+	/* there is no shutdown device, just destroy - gone - see vusb_handle_device_gone too */
+	/* not sure, have to cancel urbs, returns them all, disable device */
 	return 0;
 }
 
@@ -2094,7 +2122,9 @@ vusb_send_reset_device_cmd(struct vusb_vhcd *vhcd, struct vusb_device *vdev)
 static int
 vusb_usbfront_probe(struct xenbus_device *dev, const struct xenbus_device_id *id)
 {
-	return vusb_create_device(dev); /* TODO RJP device add here */
+	struct vusb_vhcd *vhcd = hcd_to_vhcd(platform_get_drvdata(vusb_platform_device));
+
+	return vusb_create_device(vhcd, dev);
 }
 
 /**
@@ -2103,7 +2133,7 @@ vusb_usbfront_probe(struct xenbus_device *dev, const struct xenbus_device_id *id
 static void
 vusb_usbback_changed(struct xenbus_device *dev, enum xenbus_state backend_state)
 {
-	/* TODO RJP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
+	struct vusb_device *vdev = dev_get_drvdata(&dev->dev);
 
 	dev_dbg(&dev->dev, "%s\n", xc_xenbus_strstate(backend_state));
 	dev_dbg(&dev->dev, "Mine: %s\n", xc_xenbus_strstate(dev->state));
@@ -2112,10 +2142,11 @@ vusb_usbback_changed(struct xenbus_device *dev, enum xenbus_state backend_state)
 	case XenbusStateUnknown:
 		/* if the backend vanishes from xenstore, close frontend */
 		if (!xc_xenbus_exists(XBT_NIL, dev->otherend, "")) {
-			if (dev->state != XenbusStateClosed) {
-				printk(KERN_INFO "backend vanished, closing frontend\n");
-				/* TODO RJP netfront_close(dev); --> completely wipe the device*/
-			}
+			/* Gone is gone, don't care about our state since we do not reconnect
+			 * devices. Just destroy the device.
+			 */
+			printk(KERN_INFO "backend vanished, closing frontend\n");
+			vusb_destroy_device(vdev);
 		}
 		break;
 	case XenbusStateInitialising:
@@ -2123,9 +2154,11 @@ vusb_usbback_changed(struct xenbus_device *dev, enum xenbus_state backend_state)
 	case XenbusStateReconfiguring:
 	case XenbusStateReconfigured:
 	case XenbusStateConnected:
-		/* TODO RJP init and destroy/close on fail 
-		if (xennet_connect(dev) != 0)
-			break;*/
+		if (vusb_start_device(vdev)) {
+			printk(KERN_ERR "failed to start frontend, aborting!\n");
+			xc_xenbus_switch_state(dev, XenbusStateClosed);
+			vusb_destroy_device(vdev);
+		}
 		break;
 
 	case XenbusStateInitWait:
@@ -2137,13 +2170,12 @@ vusb_usbback_changed(struct xenbus_device *dev, enum xenbus_state backend_state)
 
 	case XenbusStateClosing:
 	case XenbusStateClosed:
-                /*if (np->suspending)
-                        break;*/
-		if (dev->state != XenbusStateClosed)
-			/* TODO RJP netfront_close(dev); --> need surprise removal semantics here too and no reconnect.*/
-			;
-		else 
-			xc_xenbus_switch_state(dev, XenbusStateInitialising); /* TODO RJP NO! */
+		/* Remove the device and transition ourselves to closed, there is no
+		 * reconnect. Do it for the closed state just in case the backend never
+		 * transitioned through closing.
+		 */
+		xc_xenbus_switch_state(dev, XenbusStateClosed);
+		vusb_destroy_device(vdev);
 		break;
 	}
 }
@@ -2155,7 +2187,7 @@ vusb_xenusb_remove(struct xenbus_device *dev)
 
 	dev_dbg(&dev->dev, "%s\n", dev->nodename);
 
-	/* TODO RJP this causes vusb device removal
+	/* TODO RJP this causes vusb device removal - not sure what to do here yet
 	xennet_disconnect_backend(info);
 	del_timer_sync(&info->rx_refill_timer);
 	xennet_sysfs_delif(info->netdev);
@@ -2172,7 +2204,7 @@ vusb_usbfront_suspend(struct xenbus_device *dev)
 
 	mutex_lock(&vusb_xen_pm_mutex);
 	printk(KERN_INFO "xen_netif: pm freeze event received, detaching netfront\n");
-	/*
+	/* TODO RJP not sure what to do here yet
         info->suspending = 1;
 
 	spin_lock_bh(&info->rx_lock);
@@ -2197,7 +2229,8 @@ vusb_usbfront_resume(struct xenbus_device *dev)
 
 	mutex_lock(&vusb_xen_pm_mutex);
 	printk(KERN_INFO "xen_usbif: pm restore event received, unregister net device\n");
-        /*info->suspending = 0;
+	/* TODO RJP not sure what to do here yet
+        info->suspending = 0;
 	err = xennet_init_rings(info);
 	if (!err)
 		xc_xenbus_switch_state(dev, XenbusStateClosed);
