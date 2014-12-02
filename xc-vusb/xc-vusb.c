@@ -1837,6 +1837,26 @@ vusb_interrupt(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+static void
+vusb_device_clear(struct vusb_device *vdev)
+{
+	if (((vdev->connecting) || (vdev->present)) &&
+	    (vdev->xendev != NULL)) 
+		dev_set_drvdata(&vdev->xendev->dev, NULL);
+
+	vdev->parent = NULL;
+	vdev->xendev = NULL;
+	vdev->deviceid = 0;
+	vdev->connecting = 0;
+	vdev->present = 0;
+}
+
+static void
+vusb_usbif_free(struct vusb_device *vdev, int suspend)
+{
+	/* TODO RJP shut everything down and undo stuff from vusb_talk_to_usbback */
+}
+
 static int
 vusb_setup_usbfront(struct vusb_device *vdev)
 {
@@ -1877,7 +1897,7 @@ vusb_setup_usbfront(struct vusb_device *vdev)
 
 	return 0;
 fail:
-	/* TODO RJP like this... blkif_free(info, 0);*/
+	vusb_usbif_free(vdev, 0);
 	return err;
 }
 
@@ -1941,7 +1961,7 @@ again:
 	if (message)
 		xc_xenbus_dev_fatal(dev, err, "%s", message);
  destroy_blkring:
-	/* TODO something like this blkif_free(info, 0);*/
+	vusb_usbif_free(vdev, 0);
  out:
 	return err;
 }
@@ -1953,10 +1973,6 @@ vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 	int rc = 0;
 	unsigned long flags;
 	struct vusb_device *vdev;
-
-	/* stuff from vusb_add_device */
-	/* setup ring, ec write xenstore - xennet_connect and talk_to_netback stuff*/
-	/* TODO RJP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
 
 	/* Find a port/device we can use. */
 	spin_lock_irqsave(&vhcd->lock, flags);
@@ -1984,16 +2000,19 @@ vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 	vdev->parent = vhcd;
 	vdev->xendev = dev;
 
-	/* Setup the rings, event channel and xenstore*/
+	/* Strap out VUSB device onto the Xen device context */
+	dev_set_drvdata(&dev->dev, vdev);
+	
+	/* Setup the rings, event channel and xenstore. Internal failures cleanup
+	 * the usbif bits. Wipe the new VUSB dev and bail out.
+	 */
 	rc = vusb_talk_to_usbback(vdev);
-		goto out;
-
-	spin_unlock_irqrestore(&vhcd->lock, flags);
-
-	return 0;
+	if (rc) {
+		printk(KERN_ERR "Failed to initialize the device - id: %d\n", id);
+		vusb_device_clear(vdev);
+	}
 
 out:
-	/* TODO undo everything here, try to use destroy function */
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 	return rc;
 }
@@ -2035,15 +2054,16 @@ vusb_destroy_device(struct vusb_device *vdev)
 	struct vusb_vhcd *vhcd = vdev->parent;
 	unsigned long flags;
 
-	/* there is no shutdown device, just destroy - gone - see vusb_handle_device_gone too */
-	/* not sure, have to cancel urbs, returns them all, disable device */
-
-	/* TODO bits from vusb_handle_device_gone - need more than this */
+	/* TODO RJP need more than this? */
 	spin_lock_irqsave(&vhcd->lock, flags);
 
 	dprintk(D_PORT1, "Remove device from port %u\n", vdev->port);
-	vdev->present = 0;
+
+	vusb_usbif_free(vdev, 0);
+	vusb_device_clear(vdev);
+
 	vusb_set_link_state(vdev);
+
 	/* Update hub status */
 	vhcd->poll = 1;
 
