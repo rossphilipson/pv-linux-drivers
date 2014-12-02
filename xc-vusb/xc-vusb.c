@@ -2097,10 +2097,21 @@ static int
 vusb_usbfront_probe(struct xenbus_device *dev, const struct xenbus_device_id *id)
 {
 	struct vusb_vhcd *vhcd = hcd_to_vhcd(platform_get_drvdata(vusb_platform_device));
+	char *svid;
+	u16 vid;
 
-	/* TODO RJP make device ids */
+	svid = xc_xenbus_read(XBT_NIL, dev->nodename, "virtual-device", NULL);
+	if (IS_ERR(svid)) {
+		printk(KERN_ERR "Failed to read virtual-device value\n");
+		return PTR_ERR(svid);
+	}
 
-	return vusb_create_device(vhcd, dev, 0);
+	/* Make device ids out of the virtual-device value from xenstore */
+	vid = simple_strtoul(svid, NULL, 10);
+	printk(KERN_INFO "Creating new VUSB device - virtual-device: %s devicetype: %s\n",
+		id->devicetype, svid);
+
+	return vusb_create_device(vhcd, dev, vid);
 }
 
 /**
@@ -2130,6 +2141,7 @@ vusb_usbback_changed(struct xenbus_device *dev, enum xenbus_state backend_state)
 	case XenbusStateInitialised:
 	case XenbusStateReconfiguring:
 	case XenbusStateReconfigured:
+		break;
 	case XenbusStateConnected:
 		if (vusb_start_device(vdev)) {
 			printk(KERN_ERR "failed to start frontend, aborting!\n");
