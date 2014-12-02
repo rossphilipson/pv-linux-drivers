@@ -1834,6 +1834,7 @@ vusb_worker_stop(struct vusb_vhcd *vhcd)
 static irqreturn_t
 vusb_interrupt(int irq, void *dev_id)
 {
+	/* TODO RJP */
 	return IRQ_HANDLED;
 }
 
@@ -1855,6 +1856,20 @@ static void
 vusb_usbif_free(struct vusb_device *vdev, int suspend)
 {
 	/* TODO RJP shut everything down and undo stuff from vusb_talk_to_usbback */
+	/* Not sure what all of this will be yet */
+
+	/* Free resources associated with old device channel. */
+	if (vdev->ring_ref != GRANT_INVALID_REF) {
+		/* This frees the page too */
+		xc_gnttab_end_foreign_access(vdev->ring_ref, 0,
+					     (unsigned long)vdev->ring.sring);
+		vdev->ring_ref = GRANT_INVALID_REF;
+		vdev->ring.sring = NULL;
+	}
+
+	if (vdev->irq)
+		xc_unbind_from_irqhandler(vdev->irq, vdev);
+	vdev->evtchn = vdev->irq = 0;
 }
 
 static int
