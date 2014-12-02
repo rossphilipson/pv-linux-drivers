@@ -61,7 +61,10 @@
 #include <linux/old-core-hcd.h>
 #endif
 
-#define VUSB_MAX_PACKET_SIZE 1024*256
+#define GRANT_INVALID_REF 0
+
+#define VUSB_INTERFACE_VERSION 	3
+#define VUSB_MAX_PACKET_SIZE 	1024*256
 
 #define VUSB_PLATFORM_DRIVER_NAME	"vusb-platform"
 #define VUSB_HCD_DRIVER_NAME		"vusb-hcd"
@@ -122,6 +125,12 @@
 #define VUSB_URB_DIRECTION_IN      0x0001
 #define VUSB_URB_SHORT_OK          0x0002
 #define VUSB_URB_ISO_TRANSFER_ASAP 0x0004
+
+#if ( LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0) )
+# define USBFRONT_IRQF 0
+#else
+# define USBFRONT_IRQF IRQF_SAMPLE_RANDOM
+#endif
 
 /* Port are numbered from 1 in linux */
 #define vusb_device_by_port(v, port) (&(v)->vdev_ports[(port) - 1])
@@ -185,6 +194,7 @@ struct vusb_device {
 	 * structure in device
 	 * */
 	u16			port;
+	enum usb_device_speed	speed;
 
 	/* The Xenbus device associated with this vusb device */
 	struct xenbus_device    *xendev;
@@ -195,8 +205,11 @@ struct vusb_device {
 	/* This VUSB device's list of pending URBs */
 	struct list_head        urbp_list;
 
-	enum usb_device_speed	speed;
-	struct usb_device	*udev;
+	/* Xen rings and event channel */
+	int			ring_ref;
+	struct usbif_front_ring ring;
+	unsigned int 		evtchn;
+	unsigned int 		irq;
 
 	unsigned		present:1;
 	unsigned		connecting:1;
@@ -1818,6 +1831,225 @@ vusb_worker_stop(struct vusb_vhcd *vhcd)
 /****************************************************************************/
 /* VUSB Devices  TODO RJP lots more here...                          */
 
+static irqreturn_t
+vusb_interrupt(int irq, void *dev_id)
+{
+	return IRQ_HANDLED;
+}
+
+static int
+vusb_setup_usbfront(struct vusb_device *vdev)
+{
+	struct xenbus_device *dev = vdev->xendev;
+	struct usbif_sring *sring;
+	int err;
+
+	vdev->ring_ref = GRANT_INVALID_REF;
+
+	sring = (struct usbif_sring *)__get_free_page(GFP_NOIO | __GFP_HIGH);
+	if (!sring) {
+		xc_xenbus_dev_fatal(dev, -ENOMEM, "allocating shared ring");
+		return -ENOMEM;
+	}
+	SHARED_RING_INIT(sring);
+	FRONT_RING_INIT(&vdev->ring, sring, PAGE_SIZE);
+
+	err = xc_xenbus_grant_ring(dev, virt_to_mfn(vdev->ring.sring));
+	if (err < 0) {
+		free_page((unsigned long)sring);
+		vdev->ring.sring = NULL;
+		goto fail;
+	}
+	vdev->ring_ref = err;
+
+	err = xc_xenbus_alloc_evtchn(dev, &vdev->evtchn);
+	if (err)
+		goto fail;
+
+	err = xc_bind_evtchn_to_irqhandler(vdev->evtchn, vusb_interrupt,
+					USBFRONT_IRQF, "usbif", vdev);
+	if (err <= 0) {
+		xc_xenbus_dev_fatal(dev, err,
+				 "bind_evtchn_to_irqhandler failed");
+		goto fail;
+	}
+	vdev->irq = err;
+
+	return 0;
+fail:
+	/* TODO RJP like this... blkif_free(info, 0);*/
+	return err;
+}
+
+/* Common code used when first setting up, and when resuming. */
+static int
+vusb_talk_to_usbback(struct vusb_device *vdev)
+{
+	struct xenbus_device *dev = vdev->xendev;
+	const char *message = NULL;
+	struct xenbus_transaction xbt;
+	int err;
+
+	/* Create shared ring, alloc event channel. */
+	err = vusb_setup_usbfront(vdev);
+	if (err)
+		goto out;
+
+again:
+	err = xc_xenbus_transaction_start(&xbt);
+	if (err) {
+		xc_xenbus_dev_fatal(dev, err, "starting transaction");
+		goto destroy_blkring;
+	}
+
+	err = xc_xenbus_printf(xbt, dev->nodename,
+	 		    "ring-ref", "%u", vdev->ring_ref);
+	if (err) {
+		message = "writing ring-ref";
+		goto abort_transaction;
+	}
+
+	err = xc_xenbus_printf(xbt, dev->nodename,
+			    "event-channel", "%u", vdev->evtchn);
+	if (err) {
+		message = "writing event-channel";
+		goto abort_transaction;
+	}
+
+	err = xc_xenbus_printf(xbt, dev->nodename, "version", "%d",
+			    VUSB_INTERFACE_VERSION);
+	if (err) {
+		message = "writing protocol";
+		goto abort_transaction;
+	}
+
+	err = xc_xenbus_transaction_end(xbt, 0);
+	if (err) {
+		if (err == -EAGAIN)
+			goto again;
+		xc_xenbus_dev_fatal(dev, err, "completing transaction");
+		goto destroy_blkring;
+	}
+
+	/* Started out in the initialising state, go to initialised */
+	xc_xenbus_switch_state(dev, XenbusStateInitialised);
+
+	return 0;
+
+ abort_transaction:
+	xc_xenbus_transaction_end(xbt, 1);
+	if (message)
+		xc_xenbus_dev_fatal(dev, err, "%s", message);
+ destroy_blkring:
+	/* TODO something like this blkif_free(info, 0);*/
+ out:
+	return err;
+}
+
+static int
+vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
+{
+	u16 i;
+	int rc = 0;
+	unsigned long flags;
+	struct vusb_device *vdev;
+
+	/* stuff from vusb_add_device */
+	/* setup ring, ec write xenstore - xennet_connect and talk_to_netback stuff*/
+	/* TODO RJP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
+
+	/* Find a port/device we can use. */
+	spin_lock_irqsave(&vhcd->lock, flags);
+	for (i = 0; i < VUSB_PORTS; i++) {
+		if (vhcd->vdev_ports[i].connecting == 0)
+			continue;
+		if (vhcd->vdev_ports[i].present == 0)
+			break;
+		if (vhcd->vdev_ports[i].deviceid == id) {
+			wprintk("Device id 0x%04x already exists on port %d\n",
+			       id, vhcd->vdev_ports[i].port);
+			rc = -EEXIST;
+			goto out;
+		}
+	}
+
+	if (i >= VUSB_PORTS) {
+		printk(KERN_INFO "Attempt to add a device but no free ports on the root hub.\n");
+		rc = -ENOMEM;
+		goto out;
+	}
+	vdev = &vhcd->vdev_ports[i];
+	vdev->deviceid = id;
+	vdev->connecting = 1;
+	vdev->parent = vhcd;
+	vdev->xendev = dev;
+
+	/* Setup the rings, event channel and xenstore*/
+	rc = vusb_talk_to_usbback(vdev);
+		goto out;
+
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+
+	return 0;
+
+out:
+	/* TODO undo everything here, try to use destroy function */
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+	return rc;
+}
+
+static int
+vusb_start_device(struct vusb_device *vdev)
+{
+	struct vusb_vhcd *vhcd = vdev->parent;
+	enum usb_device_speed speed;
+	unsigned long flags;
+	int rc = 0;
+
+	spin_lock_irqsave(&vhcd->lock, flags);
+
+	/* bits from windows fe for resets and get speed, start sending packets */
+	/* final bits from vusb_add_device to make device known*/
+	vdev->present = 1;
+	vdev->connecting = 0;
+	vdev->speed = speed;
+	vdev->port_status |= usb_speed_to_port_stat(speed)
+					 | USB_PORT_STAT_CONNECTION
+					 | USB_PORT_STAT_C_CONNECTION << 16;
+	INIT_LIST_HEAD(&vdev->urbp_list);
+
+	/* TODO RJP get link speed - need to send a packet to the backend to do this */
+
+	dprintk(D_PORT1, "new status: 0x%08x speed: 0x%04x\n",
+			vdev->port_status, speed);
+	vusb_set_link_state(vdev);
+/*out:*/
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+	usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
+	return rc;
+}
+
+static void
+vusb_destroy_device(struct vusb_device *vdev)
+{
+	struct vusb_vhcd *vhcd = vdev->parent;
+	unsigned long flags;
+
+	/* there is no shutdown device, just destroy - gone - see vusb_handle_device_gone too */
+	/* not sure, have to cancel urbs, returns them all, disable device */
+
+	/* TODO bits from vusb_handle_device_gone - need more than this */
+	spin_lock_irqsave(&vhcd->lock, flags);
+
+	dprintk(D_PORT1, "Remove device from port %u\n", vdev->port);
+	vdev->present = 0;
+	vusb_set_link_state(vdev);
+	/* Update hub status */
+	vhcd->poll = 1;
+
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+}
+
 static int
 vusb_write(struct vusb_vhcd *vhcd, const void *buf, u32 len)
 {
@@ -1870,88 +2102,6 @@ vusb_send_packet(struct vusb_vhcd *vhcd, const struct iovec *iovec, size_t niov)
 	return 0;
 }
 
-static int
-vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
-{
-	u16 i;
-	int rc = 0;
-	unsigned long flags;
-	struct vusb_device *vdev;
-
-	/* stuff from vusb_add_device */
-	/* setup ring, ec write xenstore - xennet_connect and talk_to_netback stuff*/
-	/* TODO RJP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
-
-	/* Find a port/device we can use. */
-	spin_lock_irqsave(&vhcd->lock, flags);
-	for (i = 0; i < VUSB_PORTS; i++) {
-		if (vhcd->vdev_ports[i].connecting == 0)
-			continue;
-		if (vhcd->vdev_ports[i].present == 0)
-			break;
-		if (vhcd->vdev_ports[i].deviceid == id) {
-			wprintk("Device id 0x%04x already exists on port %d\n",
-			       id, vhcd->vdev_ports[i].port);
-			rc = -EEXIST;
-			goto out;
-		}
-	}
-
-	if (i >= VUSB_PORTS) {
-		printk(KERN_INFO "Attempt to add a device but no free ports on the root hub.\n");
-		rc = -ENOMEM;
-		goto out;
-	}
-	vdev = &vhcd->vdev_ports[i];
-	vdev->deviceid = id;
-	vdev->connecting = 1;
-	spin_unlock_irqrestore(&vhcd->lock, flags);
-
-	/* Start out in the initializing state */
-	xc_xenbus_switch_state(dev, XenbusStateInitialising);
-	return 0;
-out:
-	spin_unlock_irqrestore(&vhcd->lock, flags);
-	return rc;
-}
-
-static int
-vusb_start_device(struct vusb_device *vdev)
-{
-	enum usb_device_speed speed;
-	unsigned long flags;
-	int rc = 0;
-
-	spin_lock_irqsave(&vdev->parent->lock, flags);
-
-	/* bits from windows fe for resets and get speed, start sending packets */
-	/* final bits from vusb_add_device to make device known*/
-	vdev->present = 1;
-	vdev->connecting = 0;
-	vdev->speed = speed;
-	vdev->port_status |= usb_speed_to_port_stat(speed)
-					 | USB_PORT_STAT_CONNECTION
-					 | USB_PORT_STAT_C_CONNECTION << 16;
-	INIT_LIST_HEAD(&vdev->urbp_list);
-
-	/* TODO RJP get link speed - need to send a packet to the backend to do this */
-
-	dprintk(D_PORT1, "new status: 0x%08x speed: 0x%04x\n",
-			vdev->port_status, speed);
-	vusb_set_link_state(vdev);
-/*out:*/
-	spin_unlock_irqrestore(&vdev->parent->lock, flags);
-	usb_hcd_poll_rh_status(vhcd_to_hcd(vdev->parent));
-	return rc;
-}
-
-static void
-vusb_destroy_device(struct vusb_device *vdev)
-{
-	/* there is no shutdown device, just destroy - gone - see vusb_handle_device_gone too */
-	/* not sure, have to cancel urbs, returns them all, disable device */
-}
-
 /*
  * Send a bind request
  * Ask the host to open a connection
@@ -1995,32 +2145,6 @@ vusb_send_bind_commit(struct vusb_vhcd *vhcd)
 	}*/
 
 	return r;
-}
-
-/*
- * A device has gone
- * TODO: remove all URB related to this device
- */
-/* TODO RJP make into device remove funcion */
-static void
-vusb_handle_device_gone(struct vusb_vhcd *vhcd, const void *packet)
-{
-	struct vusb_device *vdev = NULL;
-	unsigned long flags;
-
-	spin_lock_irqsave(&vhcd->lock, flags);
-
-	vdev = vusb_device_by_devid(vhcd, 0 /* STUB logical device ID */);
-	if (vdev) {
-		dprintk(D_PORT1, "Remove device from port %u\n", vdev->port);
-		vdev->present = 0;
-		vusb_set_link_state(vdev);
-		/* Update hub status */
-		vhcd->poll = 1;
-	} else
-		wprintk("Device gone message for unregister device?!\n");
-
-	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
 
 /* Process packet received from vusb daemon */
@@ -2097,21 +2221,20 @@ static int
 vusb_usbfront_probe(struct xenbus_device *dev, const struct xenbus_device_id *id)
 {
 	struct vusb_vhcd *vhcd = hcd_to_vhcd(platform_get_drvdata(vusb_platform_device));
-	char *svid;
-	u16 vid;
+	int vid, err;
 
-	svid = xc_xenbus_read(XBT_NIL, dev->nodename, "virtual-device", NULL);
-	if (IS_ERR(svid)) {
-		printk(KERN_ERR "Failed to read virtual-device value\n");
-		return PTR_ERR(svid);
-	}
 
 	/* Make device ids out of the virtual-device value from xenstore */
-	vid = simple_strtoul(svid, NULL, 10);
-	printk(KERN_INFO "Creating new VUSB device - virtual-device: %s devicetype: %s\n",
-		id->devicetype, svid);
+	err = xc_xenbus_scanf(XBT_NIL, dev->nodename, "virtual-device", "%i", &vid);
+	if (err != 1) {
+		printk(KERN_ERR "Failed to read virtual-device value\n");
+		return err;
+	}
 
-	return vusb_create_device(vhcd, dev, vid);
+	printk(KERN_INFO "Creating new VUSB device - virtual-device: %i devicetype: %s\n",
+		vid, id->devicetype);
+
+	return vusb_create_device(vhcd, dev, (u16)vid);
 }
 
 /**
