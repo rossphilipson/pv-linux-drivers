@@ -143,6 +143,7 @@ do {								\
 	}							\
 } while (0)
 
+/* TODO RJP this stuff will go avay, it is v4v centric biz */
 /*
  * Convenient alias to declare an iovec
  * @packet: name of the packet
@@ -176,23 +177,19 @@ enum vusb_urbp_state {
 struct vusb_urbp {
 	struct urb		*urb;
 	enum vusb_urbp_state	state;
-	u16                     handle;
+	u16                     handle; /* TODO RJP this will be the request.id */
 	struct list_head	urbp_list;
 	int                     port;
+	usbif_request_t         request;
 };
 
 struct vusb_vhcd;
 
 /* Virtual USB device on of the RH ports */
 struct vusb_device {
-	u16			deviceid;
+	u16			device_id;
 	u32			port_status;
-	/* TODO: is it usefull? It's only set during SetAddress control command and never used */
 	u16			address;
-	/**
-	 * Use only for debugging. It's use full to know the index of the
-	 * structure in device
-	 * */
 	u16			port;
 	enum usb_device_speed	speed;
 
@@ -362,7 +359,7 @@ vusb_urbp_list_dump(const struct vusb_vhcd *vhcd, const char *fn)
 	list_for_each_entry(urbp, &vhcd->urbp_list, urbp_list) {
 		dprintk(D_URB1, "URB handle 0x%x port %u device %u\n",
 			urbp->handle, urbp->port,
-			vusb_device_by_port(vhcd, urbp->port)->deviceid);
+			vusb_device_by_port(vhcd, urbp->port)->device_id);
 	}
 	dprintk(D_URB2, "===== End URB List in %s ====\n", fn);
 }
@@ -464,7 +461,7 @@ set_port_feature(struct vusb_vhcd *vhcd, struct vusb_device *vdev, u16 val)
 	switch (val) {
 	case USB_PORT_FEAT_INDICATOR:
 	case USB_PORT_FEAT_SUSPEND:
-		// Ignored now
+		/* Ignored now */
 		break;
 
 	case USB_PORT_FEAT_POWER:
@@ -494,7 +491,7 @@ clear_port_feature(struct vusb_device *vdev, u16 val)
 	switch (val) {
 	case USB_PORT_FEAT_INDICATOR:
 	case USB_PORT_FEAT_SUSPEND:
-		// Ignored now
+		/* Ignored now */
 		break;
 
 	case USB_PORT_FEAT_ENABLE:
@@ -570,7 +567,7 @@ vusb_device_by_devid(struct vusb_vhcd *vhcd, u16 id)
 
 	for (i = 0; i < VUSB_PORTS; i++) {
 		struct vusb_device *vdev = &vhcd->vdev_ports[i];
-		if (vdev->present && vdev->deviceid == id)
+		if (vdev->present && vdev->device_id == id)
 			return &vhcd->vdev_ports[i];
 	}
 
@@ -933,7 +930,7 @@ static const struct hc_driver vusb_hcd_driver = {
 
 	.flags = HCD_USB2,
 
-	/* TODO removed ? .reset = vusb_setup,*/
+	/* .reset not used since our HCD is so simple, everything is done in start */
 	.start = vusb_hcd_start,
 	.stop =	vusb_hcd_stop,
 
@@ -1168,7 +1165,7 @@ vusb_urb_finish(struct vusb_vhcd *vhcd, struct vusb_device *vdev, u16 handle,
 
 	if (!urbp) {
 		dprintk(D_WARN, "Bad handle (0x%x) for Device ID (%u)\n",
-			handle, vdev->deviceid);
+			handle, vdev->device_id);
 		return;
 	}
 
@@ -1260,10 +1257,10 @@ vusb_initialize_urb_packet(struct vusb_vhcd *vhcd, void *packet,
 		u8 command, u32 hlen, bool has_data)
 {
 	if (has_data) /* Outbound request */
-		vusb_initialize_packet(vhcd, packet, vdev->deviceid,
+		vusb_initialize_packet(vhcd, packet, vdev->device_id,
 				command, hlen, urbp->urb->transfer_buffer_length);
 	else
-		vusb_initialize_packet(vhcd, packet, vdev->deviceid,
+		vusb_initialize_packet(vhcd, packet, vdev->device_id,
 				command, hlen, 0);
 
 	/* STUB get logical handle: urbp->handle */
@@ -1527,7 +1524,7 @@ vusb_send_cancel_urb(struct vusb_vhcd *vhcd, struct vusb_device *vdev,
 	vusb_create_packet(iovec, 1);
 	void *packet;
 
-	vusb_initialize_packet(vhcd, &packet, vdev->deviceid,
+	vusb_initialize_packet(vhcd, &packet, vdev->device_id,
 			0 /* STUB cancel internal command */,
 			0 /* STUB cancel length */,
 			0);
@@ -1535,7 +1532,7 @@ vusb_send_cancel_urb(struct vusb_vhcd *vhcd, struct vusb_device *vdev,
 	/* STUB finish packet setup */
 
 	dprintk(D_URB1, "send packet URB_CANCEL device %u port %u handle 0x%04x\n",
-		vdev->deviceid, vdev->port, urbp->handle);
+		vdev->device_id, vdev->port, urbp->handle);
 
 	vusb_set_packet_header(iovec, &packet, 0 /* STUB cancel length */);
 	vusb_send_packet(vhcd, iovec, 1);
@@ -1790,6 +1787,8 @@ vusb_worker_start(struct vusb_vhcd *vhcd)
 
 	dprintk(D_PM, "Start the worker\n");
 
+	/* TODO RJP revisit, may not want to clear the devices on resume path
+	 * also may need suspend/resume for S3 */
 	/* Initialize ports */
 	for (i = 0; i < VUSB_PORTS; i++) {
 		vhcd->vdev_ports[i].port = i + 1;
@@ -1829,7 +1828,12 @@ vusb_worker_stop(struct vusb_vhcd *vhcd)
 }
 
 /****************************************************************************/
-/* VUSB Devices  TODO RJP lots more here...                          */
+/* Ring Processing                                                          */
+
+
+
+/****************************************************************************/
+/* VUSB Devices                                                             */
 
 static irqreturn_t
 vusb_interrupt(int irq, void *dev_id)
@@ -1845,9 +1849,8 @@ vusb_device_clear(struct vusb_device *vdev)
 	    (vdev->xendev != NULL)) 
 		dev_set_drvdata(&vdev->xendev->dev, NULL);
 
-	vdev->parent = NULL;
 	vdev->xendev = NULL;
-	vdev->deviceid = 0;
+	vdev->device_id = 0;
 	vdev->connecting = 0;
 	vdev->present = 0;
 }
@@ -1996,7 +1999,7 @@ vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 			continue;
 		if (vhcd->vdev_ports[i].present == 0)
 			break;
-		if (vhcd->vdev_ports[i].deviceid == id) {
+		if (vhcd->vdev_ports[i].device_id == id) {
 			wprintk("Device id 0x%04x already exists on port %d\n",
 			       id, vhcd->vdev_ports[i].port);
 			rc = -EEXIST;
@@ -2005,17 +2008,18 @@ vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 	}
 
 	if (i >= VUSB_PORTS) {
-		printk(KERN_INFO "Attempt to add a device but no free ports on the root hub.\n");
+		printk(KERN_WARNING "Attempt to add a device but no free ports on the root hub.\n");
 		rc = -ENOMEM;
 		goto out;
 	}
 	vdev = &vhcd->vdev_ports[i];
-	vdev->deviceid = id;
+	vdev->device_id = id;
 	vdev->connecting = 1;
 	vdev->parent = vhcd;
 	vdev->xendev = dev;
+	INIT_LIST_HEAD(&vdev->urbp_list);
 
-	/* Strap out VUSB device onto the Xen device context */
+	/* Strap our VUSB device onto the Xen device context */
 	dev_set_drvdata(&dev->dev, vdev);
 	
 	/* Setup the rings, event channel and xenstore. Internal failures cleanup
@@ -2044,15 +2048,13 @@ vusb_start_device(struct vusb_device *vdev)
 
 	/* bits from windows fe for resets and get speed, start sending packets */
 	/* final bits from vusb_add_device to make device known*/
+	/* TODO RJP get link speed - need to send a packet to the backend to do this */
 	vdev->present = 1;
 	vdev->connecting = 0;
 	vdev->speed = speed;
 	vdev->port_status |= usb_speed_to_port_stat(speed)
 					 | USB_PORT_STAT_CONNECTION
 					 | USB_PORT_STAT_C_CONNECTION << 16;
-	INIT_LIST_HEAD(&vdev->urbp_list);
-
-	/* TODO RJP get link speed - need to send a packet to the backend to do this */
 
 	dprintk(D_PORT1, "new status: 0x%08x speed: 0x%04x\n",
 			vdev->port_status, speed);
@@ -2085,30 +2087,6 @@ vusb_destroy_device(struct vusb_device *vdev)
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
 
-static int
-vusb_write(struct vusb_vhcd *vhcd, const void *buf, u32 len)
-{
-	dprintk(D_VUSB2, "vusb_write %d\n", len);
-
-	/* TODO RJP maybe reuse this write routine r = v->fp->f_op->write(v->fp, buf, len, NULL);*/
-
-	dprintk(D_VUSB2, "write returned %d\n", r);
-
-	return 0;
-}
-
-static int
-vusb_read(struct vusb_vhcd *vhcd, void *buf, u32 len)
-{
-	dprintk(D_VUSB2, "vusb_read %d\n", len);
-
-	/* TODO RJP maybe reuse this read routine r = v->fp->f_op->read(v->fp, buf, len, 0L);*/
-
-	dprintk(D_VUSB2, "read returned %d\n", r);
-
-	return 0;
-}
-
 /**
  * Inititialize a packet header to send
  * @packet: packet to initialize (already allocated)
@@ -2135,51 +2113,6 @@ vusb_send_packet(struct vusb_vhcd *vhcd, const struct iovec *iovec, size_t niov)
 	/* TODO this was a r = vusb_write(v, iovec[i].iov_base, iovec[i].iov_len);*/
 
 	return 0;
-}
-
-/*
- * Send a bind request
- * Ask the host to open a connection
- * return 0 if the packet was sent
- */
-static int
-vusb_send_bind_request(struct vusb_vhcd *vhcd)
-{
-	/*vusb_create_packet(iovec, 1);*/
-	int r = 0;
-
-	/* STUB setup bind packet
-
-	r = vusb_send_packet(v, iovec, 1);
-
-	if (r >= 0) { // Wait the host answer 
-		v->state = VUSB_WAIT_BIND_RESPONSE;
-		r = 0;
-	}*/
-
-	return r;
-}
-
-/*
- * Send a bind commit
- * Like TCP notify the host we received the ACK
- */
-static int
-vusb_send_bind_commit(struct vusb_vhcd *vhcd)
-{
-	/*vusb_create_packet(iovec, 1);*/
-	int r = 0;
-
-	/* STUB setup bind commit packet to ACK 
-
-	r = vusb_send_packet(v, iovec, 1);
-
-	if (r >= 0) { // The thread can now run
-		v->state = VUSB_RUNNING;
-		r = 0;
-	}*/
-
-	return r;
 }
 
 /* Process packet received from vusb daemon */
@@ -2234,7 +2167,7 @@ vusb_send_reset_device_cmd(struct vusb_vhcd *vhcd, struct vusb_device *vdev)
 
 	dprintk(D_URB2, "Send reset command, port = %u\n", vdev->port);
 
-	vusb_initialize_packet(vhcd, &packet, vdev->deviceid,
+	vusb_initialize_packet(vhcd, &packet, vdev->device_id,
 			0 /* STUB reset internal command */,
 			0 /* STUB reset length */,
 			0);
