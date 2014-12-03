@@ -84,6 +84,8 @@
 #define D_MISC (1 << 9)
 #define D_WARN (1 << 10) /* only debugging warn */
 #define D_PM (1 << 11)
+#define D_RING1 (1 << 12)
+#define D_RING2 (1 << 13)
 
 #define DEBUGMASK (D_STATE | D_PORT1 | D_URB1 | D_PM)
 
@@ -177,10 +179,11 @@ enum vusb_urbp_state {
 struct vusb_urbp {
 	struct urb		*urb;
 	enum vusb_urbp_state	state;
-	u16                     handle; /* TODO RJP this will be the request.id */
+	u16                     handle;
 	struct list_head	urbp_list;
 	int                     port;
 	usbif_request_t         request;
+	u32			nr_segments;
 };
 
 struct vusb_vhcd;
@@ -673,7 +676,7 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	spin_lock_irqsave(&vhcd->lock, flags);
 	vdev = vusb_device_by_port(vhcd, urbp->port);
 	/* Allocate a handle */
-	urbp->handle = vusb_get_urb_handle(vhcd);
+	urbp->request.id = vusb_get_urb_handle(vhcd);
 
 	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
 		dprintk(D_WARN, "Worker is not up\n");
@@ -1830,7 +1833,46 @@ vusb_worker_stop(struct vusb_vhcd *vhcd)
 /****************************************************************************/
 /* Ring Processing                                                          */
 
+static int
+vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_urbp *urbp,
+		unsigned long *mfns, u32 nr_mfns)
+{
+	u32 i, ref;
+	grant_ref_t gref_head;
 
+	dprintk(D_RING2, "Allocate gref for %d mfns\n", (int)nr_mfns);
+
+	if (xc_gnttab_alloc_grant_references(nr_mfns, &gref_head) < 0) {
+		/* TOOD RJP xc_gnttab_request_free_callback(
+			&info->callback,
+			blkif_restart_queue_callback,
+			info,
+			BLKIF_MAX_SEGMENTS_PER_REQUEST);*/
+		return 1;
+	}
+
+	urbp->nr_segments = 0;
+
+	for (i = 0; i < nr_mfns; i++)
+	{
+		unsigned long mfn = mfns[i];
+
+		ref = xc_gnttab_claim_grant_reference(&gref_head);
+		BUG_ON(ref == -ENOSPC);
+
+		urbp->request.gref[urbp->nr_segments] = ref;
+
+		xc_gnttab_grant_foreign_access_ref(ref,
+				vdev->xendev->otherend_id, mfn,
+				usb_urb_dir_out(urbp->urb)); /* OUT is write, so RO */
+
+		urbp->nr_segments++;
+ 	}
+
+	xc_gnttab_free_grant_references(gref_head);
+
+	return 0;
+}
 
 /****************************************************************************/
 /* VUSB Devices                                                             */
