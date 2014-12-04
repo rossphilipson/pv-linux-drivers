@@ -1855,6 +1855,31 @@ vusb_worker_stop(struct vusb_vhcd *vhcd)
 /****************************************************************************/
 /* Ring Processing                                                          */
 
+static struct vusb_shadow*
+vusb_get_shadow(struct vusb_device *vdev)
+{
+	if (!vdev->shadow_free) {
+		printk(KERN_ERR "Requesting shadow when shadow_free == 0!\n");
+		return NULL;
+	}
+
+	vdev->shadow_free--;
+
+	if (vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].in_use) {
+		printk(KERN_ERR "Requesting shadow at %d which is in use!\n",
+			vdev->shadow_free);
+		return NULL;
+	}
+
+	vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].in_use = 1;
+	vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].req.nr_segments = 0;
+	vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].req.nr_packets = 0;
+	vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].req.flags = 0;
+	vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].req.length = 0;
+
+	return &vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]];
+}
+
 static void
 vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 {
