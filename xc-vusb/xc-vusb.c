@@ -61,8 +61,6 @@
 #include <linux/old-core-hcd.h>
 #endif
 
-#define GRANT_INVALID_REF 0
-
 #define VUSB_INTERFACE_VERSION 	3
 #define VUSB_MAX_PACKET_SIZE 	1024*256
 
@@ -72,6 +70,10 @@
 #define VUSB_DRIVER_VERSION		"1.0.0"
 
 #define POWER_BUDGET	5000 /* mA */
+
+#define GRANT_INVALID_REF 0
+#define USB_RING_SIZE __CONST_RING_SIZE(usbif, PAGE_SIZE)
+#define SHADOW_ENTRIES USB_RING_SIZE
 
 #define D_VUSB1 (1 << 0)
 #define D_VUSB2 (1 << 1)
@@ -182,11 +184,26 @@ struct vusb_urbp {
 	u16                     handle;
 	struct list_head	urbp_list;
 	int                     port;
-	usbif_request_t         request;
-	u32			nr_segments;
 };
 
-struct vusb_vhcd;
+struct usbif_indirect_pages {
+	unsigned long	pages[USBIF_MAX_SEGMENTS_PER_IREQUEST];
+	int		ro[USBIF_MAX_SEGMENTS_PER_IREQUEST];
+};
+typedef struct usbif_indirect_pages usbif_indirect_pages_t;
+
+struct vusb_shadow
+{
+	usbif_request_t		req;
+	unsigned long		pages[USBIF_MAX_SEGMENTS_PER_REQUEST];
+	int			ro[USBIF_MAX_SEGMENTS_PER_REQUEST];
+    	int			in_use;
+	struct vusb_urbp	*urbp;
+	int			is_reset;
+	void			*iso_packet_descriptor;
+	void			*indirect_page_memory;
+	void			*indirect_pages;
+};
 
 /* Virtual USB device on of the RH ports */
 struct vusb_device {
@@ -210,6 +227,11 @@ struct vusb_device {
 	struct usbif_front_ring ring;
 	unsigned int 		evtchn;
 	unsigned int 		irq;
+
+	/* Shadow buffers */
+	struct vusb_shadow	*shadows;
+	u16			*shadow_free_list;
+	u16			shadow_free;
 
 	unsigned		present:1;
 	unsigned		connecting:1;
@@ -675,8 +697,8 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	urbp->urb = urb;
 	spin_lock_irqsave(&vhcd->lock, flags);
 	vdev = vusb_device_by_port(vhcd, urbp->port);
-	/* Allocate a handle */
-	urbp->request.id = vusb_get_urb_handle(vhcd);
+	/* Allocate a handle as a unique ID */
+	urbp->handle = vusb_get_urb_handle(vhcd);
 
 	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
 		dprintk(D_WARN, "Worker is not up\n");
@@ -1833,8 +1855,66 @@ vusb_worker_stop(struct vusb_vhcd *vhcd)
 /****************************************************************************/
 /* Ring Processing                                                          */
 
+static void
+vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
+{
+	usbif_indirect_request_t *ireq;
+	usbif_indirect_pages_t *ipage;
+	int i, j;
+
+	if (!shadow->in_use) {
+		printk(KERN_ERR "Returning shadow %p that is not in use to list!\n",
+			shadow);
+		return;
+	}
+
+	/* Free any resources in use */
+	if (shadow->iso_packet_descriptor) {
+		kfree(shadow->iso_packet_descriptor);
+		shadow->iso_packet_descriptor = NULL;
+	}
+
+	if (shadow->indirect_page_memory) {
+		ireq = (usbif_indirect_request_t*)shadow->indirect_page_memory;
+		ipage = (usbif_indirect_pages_t*)shadow->indirect_pages;
+
+		for (i = 0; i < shadow->req.nr_segments; i++) {
+			for (j = 0; j < ireq[j].nr_segments; j++) {
+				xc_gnttab_end_foreign_access(ireq[i].gref[j],
+					ipage[i].ro[j], ipage[i].pages[j]);
+			}
+		}
+		kfree(shadow->indirect_page_memory);
+		shadow->indirect_page_memory = NULL;
+		kfree(shadow->indirect_pages);
+		shadow->indirect_pages = NULL;
+	}
+
+	for (i = 0; i < shadow->req.nr_segments; i++) {
+		xc_gnttab_end_foreign_access(shadow->req.gref[i],
+			shadow->ro[i], shadow->pages[i]);
+	}
+
+	memset(&shadow->pages[0], 0,
+		(sizeof(unsigned long)*USBIF_MAX_SEGMENTS_PER_REQUEST));
+	memset(&shadow->ro[0], 0,
+		(sizeof(int)*USBIF_MAX_SEGMENTS_PER_REQUEST));
+	shadow->req.nr_segments = 0;
+	shadow->urbp = NULL;
+	shadow->in_use = 0;
+
+	if (vdev->shadow_free >= SHADOW_ENTRIES) {
+		printk(KERN_ERR "Shadow free value too big: %d!\n",
+			vdev->shadow_free);
+		return;
+	}
+
+	vdev->shadow_free_list[vdev->shadow_free] = (u16)shadow->req.id;
+	vdev->shadow_free++;
+}
+
 static int
-vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_urbp *urbp,
+vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 		unsigned long *mfns, u32 nr_mfns)
 {
 	u32 i, ref;
@@ -1851,8 +1931,6 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_urbp *urbp,
 		return 1;
 	}
 
-	urbp->nr_segments = 0;
-
 	for (i = 0; i < nr_mfns; i++)
 	{
 		unsigned long mfn = mfns[i];
@@ -1860,13 +1938,13 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_urbp *urbp,
 		ref = xc_gnttab_claim_grant_reference(&gref_head);
 		BUG_ON(ref == -ENOSPC);
 
-		urbp->request.gref[urbp->nr_segments] = ref;
+		shadow->req.gref[shadow->req.nr_segments] = ref;
 
 		xc_gnttab_grant_foreign_access_ref(ref,
 				vdev->xendev->otherend_id, mfn,
-				usb_urb_dir_out(urbp->urb)); /* OUT is write, so RO */
+				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
 
-		urbp->nr_segments++;
+		shadow->req.nr_segments++;
  	}
 
 	xc_gnttab_free_grant_references(gref_head);
@@ -1915,6 +1993,16 @@ vusb_usbif_free(struct vusb_device *vdev, int suspend)
 	if (vdev->irq)
 		xc_unbind_from_irqhandler(vdev->irq, vdev);
 	vdev->evtchn = vdev->irq = 0;
+
+	if (vdev->shadows) {
+		kfree(vdev->shadows);
+		vdev->shadows = NULL;
+
+	if (vdev->shadow_free_list) {
+		kfree(vdev->shadow_free_list);
+		vdev->shadow_free_list = NULL;
+	}
+	}
 }
 
 static int
@@ -1922,7 +2010,7 @@ vusb_setup_usbfront(struct vusb_device *vdev)
 {
 	struct xenbus_device *dev = vdev->xendev;
 	struct usbif_sring *sring;
-	int err;
+	int err, i;
 
 	vdev->ring_ref = GRANT_INVALID_REF;
 
@@ -1954,6 +2042,31 @@ vusb_setup_usbfront(struct vusb_device *vdev)
 		goto fail;
 	}
 	vdev->irq = err;
+
+	/* Allocate the shadow buffers */
+	vdev->shadows = kzalloc(sizeof(struct vusb_shadow)*SHADOW_ENTRIES,
+				GFP_KERNEL);
+	if (!vdev->shadows) {
+		xc_xenbus_dev_fatal(dev, err,
+				 "allocate shadows failed");
+		err = -ENOMEM;
+		goto fail;
+	}
+	
+	vdev->shadow_free_list = kzalloc(sizeof(u16)*SHADOW_ENTRIES,
+				GFP_KERNEL);
+	if (!vdev->shadow_free_list) {
+		xc_xenbus_dev_fatal(dev, err,
+				 "allocate shadow free list failed");
+		err = -ENOMEM;
+		goto fail;
+	}
+
+	for (i = 0; i < SHADOW_ENTRIES; i++) {
+		vdev->shadows[i].req.id = i;
+		vdev->shadows[i].in_use = 1;
+		vusb_put_shadow(vdev, &vdev->shadows[i]);
+	}
 
 	return 0;
 fail:
@@ -2125,6 +2238,9 @@ vusb_destroy_device(struct vusb_device *vdev)
 
 	/* Update hub status */
 	vhcd->poll = 1;
+
+	/* TODO RJP have to cleanup outstanding URBs, shadow stuff, requets
+	 * e.g. like CompleteRequestsFromShadow */
 
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
