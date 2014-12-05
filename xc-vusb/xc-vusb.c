@@ -1948,6 +1948,8 @@ vusb_put_ring(struct vusb_device *vdev, struct vusb_shadow *shadow)
 	req = RING_GET_REQUEST(&vdev->ring, vdev->ring.req_prod_pvt);
 	memcpy(req, &shadow->req, sizeof(usbif_request_t));
 
+	vdev->ring.req_prod_pvt++;
+
 	RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&vdev->ring, notify);
 
 	if (notify)
