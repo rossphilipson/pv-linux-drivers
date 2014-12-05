@@ -192,8 +192,7 @@ struct usbif_indirect_pages {
 };
 typedef struct usbif_indirect_pages usbif_indirect_pages_t;
 
-struct vusb_shadow
-{
+struct vusb_shadow {
 	usbif_request_t		req;
 	unsigned long		pages[USBIF_MAX_SEGMENTS_PER_REQUEST];
 	int			ro[USBIF_MAX_SEGMENTS_PER_REQUEST];
@@ -207,6 +206,7 @@ struct vusb_shadow
 
 /* Virtual USB device on of the RH ports */
 struct vusb_device {
+	spinlock_t		lock;
 	u16			device_id;
 	u32			port_status;
 	u16			address;
@@ -275,6 +275,8 @@ struct vusb_vhcd {
 static struct platform_device *vusb_platform_device = NULL;
 static DEFINE_MUTEX(vusb_xen_pm_mutex);
 
+static void
+vusb_process_requests(struct vusb_device *vdev);
 static int
 vusb_send_packet(struct vusb_vhcd *vhcd, const struct iovec *iovec, size_t niov);
 static void
@@ -373,41 +375,6 @@ vusb_worker_notify(struct vusb_vhcd *vhcd)
 {
 	send_sig(SIGINT, vhcd->kthread, 0);
 }
-
-/* Dump the URBp list */
-static inline void
-vusb_urbp_list_dump(const struct vusb_vhcd *vhcd, const char *fn)
-{
-	const struct vusb_urbp *urbp;
-
-	dprintk(D_URB2, "===== Current URB List in %s =====\n", fn);
-	list_for_each_entry(urbp, &vhcd->urbp_list, urbp_list) {
-		dprintk(D_URB1, "URB handle 0x%x port %u device %u\n",
-			urbp->handle, urbp->port,
-			vusb_device_by_port(vhcd, urbp->port)->device_id);
-	}
-	dprintk(D_URB2, "===== End URB List in %s ====\n", fn);
-}
-
-#ifdef VUSB_DEBUG
-/* Dump URBp */
-static inline void
-vusb_urbp_dump(struct vusb_urbp *urbp)
-{
-	struct urb *urb = urbp->urb;
-	unsigned int type;
-
-	type = usb_pipetype(urb->pipe);
-
-	iprintk("urb handle: 0x%x state: %s status: %d pipe: %s(%u)\n",
-		urbp->handle, vusb_state_to_string(urbp),
-		urb->status, vusb_pipe_to_string(urb), type);
-	iprintk("Device: %u Endpoint: %u In: %u\n",
-		usb_pipedevice(urb->pipe),
-		usb_pipeendpoint(urb->pipe),
-		usb_urb_dir_in(urb));
-}
-#endif /* VUSB_DEBUG */
 
 static inline u16
 usb_speed_to_port_stat(enum usb_device_speed speed)
@@ -559,9 +526,31 @@ vusb_get_urb_handle(struct vusb_vhcd *vhcd)
 	return vhcd->urb_handle;
 }
 
+#ifdef VUSB_DEBUG
+/* Dump URBp */
+static inline void
+vusb_urbp_dump(struct vusb_urbp *urbp)
+{
+	struct urb *urb = urbp->urb;
+	unsigned int type;
+
+	type = usb_pipetype(urb->pipe);
+
+	iprintk("urb handle: 0x%x state: %s status: %d pipe: %s(%u)\n",
+		urbp->handle, vusb_state_to_string(urbp),
+		urb->status, vusb_pipe_to_string(urb), type);
+	iprintk("Device: %u Endpoint: %u In: %u\n",
+		usb_pipedevice(urb->pipe),
+		usb_pipeendpoint(urb->pipe),
+		usb_urb_dir_in(urb));
+}
+#endif /* VUSB_DEBUG */
+
 /*
  * Notify USB stack that the URB is finished and release it
  * The lock is already taken
+ *
+ * TOP-LEVEL (sort of)
  */
 static void
 vusb_urbp_release(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
@@ -676,9 +665,8 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	struct vusb_vhcd *vhcd;
 	unsigned long flags;
 	struct vusb_urbp *urbp;
-	const struct vusb_device *vdev;
-
-	int r = -ENOMEM;
+	struct vusb_device *vdev;
+	int ret = -ENOMEM;
 
 	dprintk(D_MISC, ">vusb_urb_enqueue\n");
 
@@ -695,31 +683,42 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	/* Port numbered from 1 */
 	urbp->port = urb->dev->portnum;
 	urbp->urb = urb;
+
 	spin_lock_irqsave(&vhcd->lock, flags);
-	vdev = vusb_device_by_port(vhcd, urbp->port);
 	/* Allocate a handle as a unique ID */
 	urbp->handle = vusb_get_urb_handle(vhcd);
 
-	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
+	if (vhcd->state == VUSB_INACTIVE) {
 		dprintk(D_WARN, "Worker is not up\n");
 		kfree(urbp);
-		r = -ESHUTDOWN;
-		goto done;
+		spin_unlock_irqrestore(&vhcd->lock, flags);
+		return -ESHUTDOWN;
 	}
-
-	r = usb_hcd_link_urb_to_ep(hcd, urb);
-	if (r) {
-		kfree(urbp);
-		goto done;
-	}
-
-	list_add_tail(&urbp->urbp_list, &vhcd->urbp_list);
-	vusb_worker_notify(vhcd);
-
-done:
+	vdev = vusb_device_by_port(vhcd, urbp->port);
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
-	return r;
+	/* Now lock the vusb device and drive the request queue */
+	/* TODO RJP more when we have ref counting */
+	spin_lock_irqsave(&vdev->lock, flags);
+	if (!vdev->present) {
+		dprintk(D_WARN, "Worker is not up\n");
+		kfree(urbp);
+		spin_unlock_irqrestore(&vdev->lock, flags);
+		return -ENODEV;
+	}
+
+	ret = usb_hcd_link_urb_to_ep(hcd, urb);
+	if (ret) {
+		kfree(urbp);
+		spin_unlock_irqrestore(&vdev->lock, flags);
+		return ret;
+	}
+
+	list_add_tail(&urbp->urbp_list, &vdev->urbp_list);
+	vusb_process_requests(vdev);
+	spin_unlock_irqrestore(&vdev->lock, flags);
+
+	return 0;
 }
 
 static int
@@ -975,6 +974,52 @@ static const struct hc_driver vusb_hcd_driver = {
 /****************************************************************************/
 /* URB Processing                                                           */
 
+/* Convert URB transfer flags to VUSB flags */
+static inline u16
+vusb_urb_to_flags(struct urb *urb)
+{
+	u16 flags = 0;
+
+	if (usb_urb_dir_in(urb))
+		flags |= VUSB_URB_DIRECTION_IN;
+
+	if (!(urb->transfer_flags & URB_SHORT_NOT_OK))
+		flags |= VUSB_URB_SHORT_OK;
+
+	if (urb->transfer_flags & URB_ISO_ASAP)
+		flags |= VUSB_URB_ISO_TRANSFER_ASAP;
+
+	return flags;
+}
+
+/* Retrieve endpoint from URB */
+static inline u8
+vusb_urb_to_endpoint(struct urb *urb)
+{
+	u8 endpoint = 0;
+
+	endpoint = usb_pipeendpoint(urb->pipe);
+	if (usb_urb_dir_in(urb))
+		endpoint |= 0x80;
+
+	return endpoint;
+}
+
+/* Dump the URBp list */
+static inline void
+vusb_urbp_list_dump(const struct vusb_vhcd *vhcd, const char *fn)
+{
+	const struct vusb_urbp *urbp;
+
+	dprintk(D_URB2, "===== Current URB List in %s =====\n", fn);
+	list_for_each_entry(urbp, &vhcd->urbp_list, urbp_list) {
+		dprintk(D_URB1, "URB handle 0x%x port %u device %u\n",
+			urbp->handle, urbp->port,
+			vusb_device_by_port(vhcd, urbp->port)->device_id);
+	}
+	dprintk(D_URB2, "===== End URB List in %s ====\n", fn);
+}
+
 /* Retrieve a URB by handle */
 static struct vusb_urbp*
 vusb_urb_by_handle(struct vusb_vhcd *vhcd, struct vusb_device *vdev, u16 handle)
@@ -1220,7 +1265,10 @@ vusb_urb_finish(struct vusb_vhcd *vhcd, struct vusb_device *vdev, u16 handle,
 	}
 }
 
-/* Handle command URB response */
+/* Handle command URB response
+ *
+ * TOP-LEVEL
+ */
 static void
 vusb_handle_urb_response(struct vusb_vhcd *vhcd, const void *packet)
 {
@@ -1245,7 +1293,10 @@ out:
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
 
-/* Handle command URB status */
+/* Handle command URB status
+ *
+ * TOP-LEVEL
+ */
 static void
 vusb_handle_urb_status(struct vusb_vhcd *vhcd, const void *packet)
 {
@@ -1321,36 +1372,6 @@ vusb_send_urb_packet(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp,
 	return r;
 }
 
-/* Convert URB transfer flags to VUSB flags */
-static inline u16
-vusb_urb_to_flags(struct urb *urb)
-{
-	u16 flags = 0;
-
-	if (usb_urb_dir_in(urb))
-		flags |= VUSB_URB_DIRECTION_IN;
-
-	if (!(urb->transfer_flags & URB_SHORT_NOT_OK))
-		flags |= VUSB_URB_SHORT_OK;
-
-	if (urb->transfer_flags & URB_ISO_ASAP)
-		flags |= VUSB_URB_ISO_TRANSFER_ASAP;
-
-	return flags;
-}
-
-/* Retrieve endpoint from URB */
-static inline u8
-vusb_urb_to_endpoint(struct urb *urb)
-{
-	u8 endpoint = 0;
-
-	endpoint = usb_pipeendpoint(urb->pipe);
-	if (usb_urb_dir_in(urb))
-		endpoint |= 0x80;
-
-	return endpoint;
-}
 
 /* Not defined by hcd.h */
 #define InterfaceOutRequest 						\
@@ -1393,6 +1414,9 @@ vusb_send_control_urb(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 	/* Retrieve the device */
 	vdev = vusb_device_by_port(vhcd, urbp->port);
 
+	/* TODO RJP this probably doesn't make sense now. This was split out for
+	 * the ctxusb protocol. Not sure what it will look like for us.
+	 */
 	switch (typeReq) {
 	case DeviceOutRequest | USB_REQ_SET_ADDRESS:
 		/* Don't forward set address command, directly return */
@@ -1618,6 +1642,8 @@ vusb_send_urb(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
  * Process URB task
  * - Check if we need to reset a device
  * - Browse and send URB
+ *
+ * TOP-LEVEL
  */
 static void
 vusb_process_urbs(struct vusb_vhcd *vhcd)
@@ -1687,87 +1713,6 @@ vusb_worker_cleanup(struct vusb_vhcd *vhcd)
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
 
-/*
- * Main task
- * - Read command
- * - Send command if the task receive an interrupt (not efficient)
- */
-static void
-vusb_mainloop(struct vusb_vhcd *vhcd)
-{
-	/* TODO RJP:
-	 * process writes to rings that were full.
-	 * process reads from rings that were empty.
-	 *
-	 * Original code for reference for now
-	 *
-	int nr = 0;
-	int expected = 0; // STUB packet header length
-	int count = 0;
-	int r;
-	// STUB get packet header
-
-	// FIXME: check return 
-	vusb_send_bind_request(v);
-	do {
-		nr = vusb_read(v, pbuf + count, expected - count);
-
-		dprintk(D_V4V1, "vusb_read: %d\n", nr);
-
-		if (nr == -EINTR || nr == -ERESTARTSYS) { // Sig INT occured 
-			// Check if we need to stop
-			if (kthread_should_stop())
-			        return;
-			flush_signals(current);
-			vusb_process_urbs(v);
-			dprintk(D_V4V1, "vusb: got interrupted, restarting read\n");
-			continue;
-		} else if (nr < 0) { // TODO: handle EAGAIN EDISCONNECT
-			wprintk("Unexpected error on read: %d\n", nr);
-			return;
-		} else if (nr == 0) {
-			wprintk("zero read, assuming server close connection\n");
-			// TODO: Don't close the thread. Check if we can restart the connection 
-			return;
-		}
-
-		count = count + nr;
-
-		if (count < expected) {
-			dprintk(D_V4V2, "Partial read, remaining: %d\n", expected-count);
-			continue;
-		} else  if (expected == 0) { // STUB packet header length 
-			expected = 0; // STUB payload length 
-			if (expected > VUSB_MAX_PACKET_SIZE) {
-				wprintk("Packet too large (%u)\n", expected);
-				// TODO: Skip the packet, don't close the connection
-				return;
-			}
-		}
-
-		if (count > expected) {
-			BUG();
-		}
-		if (count == expected) {
-			dprintk(D_V4V1, "All data received calling handler\n");
-			r = vusb_process_packet(v, (void *)pbuf);
-			if (v->poll) { // Update Hub status
-				v->poll = 0;
-				usb_hcd_poll_rh_status(vhcd_to_hcd(v));
-			}
-
-			if (r < 0) {
-				return;
-			}
-			if (r == 2) {
-				vusb_process_urbs(v);
-			}
-			expected = 0; // STUB packet header length
-			count = 0;
-		}
-	} while(1);
-	*/
-}
 
 static int
 vusb_threadfunc(void *data)
@@ -1786,7 +1731,7 @@ vusb_threadfunc(void *data)
 
 	/* Main loop */
 	set_current_state(TASK_INTERRUPTIBLE);
-	vusb_mainloop(vhcd);
+	/*vusb_mainloop(vhcd);*/
 
 	dprintk(D_VUSB1, "tf: fp closed, thread going idle\n");
 
@@ -1820,6 +1765,7 @@ vusb_worker_start(struct vusb_vhcd *vhcd)
 		vhcd->vdev_ports[i].parent = vhcd;
 		vhcd->vdev_ports[i].connecting = 0;
 		vhcd->vdev_ports[i].present = 0;
+		spin_lock_init(&vhcd->vdev_ports[i].lock);
 	}
 
 	vhcd->rh_state = VUSB_INACTIVE;
@@ -1998,6 +1944,11 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 /****************************************************************************/
 /* VUSB Devices                                                             */
 
+static void
+vusb_process_requests(struct vusb_device *vdev)
+{
+}
+
 static irqreturn_t
 vusb_interrupt(int irq, void *dev_id)
 {
@@ -2040,11 +1991,11 @@ vusb_usbif_free(struct vusb_device *vdev, int suspend)
 	if (vdev->shadows) {
 		kfree(vdev->shadows);
 		vdev->shadows = NULL;
+	}
 
 	if (vdev->shadow_free_list) {
 		kfree(vdev->shadow_free_list);
 		vdev->shadow_free_list = NULL;
-	}
 	}
 }
 
@@ -2295,6 +2246,7 @@ vusb_destroy_device(struct vusb_device *vdev)
  * @command: what do we want?
  * @hlen: size of header
  * @dlen: size of data
+ * TODO RJP nuke it...
  */
 static void
 vusb_initialize_packet(struct vusb_vhcd *vhcd, void *packet, u16 devid,
@@ -2307,6 +2259,7 @@ vusb_initialize_packet(struct vusb_vhcd *vhcd, void *packet, u16 devid,
 /*
  * Send a request to the host
  * A packet is describe as multiple vectors
+ * TODO RJP nuke it and all those packet macros...
  */
 static int
 vusb_send_packet(struct vusb_vhcd *vhcd, const struct iovec *iovec, size_t niov)
@@ -2316,12 +2269,109 @@ vusb_send_packet(struct vusb_vhcd *vhcd, const struct iovec *iovec, size_t niov)
 	return 0;
 }
 
+/*
+ * Main task
+ * - Read command
+ * - Send command if the task receive an interrupt (not efficient)
+ */
+static void
+vusb_mainloop(struct vusb_vhcd *vhcd)
+{
+	/* TODO RJP:
+	 * process writes to rings that were full.
+	 * process reads from rings that were empty.
+	 *
+	 * Original code for reference for now
+	 *
+	 * Outbound path fe -> be
+	 *
+	 * Moved in with the device functions. Something like this will
+	 * become a device function driven by enqueue and work. The kthread
+	 * will go away.
+	 *
+	 * Update: this thing is a mess. It is both the inbound and outbound
+	 * processor. Just leave it here for reference.
+	int nr = 0;
+	int expected = 0; // STUB packet header length
+	int count = 0;
+	int r;
+	// STUB get packet header
+
+	// FIXME: check return 
+	vusb_send_bind_request(v);
+	do {
+		nr = vusb_read(v, pbuf + count, expected - count);
+
+		dprintk(D_V4V1, "vusb_read: %d\n", nr);
+
+		if (nr == -EINTR || nr == -ERESTARTSYS) { // Sig INT occured 
+			// Check if we need to stop
+			if (kthread_should_stop())
+			        return;
+			flush_signals(current);
+			vusb_process_urbs(v);
+			dprintk(D_V4V1, "vusb: got interrupted, restarting read\n");
+			continue;
+		} else if (nr < 0) { // TODO: handle EAGAIN EDISCONNECT
+			wprintk("Unexpected error on read: %d\n", nr);
+			return;
+		} else if (nr == 0) {
+			wprintk("zero read, assuming server close connection\n");
+			// TODO: Don't close the thread. Check if we can restart the connection 
+			return;
+		}
+
+		count = count + nr;
+
+		if (count < expected) {
+			dprintk(D_V4V2, "Partial read, remaining: %d\n", expected-count);
+			continue;
+		} else  if (expected == 0) { // STUB packet header length 
+			expected = 0; // STUB payload length 
+			if (expected > VUSB_MAX_PACKET_SIZE) {
+				wprintk("Packet too large (%u)\n", expected);
+				// TODO: Skip the packet, don't close the connection
+				return;
+			}
+		}
+
+		if (count > expected) {
+			BUG();
+		}
+		if (count == expected) {
+			dprintk(D_V4V1, "All data received calling handler\n");
+			r = vusb_process_packet(v, (void *)pbuf);
+			if (v->poll) { // Update Hub status
+				v->poll = 0;
+				usb_hcd_poll_rh_status(vhcd_to_hcd(v));
+			}
+
+			if (r < 0) {
+				return;
+			}
+			if (r == 2) {
+				vusb_process_urbs(v);
+			}
+			expected = 0; // STUB packet header length
+			count = 0;
+		}
+	} while(1);
+	*/
+}
+
 /* Process packet received from vusb daemon */
 static int
 vusb_process_packet(struct vusb_vhcd *vhcd, const void *packet)
 {
 	int res = 0;
 
+	/* TODO RJP
+	 *
+	 * Inbound path: be -> fe
+	 *
+	 * This will also become a device function driven by the irq/bh/work
+	 *
+	 */
 	switch (vhcd->state) {
 	case VUSB_WAIT_BIND_RESPONSE:
 		iprintk("Wait bind response send it\n");
