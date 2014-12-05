@@ -1635,46 +1635,6 @@ vusb_send_urb(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 	}
 }
 
-/*
- * Process URB task
- * - Check if we need to reset a device
- * - Browse and send URB
- *
- * TOP-LEVEL
- */
-static void
-vusb_process_urbs(struct vusb_vhcd *vhcd)
-{
-	struct vusb_urbp *urbp;
-	struct vusb_urbp *next;
-	unsigned long flags;
-	u16 i;
-
-	dprintk(D_MISC, "process_urbs()\n");
-
-	spin_lock_irqsave(&vhcd->lock, flags);
-
-	/* Check if we need to reset a device */
-	for (i = 0; i < VUSB_PORTS; i++) {
-		if (vhcd->vdev_ports[i].reset == 1) {
-			vhcd->vdev_ports[i].reset = 2;
-			vusb_send_reset_device_cmd(vhcd, &vhcd->vdev_ports[i]);
-		}
-	}
-
-	/* Browse URB list */
-	list_for_each_entry_safe(urbp, next, &vhcd->urbp_list, urbp_list) {
-		vusb_send_urb(vhcd, urbp);
-	}
-
-	spin_unlock_irqrestore(&vhcd->lock, flags);
-
-	if (vhcd->poll) { /* Update Hub status */
-		vhcd->poll = 0;
-		usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
-	}
-}
-
 /****************************************************************************/
 /* Daemon Thread                                                            */
 
@@ -1944,14 +1904,52 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 /* VUSB Devices                                                             */
 
 static void
-vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp)
+vusb_check_reset_devices(struct vusb_vhcd *vhcd)
 {
 	unsigned long flags;
+	int i;
+
+	spin_lock_irqsave(&vhcd->lock, flags);
+
+	/* Check if we need to reset a device */
+	for (i = 0; i < VUSB_PORTS; i++) {
+		if (vhcd->vdev_ports[i].reset == 1) {
+			vhcd->vdev_ports[i].reset = 2;
+			vusb_send_reset_device_cmd(vhcd, &vhcd->vdev_ports[i]);
+		}
+	}
+
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+}
+
+static void
+vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp)
+{
+	struct vusb_vhcd *vhcd = vdev->parent;
+	struct vusb_urbp *pos;
+	struct vusb_urbp *next;
+	unsigned long flags;
+
+	/* TODO RJP check elsewhere like in work/bh */
+	vusb_check_reset_devices(vhcd);
 
 	spin_lock_irqsave(&vdev->lock, flags);
+
 	/* Queue it at the back and drive the processing */
 	list_add_tail(&urbp->urbp_list, &vdev->urbp_list);
+
+	list_for_each_entry_safe(pos, next, &vdev->urbp_list, urbp_list) {
+		/* TODO RJP fix to return values, schedule work if we cannot drain the queue */
+		vusb_send_urb(vhcd, pos);
+	}
+
 	spin_unlock_irqrestore(&vdev->lock, flags);
+
+	/* TODO RJP check elsewhere like in work/bh */
+	if (vhcd->poll) { /* Update Hub status */
+		vhcd->poll = 0;
+		usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
+	}
 }
 
 static irqreturn_t
@@ -1979,7 +1977,7 @@ static void
 vusb_usbif_free(struct vusb_device *vdev, int suspend)
 {
 	/* TODO RJP shut everything down and undo stuff from vusb_talk_to_usbback */
-	/* Not sure what all of this will be yet */
+	/* Not sure what all of this will be yet  - e.g. see all that blkback does */
 
 	/* Free resources associated with old device channel. */
 	if (vdev->ring_ref != GRANT_INVALID_REF) {
