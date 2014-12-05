@@ -3,6 +3,7 @@
  *
  * OpenXT vUSB frontend driver
  *
+ * Copyright (c) 2014 Ross Philipson <ross.philipson@gmail.com>
  * Copyright (c) 2013 Julien Grall
  * Copyright (c) 2011 Thomas Horsten
  * Copyright (c) 2013 OpenXT Systems, Inc.
@@ -206,21 +207,21 @@ struct vusb_shadow {
 
 /* Virtual USB device on of the RH ports */
 struct vusb_device {
-	spinlock_t		lock;
 	u16			device_id;
 	u32			port_status;
 	u16			address;
 	u16			port;
 	enum usb_device_speed	speed;
+	unsigned		present:1;
+	unsigned		connecting:1;
+	unsigned		processing:1;
+	unsigned		reset:2;
 
 	/* The Xenbus device associated with this vusb device */
 	struct xenbus_device    *xendev;
 
 	/* Pointer back to the parent virtual HCD core device */
 	struct vusb_vhcd        *parent;
-
-	/* This VUSB device's list of pending URBs */
-	struct list_head        urbp_list;
 
 	/* Xen rings and event channel */
 	int			ring_ref;
@@ -233,9 +234,9 @@ struct vusb_device {
 	u16			*shadow_free_list;
 	u16			shadow_free;
 
-	unsigned		present:1;
-	unsigned		connecting:1;
-	unsigned		reset:2;
+	/* This VUSB device's list of pending URBs and a lock for them*/
+	spinlock_t		lock;
+	struct list_head        urbp_list;
 };
 
 /* Virtual USB HCD/RH pieces */
@@ -276,7 +277,7 @@ static struct platform_device *vusb_platform_device = NULL;
 static DEFINE_MUTEX(vusb_xen_pm_mutex);
 
 static void
-vusb_process_requests(struct vusb_device *vdev);
+vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp);
 static int
 vusb_send_packet(struct vusb_vhcd *vhcd, const struct iovec *iovec, size_t niov);
 static void
@@ -688,23 +689,12 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	/* Allocate a handle as a unique ID */
 	urbp->handle = vusb_get_urb_handle(vhcd);
 
-	if (vhcd->state == VUSB_INACTIVE) {
+	vdev = vusb_device_by_port(vhcd, urbp->port);
+	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
 		dprintk(D_WARN, "Worker is not up\n");
 		kfree(urbp);
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		return -ESHUTDOWN;
-	}
-	vdev = vusb_device_by_port(vhcd, urbp->port);
-	spin_unlock_irqrestore(&vhcd->lock, flags);
-
-	/* Now lock the vusb device and drive the request queue */
-	/* TODO RJP more when we have ref counting */
-	spin_lock_irqsave(&vdev->lock, flags);
-	if (!vdev->present) {
-		dprintk(D_WARN, "Worker is not up\n");
-		kfree(urbp);
-		spin_unlock_irqrestore(&vdev->lock, flags);
-		return -ENODEV;
 	}
 
 	ret = usb_hcd_link_urb_to_ep(hcd, urb);
@@ -714,9 +704,16 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 		return ret;
 	}
 
-	list_add_tail(&urbp->urbp_list, &vdev->urbp_list);
-	vusb_process_requests(vdev);
-	spin_unlock_irqrestore(&vdev->lock, flags);
+	/* Set it in the processing state so it is not nuked out from under us */
+	vdev->processing = 1;
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+
+	vusb_process_requests(vdev, urbp);
+
+	/* Finished processing */
+	spin_lock_irqsave(&vhcd->lock, flags);
+	vdev->processing = 1;
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	return 0;
 }
@@ -1708,6 +1705,7 @@ vusb_worker_cleanup(struct vusb_vhcd *vhcd)
 		vhcd->vdev_ports[i].port = i + 1;
 		vhcd->vdev_ports[i].connecting = 0;
 		vhcd->vdev_ports[i].present = 0;
+		vhcd->vdev_ports[i].processing = 0;
 	}
 
 	spin_unlock_irqrestore(&vhcd->lock, flags);
@@ -1765,6 +1763,7 @@ vusb_worker_start(struct vusb_vhcd *vhcd)
 		vhcd->vdev_ports[i].parent = vhcd;
 		vhcd->vdev_ports[i].connecting = 0;
 		vhcd->vdev_ports[i].present = 0;
+		vhcd->vdev_ports[i].processing = 0;
 		spin_lock_init(&vhcd->vdev_ports[i].lock);
 	}
 
@@ -1945,8 +1944,14 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 /* VUSB Devices                                                             */
 
 static void
-vusb_process_requests(struct vusb_device *vdev)
+vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
+	unsigned long flags;
+
+	spin_lock_irqsave(&vdev->lock, flags);
+	/* Queue it at the back and drive the processing */
+	list_add_tail(&urbp->urbp_list, &vdev->urbp_list);
+	spin_unlock_irqrestore(&vdev->lock, flags);
 }
 
 static irqreturn_t
@@ -1967,6 +1972,7 @@ vusb_device_clear(struct vusb_device *vdev)
 	vdev->device_id = 0;
 	vdev->connecting = 0;
 	vdev->present = 0;
+	vdev->processing = 0;
 }
 
 static void
@@ -2220,11 +2226,20 @@ vusb_destroy_device(struct vusb_device *vdev)
 	struct vusb_vhcd *vhcd = vdev->parent;
 	unsigned long flags;
 
-	/* TODO RJP need more than this? */
+again:
 	spin_lock_irqsave(&vhcd->lock, flags);
+
+	if (vdev->processing) {
+		vdev->present = 0;
+		spin_unlock_irqrestore(&vhcd->lock, flags);
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule_timeout(2*HZ);
+		goto again;
+	}
 
 	dprintk(D_PORT1, "Remove device from port %u\n", vdev->port);
 
+	/* TODO RJP need more than this? */
 	vusb_usbif_free(vdev, 0);
 	vusb_device_clear(vdev);
 
