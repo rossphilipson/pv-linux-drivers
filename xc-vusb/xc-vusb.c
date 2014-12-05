@@ -712,7 +712,7 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 
 	/* Finished processing */
 	spin_lock_irqsave(&vhcd->lock, flags);
-	vdev->processing = 1;
+	vdev->processing = 0;
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	return 0;
@@ -2227,8 +2227,9 @@ vusb_destroy_device(struct vusb_device *vdev)
 again:
 	spin_lock_irqsave(&vhcd->lock, flags);
 
+	vdev->present = 0; /* Gone ... */
+
 	if (vdev->processing) {
-		vdev->present = 0;
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		set_current_state(TASK_INTERRUPTIBLE);
 		schedule_timeout(2*HZ);
