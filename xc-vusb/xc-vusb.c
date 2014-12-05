@@ -1938,6 +1938,22 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 	vdev->shadow_free++;
 }
 
+static void
+vusb_put_ring(struct vusb_device *vdev, struct vusb_shadow *shadow)
+{
+	int notify;
+	usbif_request_t *req;
+
+	/* If we have a shadow allocation, we know there is space on the ring */	
+	req = RING_GET_REQUEST(&vdev->ring, vdev->ring.req_prod_pvt);
+	memcpy(req, &shadow->req, sizeof(usbif_request_t));
+
+	RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&vdev->ring, notify);
+
+	if (notify)
+		xc_notify_remote_via_irq(vdev->irq);
+}
+
 static int
 vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 		unsigned long *mfns, u32 nr_mfns)
