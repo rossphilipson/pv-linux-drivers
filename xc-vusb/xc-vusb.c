@@ -218,6 +218,7 @@ struct vusb_device {
 	unsigned			present:1;
 	unsigned			connecting:1;
 	unsigned			processing:1;
+	unsigned			closing:1;
 	unsigned			reset:2;
 
 	/* The Xenbus device associated with this vusb device */
@@ -225,6 +226,9 @@ struct vusb_device {
 
 	/* Pointer back to the parent virtual HCD core device */
 	struct vusb_vhcd		*parent;
+
+	/* Lock for device resources */
+	spinlock_t			lock;
 
 	/* Xen rings and event channel */
 	int				ring_ref;
@@ -238,8 +242,7 @@ struct vusb_device {
 	u16				*shadow_free_list;
 	u16				shadow_free;
 
-	/* This VUSB device's list of pending URBs and a lock for them*/
-	spinlock_t			lock;
+	/* This VUSB device's list of pending URBs */
 	struct list_head        	urbp_list;
 
 	struct work_struct 		work;
@@ -617,6 +620,7 @@ vusb_init_hcd(struct vusb_vhcd *vhcd)
 		vhcd->vdev_ports[i].connecting = 0;
 		vhcd->vdev_ports[i].present = 0;
 		vhcd->vdev_ports[i].processing = 0;
+		vhcd->vdev_ports[i].closing = 0;
 		spin_lock_init(&vhcd->vdev_ports[i].lock);
 		INIT_WORK(&vhcd->vdev_ports[i].work, vusb_restart_processing);
 	}
@@ -699,7 +703,13 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 
 	vdev = vusb_device_by_port(vhcd, urbp->port);
 	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
-		dprintk(D_WARN, "Worker is not up\n");
+		eprintk("Start processing called while device(s) in invalid states\n");
+		kfree(urbp);
+		spin_unlock_irqrestore(&vhcd->lock, flags);
+		return -ESHUTDOWN;
+	}
+
+	if (vdev->closing) {
 		kfree(urbp);
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		return -ESHUTDOWN;
@@ -1687,9 +1697,19 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 }
 
 static void
-vusb_put_ring(struct vusb_device *vdev, struct vusb_shadow *shadow)
+vusb_flush_requests(struct vusb_device *vdev)
 {
 	int notify;
+
+	RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&vdev->ring, notify);
+
+	if (notify)
+		xc_notify_remote_via_irq(vdev->irq);
+}
+
+static void
+vusb_put_ring(struct vusb_device *vdev, struct vusb_shadow *shadow)
+{
 	usbif_request_t *req;
 
 	/* If we have a shadow allocation, we know there is space on the ring */	
@@ -1698,10 +1718,7 @@ vusb_put_ring(struct vusb_device *vdev, struct vusb_shadow *shadow)
 
 	vdev->ring.req_prod_pvt++;
 
-	RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&vdev->ring, notify);
-
-	if (notify)
-		xc_notify_remote_via_irq(vdev->irq);
+	vusb_flush_requests(vdev);
 }
 
 static void
@@ -1760,6 +1777,13 @@ vusb_start_processing(struct vusb_device *vdev)
 	spin_lock_irqsave(&vhcd->lock, flags);
 
 	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
+		eprintk("Start processing called while device(s) in invalid statesi\n");
+		spin_unlock_irqrestore(&vhcd->lock, flags);
+		return false;
+	}
+
+	if (vdev->closing) {
+		/* Normal, shutdown of this device pending */
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		return false;
 	}
@@ -1790,7 +1814,7 @@ vusb_wait_stop_processing(struct vusb_device *vdev)
 again:
 	spin_lock_irqsave(&vhcd->lock, flags);
 
-	vdev->present = 0; /* Gone ... */
+	vdev->closing = 0; /* Goning away now... */
 
 	if (vdev->processing) {
 		spin_unlock_irqrestore(&vhcd->lock, flags);
@@ -1888,15 +1912,13 @@ vusb_device_clear(struct vusb_device *vdev)
 	vdev->connecting = 0;
 	vdev->present = 0;
 	vdev->processing = 0;
+	vdev->closing = 0;
 }
 
 static void
 vusb_usbif_free(struct vusb_device *vdev, int suspend)
 {
-	/* TODO RJP shut everything down and undo stuff from vusb_talk_to_usbback */
-	/* Not sure what all of this will be yet  - e.g. see all that blkback does */
-
-	/* Free resources associated with old device channel. */
+	/* Free all resources setup during vusb_create_device */
 	if (vdev->ring_ref != GRANT_INVALID_REF) {
 		/* This frees the page too */
 		xc_gnttab_end_foreign_access(vdev->ring_ref, 0,
@@ -2154,22 +2176,31 @@ vusb_destroy_device(struct vusb_device *vdev)
 	/* Wait for all processing to stop now */
 	vusb_wait_stop_processing(vdev);
 
-	/* Cancel all the pending URBs */
+	/* Final device operations. There should me no more activity in the
+	 * front end for this device since it is now in the closing state.
+	 */
+	spin_lock_irqsave(&vdev->lock, flags);
+
+	/* Give usbback a chance to consume the ring */
+	vusb_flush_requests(vdev);
+
+	/* TODO RJP do something like the blkback wait_event_interruptible here? */
+
+	/* Clear all the pending URBs */
 	list_for_each_entry_safe(pos, next, &vdev->urbp_list, urbp_list) {
 		pos->urb->status = -ESHUTDOWN;
 		vusb_urbp_release(vdev, pos);
 	}
 
+	spin_unlock_irqrestore(&vdev->lock, flags);
+
 	spin_lock_irqsave(&vhcd->lock, flags);
 
-	/* TODO RJP need more than this? */
+	/* Final VHCD operations on device. Clean up everything. */
 	vusb_usbif_free(vdev, 0);
 	vusb_device_clear(vdev);
 
 	vusb_set_link_state(vdev);
-
-	/* TODO RJP have to cleanup outstanding URBs, shadow stuff, requets
-	 * e.g. like CompleteRequestsFromShadow */
 
 	if (vhcd->state != VUSB_INACTIVE)
 		vhcd->poll = 1;
