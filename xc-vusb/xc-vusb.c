@@ -224,8 +224,8 @@ struct vusb_device {
 	/* The Xenbus device associated with this vusb device */
 	struct xenbus_device    	*xendev;
 
-	/* Pointer back to the parent virtual HCD core device */
-	struct vusb_vhcd		*parent;
+	/* Pointer back to the virtual HCD core device */
+	struct vusb_vhcd		*vhcd;
 
 	/* Lock for device resources */
 	spinlock_t			lock;
@@ -270,6 +270,10 @@ struct vusb_vhcd {
 
 	u16				urb_handle;
 
+	struct work_struct 		work;
+
+	struct list_head        	release_list;
+
 	/*
 	 * Update hub can't be done in critical section.
 	 * Is the driver need to update the hub?
@@ -295,6 +299,8 @@ vusb_initialize_packet(struct vusb_device *vdev, void *packet,
 		u8 command, u32 hlen, u32 dlen);
 static void
 vusb_send_reset_device_cmd(struct vusb_device *vdev);
+static void
+vusb_urbp_release_async(struct work_struct *work);
 
 /****************************************************************************/
 /* Miscellaneous Routines                                                   */
@@ -547,13 +553,10 @@ vusb_urbp_dump(struct vusb_urbp *urbp)
 /*
  * Notify USB stack that the URB is finished and release it
  * The lock is already taken
- *
- * TOP-LEVEL (sort of)
  */
 static void
-vusb_urbp_release(struct vusb_device *vdev, struct vusb_urbp *urbp)
+vusb_urbp_release(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 {
-	struct vusb_vhcd *vhcd = vdev->parent;
 	struct urb *urb = urbp->urb;
 
 #ifdef VUSB_DEBUG
@@ -563,13 +566,44 @@ vusb_urbp_release(struct vusb_device *vdev, struct vusb_urbp *urbp)
 
 	dprintk(D_URB1, "Giveback URB 0x%x status %d length %u\n",
 		urbp->handle, urb->status, urb->actual_length);
-	list_del(&urbp->urbp_list);
 	kfree(urbp);
 	usb_hcd_unlink_urb_from_ep(vhcd_to_hcd(vhcd), urb);
-	/* Unlock the lock before notify the USB stack (could call other cb) */
-	spin_unlock(&vdev->lock);
 	usb_hcd_giveback_urb(vhcd_to_hcd(vhcd), urb, urb->status);
-	spin_lock(&vdev->lock);
+}
+
+static void
+vusb_urbp_release_async(struct work_struct *work)
+{
+	struct vusb_vhcd *vhcd = container_of(work, struct vusb_vhcd, work);
+	struct list_head tmp;
+	struct vusb_urbp *pos;
+	struct vusb_urbp *next;
+	unsigned long flags;
+
+	spin_lock_irqsave(&vhcd->lock, flags);
+        list_splice_init(&vhcd->release_list, &tmp);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+
+	list_for_each_entry_safe(pos, next, &tmp, urbp_list) {
+		vusb_urbp_release(vhcd, pos);
+	}
+}
+
+static void
+vusb_urbp_queue_release(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
+{
+	unsigned long flags;
+
+	/* Remove from the vdev list. This is called from the urb processing
+	 * routines holding the vdev lock.
+	 */
+	list_del(&urbp->urbp_list);
+
+	spin_lock_irqsave(&vhcd->lock, flags);
+	list_add_tail(&urbp->urbp_list, &vhcd->release_list);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+	
+	schedule_work(&vhcd->work);
 }
 
 /* Hub descriptor */
@@ -615,7 +649,7 @@ vusb_init_hcd(struct vusb_vhcd *vhcd)
 	/* Initialize ports */
 	for (i = 0; i < VUSB_PORTS; i++) {
 		vhcd->vdev_ports[i].port = i + 1;
-		vhcd->vdev_ports[i].parent = vhcd;
+		vhcd->vdev_ports[i].vhcd = vhcd;
 		vhcd->vdev_ports[i].connecting = 0;
 		vhcd->vdev_ports[i].present = 0;
 		vhcd->vdev_ports[i].processing = 0;
@@ -687,7 +721,7 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	if (!urb->transfer_buffer && urb->transfer_buffer_length)
 		return -EINVAL;
 
-	urbp = kmalloc(sizeof *urbp, mem_flags);
+	urbp = kmalloc(sizeof(*urbp), mem_flags);
 	if (!urbp)
 		return -ENOMEM;
 
@@ -1125,7 +1159,7 @@ vusb_urb_common_finish(struct vusb_device *vdev, struct vusb_urbp *urbp, bool in
 		}
 	}
 
-	vusb_urbp_release(vdev, urbp);
+	vusb_urbp_queue_release(vdev->vhcd, urbp);
 }
 
 /*
@@ -1174,7 +1208,7 @@ vusb_urb_isochronous_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
 
 	urb->actual_length = dlen;
 
-	vusb_urbp_release(vdev, urbp);
+	vusb_urbp_queue_release(vdev->vhcd, urbp);
 	return;
 
 iso_err:
@@ -1185,7 +1219,7 @@ iso_err:
 	}
 	urb->actual_length = 0;
 
-	vusb_urbp_release(vdev, urbp);
+	vusb_urbp_queue_release(vdev->vhcd, urbp);
 }
 
 /* Finish a control URB */
@@ -1634,7 +1668,7 @@ vusb_send_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 		/* Remove URB */
 		dprintk(D_URB1, "URB immediate %s\n",
 			vusb_state_to_string(urbp));
-		vusb_urbp_release(vdev, urbp);
+		vusb_urbp_queue_release(vdev->vhcd, urbp);
 	}
 }
 
@@ -1799,7 +1833,7 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 static bool
 vusb_start_processing(struct vusb_device *vdev)
 {
-	struct vusb_vhcd *vhcd = vdev->parent;
+	struct vusb_vhcd *vhcd = vdev->vhcd;
 	unsigned long flags;
 
 	spin_lock_irqsave(&vhcd->lock, flags);
@@ -1825,7 +1859,7 @@ vusb_start_processing(struct vusb_device *vdev)
 static void
 vusb_stop_processing(struct vusb_device *vdev)
 {
-	struct vusb_vhcd *vhcd = vdev->parent;
+	struct vusb_vhcd *vhcd = vdev->vhcd;
 	unsigned long flags;
 
 	spin_lock_irqsave(&vhcd->lock, flags);
@@ -1836,7 +1870,7 @@ vusb_stop_processing(struct vusb_device *vdev)
 static void
 vusb_wait_stop_processing(struct vusb_device *vdev)
 {
-	struct vusb_vhcd *vhcd = vdev->parent;
+	struct vusb_vhcd *vhcd = vdev->vhcd;
 	unsigned long flags;
 
 again:
@@ -1876,7 +1910,7 @@ vusb_check_reset_devices(struct vusb_vhcd *vhcd)
 static void
 vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
-	struct vusb_vhcd *vhcd = vdev->parent;
+	struct vusb_vhcd *vhcd = vdev->vhcd;
 	struct vusb_urbp *pos;
 	struct vusb_urbp *next;
 	unsigned long flags;
@@ -2137,7 +2171,7 @@ vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 	vdev = &vhcd->vdev_ports[i];
 	vdev->device_id = id;
 	vdev->connecting = 1;
-	vdev->parent = vhcd;
+	vdev->vhcd = vhcd;
 	vdev->xendev = dev;
 	INIT_LIST_HEAD(&vdev->urbp_list);
 
@@ -2161,7 +2195,7 @@ out:
 static int
 vusb_start_device(struct vusb_device *vdev)
 {
-	struct vusb_vhcd *vhcd = vdev->parent;
+	struct vusb_vhcd *vhcd = vdev->vhcd;
 	enum usb_device_speed speed;
 	unsigned long flags;
 	int rc = 0;
@@ -2190,7 +2224,7 @@ vusb_start_device(struct vusb_device *vdev)
 static void
 vusb_destroy_device(struct vusb_device *vdev)
 {
-	struct vusb_vhcd *vhcd = vdev->parent;
+	struct vusb_vhcd *vhcd = vdev->vhcd;
 	struct list_head tmp;
 	struct vusb_urbp *pos;
 	struct vusb_urbp *next;
@@ -2223,7 +2257,7 @@ vusb_destroy_device(struct vusb_device *vdev)
 	/* Release all the pending URBs - this has to be done outside a lock */
 	list_for_each_entry_safe(pos, next, &tmp, urbp_list) {
 		pos->urb->status = -ESHUTDOWN;
-		vusb_urbp_release(vdev, pos);
+		vusb_urbp_release(vhcd, pos);
 	}
 
 	spin_lock_irqsave(&vhcd->lock, flags);
@@ -2440,7 +2474,7 @@ vusb_send_reset_device_cmd(struct vusb_device *vdev)
 	vdev->port_status |= (USB_PORT_STAT_C_RESET << 16);
 
 	vusb_set_link_state(vdev);
-	vdev->parent->poll = 1;
+	vdev->vhcd->poll = 1;
 }
 
 /****************************************************************************/
@@ -2646,6 +2680,9 @@ vusb_platform_cleanup(struct vusb_vhcd *vhcd)
 	vhcd->state = VUSB_INACTIVE;
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
+	/* Shutdown all work. Must be done with no locks held. */
+	flush_work_sync(&vhcd->work);
+
 	/* Unplug all USB devices */
 	for (i = 0; i < VUSB_PORTS; i++)
 		xc_xenbus_switch_state(vhcd->vdev_ports[i].xendev, XenbusStateClosed);
@@ -2675,6 +2712,8 @@ vusb_platform_probe(struct platform_device *pdev)
 	vhcd = hcd_to_vhcd(hcd);
 
 	spin_lock_init(&vhcd->lock);
+	INIT_WORK(&vhcd->work, vusb_urbp_release_async);
+	INIT_LIST_HEAD(&vhcd->release_list);
 
 	ret = usb_add_hcd(hcd, 0, 0);
 	if (ret != 0)
