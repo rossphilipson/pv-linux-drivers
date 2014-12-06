@@ -36,7 +36,6 @@
 #include <linux/version.h>
 #include <linux/module.h>
 #include <asm/uaccess.h>
-#include <linux/kthread.h>
 #include <linux/signal.h>
 #include <linux/slab.h>
 #include <linux/platform_device.h>
@@ -248,7 +247,6 @@ struct vusb_device {
 
 /* Virtual USB HCD/RH pieces */
 enum vusb_rh_state {
-	VUSB_RH_RESET,
 	VUSB_RH_SUSPENDED,
 	VUSB_RH_RUNNING
 };
@@ -269,9 +267,6 @@ struct vusb_vhcd {
 	/* TODO RJP this will go away */
 	struct list_head                urbp_list;
 	u16				urb_handle;
-
-	/* Main thread */
-	struct task_struct 		*kthread;
 
 	/*
 	 * Update hub can't be done in critical section.
@@ -327,14 +322,12 @@ static const char*
 vusb_rhstate_to_string(const struct vusb_vhcd *vhcd)
 {
 	switch (vhcd->rh_state) {
-	case VUSB_RH_RESET:
-		return "RESET";
 	case VUSB_RH_SUSPENDED:
 		return "SUSPENDED";
 	case VUSB_RH_RUNNING:
 		return "RUNNING";
 	default:
-		return "Unknown";
+		return "UNKNOWN";
 	}
 }
 
@@ -378,17 +371,6 @@ vusb_state_to_string(const struct vusb_urbp *urbp)
 }
 
 #endif /* VUSB_DEBUG */
-
-/*
- * Notify the worker that there is a new task
- * FIXME: I think the best solution is to have
- * a pending queue
- */
-static inline void
-vusb_worker_notify(struct vusb_vhcd *vhcd)
-{
-	send_sig(SIGINT, vhcd->kthread, 0);
-}
 
 static inline u16
 usb_speed_to_port_stat(enum usb_device_speed speed)
@@ -455,7 +437,7 @@ vusb_port_reset(struct vusb_vhcd *vhcd, struct vusb_device *vdev)
 
 	vdev->reset = 1;
 
-	vusb_worker_notify(vhcd);
+	/* TODO RJP vusb_worker_notify(vhcd);*/
 }
 
 static void
@@ -619,6 +601,31 @@ vusb_hub_descriptor(struct usb_hub_descriptor *desc)
 	desc->wHubCharacteristics = cpu_to_le16(temp);
 }
 
+static int
+vusb_init_hcd(struct vusb_vhcd *vhcd)
+{
+	int i;
+
+	dprintk(D_PM, "Init the HCD\n");
+
+	/* TODO RJP revisit, may not want to clear the devices on resume path
+	 * also may need suspend/resume for S3 */
+	/* Initialize ports */
+	for (i = 0; i < VUSB_PORTS; i++) {
+		vhcd->vdev_ports[i].port = i + 1;
+		vhcd->vdev_ports[i].parent = vhcd;
+		vhcd->vdev_ports[i].connecting = 0;
+		vhcd->vdev_ports[i].present = 0;
+		vhcd->vdev_ports[i].processing = 0;
+		spin_lock_init(&vhcd->vdev_ports[i].lock);
+		INIT_WORK(&vhcd->vdev_ports[i].work, vusb_restart_processing);
+	}
+
+	vhcd->state = VUSB_INACTIVE;
+
+	return 0;
+}
+
 /* HCD start */
 static int
 vusb_hcd_start(struct usb_hcd *hcd)
@@ -630,6 +637,7 @@ vusb_hcd_start(struct usb_hcd *hcd)
 	dprintk(D_MISC, ">vusb_start\n");
 
 	vhcd->rh_state = VUSB_RH_RUNNING;
+	vhcd->state = VUSB_RUNNING;
 
 	hcd->power_budget = POWER_BUDGET;
 	hcd->state = HC_STATE_RUNNING;
@@ -641,7 +649,8 @@ vusb_hcd_start(struct usb_hcd *hcd)
 }
 
 /* HCD stop */
-static void vusb_hcd_stop(struct usb_hcd *hcd)
+static void
+vusb_hcd_stop(struct usb_hcd *hcd)
 {
 	struct vusb_vhcd *vhcd;
 
@@ -743,7 +752,7 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 
 	if (urbp) {
 		urbp->state = VUSB_URBP_CANCEL;
-		vusb_worker_notify(vhcd);
+		/* TODO RJP vusb_worker_notify(vhcd);*/
 	} else
 		wprintk("Try do dequeue an unhandle URB\n");
 
@@ -924,19 +933,21 @@ static int
 vusb_hcd_bus_resume(struct usb_hcd *hcd)
 {
 	struct vusb_vhcd *vhcd = hcd_to_vhcd(hcd);
-	int rc = 0;
+	int ret = 0;
 
 	dprintk(D_PM, "Bus resume\n");
 
 	spin_lock_irq(&vhcd->lock);
 	if (!HCD_HW_ACCESSIBLE(hcd)) {
-		rc = -ESHUTDOWN;
+		ret = -ESHUTDOWN;
 	} else {
 		vhcd->rh_state = VUSB_RH_RUNNING;
+		vhcd->state = VUSB_RUNNING;
 		hcd->state = HC_STATE_RUNNING;
 	}
 	spin_unlock_irq(&vhcd->lock);
-	return rc;
+
+	return ret;
 }
 #endif /* CONFIG_PM */
 
@@ -1590,129 +1601,6 @@ vusb_send_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 }
 
 /****************************************************************************/
-/* Daemon Thread                                                            */
-
-/* Helper to cleanup data associated to the worker */
-static void
-vusb_worker_cleanup(struct vusb_vhcd *vhcd)
-{
-	struct vusb_urbp *urbp;
-	struct vusb_urbp *next;
-	u16 i = 0;
-	unsigned long flags;
-
-	dprintk(D_PM, "Clean up the worker\n");
-
-	spin_lock_irqsave(&vhcd->lock, flags);
-	vhcd->rh_state = VUSB_INACTIVE;
-
-	list_for_each_entry_safe(urbp, next, &vhcd->urbp_list, urbp_list) {
-		struct vusb_device *vdev;
-
-		vdev = vusb_device_by_port(vhcd, urbp->port);
-		urbp->urb->status = -ESHUTDOWN;
-		/* TODO RJP locks and such vusb_urbp_release(vhcd, urbp);*/
-	}
-
-	/* Unplug all USB devices */
-	for (i = 0; i < VUSB_PORTS; i++) {
-		vhcd->vdev_ports[i].port = i + 1;
-		vhcd->vdev_ports[i].connecting = 0;
-		vhcd->vdev_ports[i].present = 0;
-		vhcd->vdev_ports[i].processing = 0;
-	}
-
-	spin_unlock_irqrestore(&vhcd->lock, flags);
-}
-
-
-static int
-vusb_threadfunc(void *data)
-{
-	mm_segment_t oldfs;
-	struct vusb_vhcd *vhcd = data;
-
-	dprintk(D_VUSB1, "tf: In thread\n");
-
-	/* Fine now, as we don't return to userspace: */
-	oldfs = get_fs();
-	set_fs(get_ds());
-
-	siginitsetinv(&current->blocked, sigmask(SIGINT));
-	allow_signal(SIGINT);
-
-	/* Main loop */
-	set_current_state(TASK_INTERRUPTIBLE);
-	/*vusb_mainloop(vhcd);*/
-
-	dprintk(D_VUSB1, "tf: fp closed, thread going idle\n");
-
-	if (!kthread_should_stop())
-		wprintk("Unexpected TODO close\n");
-
-	vusb_worker_cleanup(vhcd);
-
-	set_fs(oldfs);
-	while (!kthread_should_stop()) {
-		schedule_timeout(100000);
-	}
-	dprintk(D_VUSB1, "tf: Thread exiting\n");
-	return 0;
-}
-
-/* Helper to create the worker */
-static int
-vusb_worker_start(struct vusb_vhcd *vhcd)
-{
-	int ret = 0;
-	u16 i = 0;
-
-	dprintk(D_PM, "Start the worker\n");
-
-	/* TODO RJP revisit, may not want to clear the devices on resume path
-	 * also may need suspend/resume for S3 */
-	/* Initialize ports */
-	for (i = 0; i < VUSB_PORTS; i++) {
-		vhcd->vdev_ports[i].port = i + 1;
-		vhcd->vdev_ports[i].parent = vhcd;
-		vhcd->vdev_ports[i].connecting = 0;
-		vhcd->vdev_ports[i].present = 0;
-		vhcd->vdev_ports[i].processing = 0;
-		spin_lock_init(&vhcd->vdev_ports[i].lock);
-		INIT_WORK(&vhcd->vdev_ports[i].work, vusb_restart_processing);
-	}
-
-	vhcd->rh_state = VUSB_INACTIVE;
-
-	/* TODO Opened v4v connection here - the vusb devices will do this for their rings*/
-
-	/* Create the main thread */
-	vhcd->kthread = kthread_run(vusb_threadfunc, vhcd, "vusb");
-	if (IS_ERR(vhcd->kthread)) {
-		ret = PTR_ERR(vhcd->kthread);
-		eprintk("unable to start the thread: %d", ret);
-		goto err;
-	}
-
-	return 0;
-err:
-	return ret;
-}
-
-/*
- * Helper to stop the worker
- * FIXME: there is a race condition with send_sig and kthread_stop
- */
-static inline void
-vusb_worker_stop(struct vusb_vhcd *vhcd)
-{
-	dprintk(D_PM, "Stop the worker\n");
-
-	send_sig(SIGINT, vhcd->kthread, 0); /* To left the function read */
-	kthread_stop(vhcd->kthread);
-}
-
-/****************************************************************************/
 /* Ring Processing                                                          */
 
 static struct vusb_shadow*
@@ -1890,6 +1778,27 @@ vusb_stop_processing(struct vusb_device *vdev)
 
 	spin_lock_irqsave(&vhcd->lock, flags);
 	vdev->processing = 0;
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+}
+
+static void
+vusb_wait_stop_processing(struct vusb_device *vdev)
+{
+	struct vusb_vhcd *vhcd = vdev->parent;
+	unsigned long flags;
+
+again:
+	spin_lock_irqsave(&vhcd->lock, flags);
+
+	vdev->present = 0; /* Gone ... */
+
+	if (vdev->processing) {
+		spin_unlock_irqrestore(&vhcd->lock, flags);
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule_timeout(HZ);
+		goto again;
+	}
+
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
 
@@ -2230,26 +2139,28 @@ static void
 vusb_destroy_device(struct vusb_device *vdev)
 {
 	struct vusb_vhcd *vhcd = vdev->parent;
+	struct vusb_urbp *pos;
+	struct vusb_urbp *next;
 	unsigned long flags;
+
+	dprintk(D_PORT1, "Remove device from port %u\n", vdev->port);
 
 	/* Disconnect gref free callback so it schedules no more work */
 	xc_gnttab_cancel_free_callback(&vdev->callback);
 
 	/* Shutdown all work. Must be done with no locks held. */
 	flush_work_sync(&vdev->work);
-again:
-	spin_lock_irqsave(&vhcd->lock, flags);
 
-	vdev->present = 0; /* Gone ... */
+	/* Wait for all processing to stop now */
+	vusb_wait_stop_processing(vdev);
 
-	if (vdev->processing) {
-		spin_unlock_irqrestore(&vhcd->lock, flags);
-		set_current_state(TASK_INTERRUPTIBLE);
-		schedule_timeout(2*HZ);
-		goto again;
+	/* Cancel all the pending URBs */
+	list_for_each_entry_safe(pos, next, &vdev->urbp_list, urbp_list) {
+		pos->urb->status = -ESHUTDOWN;
+		vusb_urbp_release(vdev, pos);
 	}
 
-	dprintk(D_PORT1, "Remove device from port %u\n", vdev->port);
+	spin_lock_irqsave(&vhcd->lock, flags);
 
 	/* TODO RJP need more than this? */
 	vusb_usbif_free(vdev, 0);
@@ -2257,13 +2168,19 @@ again:
 
 	vusb_set_link_state(vdev);
 
-	/* Update hub status */
-	vhcd->poll = 1;
-
 	/* TODO RJP have to cleanup outstanding URBs, shadow stuff, requets
 	 * e.g. like CompleteRequestsFromShadow */
 
+	if (vhcd->state != VUSB_INACTIVE)
+		vhcd->poll = 1;
+
 	spin_unlock_irqrestore(&vhcd->lock, flags);
+
+	/* Update hub status, device gone, port empty */
+	if (vhcd->poll) {
+		vhcd->poll = 0;
+		usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
+	}
 }
 
 /**
@@ -2651,12 +2568,29 @@ vusb_xen_unregister(void)
 /****************************************************************************/
 /* VUSB Platform Device & Driver                                            */
 
+static void
+vusb_platform_cleanup(struct vusb_vhcd *vhcd)
+{
+	unsigned long flags;
+	u16 i = 0;
+
+	dprintk(D_PM, "Clean up the worker\n");
+
+	spin_lock_irqsave(&vhcd->lock, flags);
+	vhcd->state = VUSB_INACTIVE;
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+
+	/* Unplug all USB devices */
+	for (i = 0; i < VUSB_PORTS; i++)
+		xc_xenbus_switch_state(vhcd->vdev_ports[i].xendev, XenbusStateClosed);
+}
+
 /* Platform probe */
 static int
 vusb_platform_probe(struct platform_device *pdev)
 {
 	struct usb_hcd *hcd;
-	int retval;
+	int ret;
 	struct vusb_vhcd *vhcd;
 
 	if (usb_disabled())
@@ -2677,26 +2611,22 @@ vusb_platform_probe(struct platform_device *pdev)
 	spin_lock_init(&vhcd->lock);
 	INIT_LIST_HEAD(&vhcd->urbp_list);
 
-	retval = vusb_worker_start(vhcd);
-	if (retval != 0)
-		goto err_worker;
-
-	retval = usb_add_hcd(hcd, 0, 0);
-	if (retval != 0)
+	ret = usb_add_hcd(hcd, 0, 0);
+	if (ret != 0)
 		goto err_add;
+
+	vusb_init_hcd(vhcd);
 
 	dprintk(D_MISC, "<vusb_hcd_probe %d\n", retval);
 
 	return 0;
 
 err_add:
-	vusb_worker_stop(vhcd);
-err_worker:
 	usb_put_hcd(hcd);
 
 	dprintk(D_MISC, "<vusb_hcd_probe %d\n", retval);
 
-	return retval;
+	return ret;
 }
 
 /* Platform remove */
@@ -2720,8 +2650,7 @@ vusb_platform_remove(struct platform_device *pdev)
 
 	vhcd = hcd_to_vhcd(hcd);
 
-	/* Stop the main thread and release its memory */
-	vusb_worker_stop(vhcd);
+	vusb_platform_cleanup(vhcd);
 
 	usb_put_hcd(hcd);
 
@@ -2739,7 +2668,7 @@ vusb_platform_freeze(struct device *dev)
 	struct platform_device *pdev = to_platform_device(dev);
 	struct usb_hcd *hcd;
 	struct vusb_vhcd *vhcd;
-	int rc = 0;
+	int ret = 0;
 	unsigned long flags;
 
 	iprintk("HCD freeze\n");
@@ -2753,15 +2682,15 @@ vusb_platform_freeze(struct device *dev)
 
 	if (vhcd->rh_state == VUSB_RH_RUNNING) {
 		wprintk("Root hub isn't suspended!\n");
-		rc = -EBUSY;
+		ret = -EBUSY;
 	} else
 		clear_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
-	if (rc == 0)
-		vusb_worker_stop(vhcd);
+	if (ret == 0)
+		vusb_platform_cleanup(vhcd);
 
-	return rc;
+	return ret;
 }
 
 /* Platform restore */
@@ -2772,7 +2701,6 @@ vusb_platform_restore(struct device *dev)
 	struct usb_hcd *hcd;
 	unsigned long flags;
 	struct vusb_vhcd *vhcd;
-	int rc = 0;
 
 	iprintk("HCD restore\n");
 
@@ -2781,13 +2709,10 @@ vusb_platform_restore(struct device *dev)
 
 	spin_lock_irqsave(&vhcd->lock, flags);
 	set_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
+	vusb_init_hcd(vhcd);
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
-	rc = vusb_worker_start(vhcd);
-	if (rc != 0)
-		usb_hcd_poll_rh_status(hcd);
-
-	return rc;
+	return 0;
 }
 #endif /* CONFIG_PM */
 
