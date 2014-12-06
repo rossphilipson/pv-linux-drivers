@@ -24,10 +24,7 @@
 
 /***
  *** TODO
- *** - Modify thread handling
  *** - Add branch prediction
- *** - Send cancel URB command if needed
- *** - Management support
  *** - Devices are not kept accross suspend/hibernate (vusb daemon issue)
  *** - Reorganize the code
  ***/
@@ -1894,6 +1891,7 @@ vusb_check_reset_devices(struct vusb_vhcd *vhcd)
 	unsigned long flags;
 	int i;
 
+	/* TODO RJP this needs some work - may not be ok - need to queue? */
 	spin_lock_irqsave(&vhcd->lock, flags);
 
 	/* Check if we need to reset a device */
@@ -1958,7 +1956,18 @@ vusb_restart_processing(struct work_struct *work)
 static irqreturn_t
 vusb_interrupt(int irq, void *dev_id)
 {
+	struct vusb_device *vdev = (struct vusb_device*)dev_id;
+	unsigned long flags;
+
+	if (!vusb_start_processing(vdev))
+		return IRQ_HANDLED;
+
 	/* TODO RJP */
+	spin_lock_irqsave(&vdev->lock, flags);
+	spin_unlock_irqrestore(&vdev->lock, flags);
+
+	vusb_stop_processing(vdev);
+
 	return IRQ_HANDLED;
 }
 
@@ -1979,9 +1988,6 @@ vusb_device_clear(struct vusb_device *vdev)
 static void
 vusb_usbif_free(struct vusb_device *vdev, int suspend)
 {
-	/* TODO RJP shut everything down and undo stuff from vusb_talk_to_usbback */
-	/* Not sure what all of this will be yet  - e.g. see all that blkback does */
-
 	/* Free resources associated with old device channel. */
 	if (vdev->ring_ref != GRANT_INVALID_REF) {
 		/* This frees the page too */
@@ -2144,30 +2150,32 @@ static int
 vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 {
 	u16 i;
-	int rc = 0;
+	int ret = 0;
 	unsigned long flags;
 	struct vusb_device *vdev;
 
 	/* Find a port/device we can use. */
 	spin_lock_irqsave(&vhcd->lock, flags);
 	for (i = 0; i < VUSB_PORTS; i++) {
-		if (vhcd->vdev_ports[i].connecting == 0)
+		if ((vhcd->vdev_ports[i].connecting)||(
+		    (vhcd->vdev_ports[i].closing)))
 			continue;
-		if (vhcd->vdev_ports[i].present == 0)
+		if (!vhcd->vdev_ports[i].present)
 			break;
 		if (vhcd->vdev_ports[i].device_id == id) {
 			wprintk("Device id 0x%04x already exists on port %d\n",
 			       id, vhcd->vdev_ports[i].port);
-			rc = -EEXIST;
+			ret = -EEXIST;
 			goto out;
 		}
 	}
 
 	if (i >= VUSB_PORTS) {
-		printk(KERN_WARNING "Attempt to add a device but no free ports on the root hub.\n");
-		rc = -ENOMEM;
+		wprintk("Attempt to add a device but no free ports on the root hub.\n");
+		ret = -ENOMEM;
 		goto out;
 	}
+
 	vdev = &vhcd->vdev_ports[i];
 	vdev->device_id = id;
 	vdev->connecting = 1;
@@ -2181,15 +2189,15 @@ vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 	/* Setup the rings, event channel and xenstore. Internal failures cleanup
 	 * the usbif bits. Wipe the new VUSB dev and bail out.
 	 */
-	rc = vusb_talk_to_usbback(vdev);
-	if (rc) {
+	ret = vusb_talk_to_usbback(vdev);
+	if (ret) {
 		printk(KERN_ERR "Failed to initialize the device - id: %d\n", id);
 		vusb_device_clear(vdev);
 	}
 
 out:
 	spin_unlock_irqrestore(&vhcd->lock, flags);
-	return rc;
+	return ret;
 }
 
 static int
@@ -2267,9 +2275,6 @@ vusb_destroy_device(struct vusb_device *vdev)
 	vusb_device_clear(vdev);
 
 	vusb_set_link_state(vdev);
-
-	/* TODO RJP have to cleanup outstanding URBs, shadow stuff, requets
-	 * e.g. like CompleteRequestsFromShadow */
 
 	if (vhcd->state != VUSB_INACTIVE)
 		vhcd->poll = 1;
