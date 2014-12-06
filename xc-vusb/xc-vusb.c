@@ -2191,11 +2191,14 @@ static void
 vusb_destroy_device(struct vusb_device *vdev)
 {
 	struct vusb_vhcd *vhcd = vdev->parent;
+	struct list_head tmp;
 	struct vusb_urbp *pos;
 	struct vusb_urbp *next;
 	unsigned long flags;
 
 	dprintk(D_PORT1, "Remove device from port %u\n", vdev->port);
+
+	INIT_LIST_HEAD(&tmp);
 
 	/* Disconnect gref free callback so it schedules no more work */
 	xc_gnttab_cancel_free_callback(&vdev->callback);
@@ -2209,16 +2212,19 @@ vusb_destroy_device(struct vusb_device *vdev)
 	/* Final device operations */
 	spin_lock_irqsave(&vdev->lock, flags);
 
-	/* Cancel all the pending URBs */
-	list_for_each_entry_safe(pos, next, &vdev->urbp_list, urbp_list) {
-		pos->urb->status = -ESHUTDOWN;
-		vusb_urbp_release(vdev, pos);
-	}
-
 	/* Give usbback a chance to consume the ring */
 	vusb_flush_requests(vdev);
 
+	/* Copy to temp list */
+        list_splice_init(&vdev->urbp_list, &tmp);
+
 	spin_unlock_irqrestore(&vdev->lock, flags);
+
+	/* Release all the pending URBs - this has to be done outside a lock */
+	list_for_each_entry_safe(pos, next, &tmp, urbp_list) {
+		pos->urb->status = -ESHUTDOWN;
+		vusb_urbp_release(vdev, pos);
+	}
 
 	spin_lock_irqsave(&vhcd->lock, flags);
 
