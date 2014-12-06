@@ -62,6 +62,10 @@
 #include <linux/old-core-hcd.h>
 #endif
 
+#if ( LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,32) )
+#define flush_work_sync(a) flush_scheduled_work()
+#endif
+
 #define VUSB_INTERFACE_VERSION 	3
 #define VUSB_MAX_PACKET_SIZE 	1024*256
 
@@ -207,36 +211,39 @@ struct vusb_shadow {
 
 /* Virtual USB device on of the RH ports */
 struct vusb_device {
-	u16			device_id;
-	u32			port_status;
-	u16			address;
-	u16			port;
-	enum usb_device_speed	speed;
-	unsigned		present:1;
-	unsigned		connecting:1;
-	unsigned		processing:1;
-	unsigned		reset:2;
+	u16				device_id;
+	u32				port_status;
+	u16				address;
+	u16				port;
+	enum usb_device_speed		speed;
+	unsigned			present:1;
+	unsigned			connecting:1;
+	unsigned			processing:1;
+	unsigned			reset:2;
 
 	/* The Xenbus device associated with this vusb device */
-	struct xenbus_device    *xendev;
+	struct xenbus_device    	*xendev;
 
 	/* Pointer back to the parent virtual HCD core device */
-	struct vusb_vhcd        *parent;
+	struct vusb_vhcd		*parent;
 
 	/* Xen rings and event channel */
-	int			ring_ref;
-	struct usbif_front_ring ring;
-	unsigned int 		evtchn;
-	unsigned int 		irq;
+	int				ring_ref;
+	struct usbif_front_ring 	ring;
+	unsigned int 			evtchn;
+	unsigned int 			irq;
+	struct gnttab_free_callback 	callback;
 
 	/* Shadow buffers */
-	struct vusb_shadow	*shadows;
-	u16			*shadow_free_list;
-	u16			shadow_free;
+	struct vusb_shadow		*shadows;
+	u16				*shadow_free_list;
+	u16				shadow_free;
 
 	/* This VUSB device's list of pending URBs and a lock for them*/
-	spinlock_t		lock;
-	struct list_head        urbp_list;
+	spinlock_t			lock;
+	struct list_head        	urbp_list;
+
+	struct work_struct 		work;
 };
 
 /* Virtual USB HCD/RH pieces */
@@ -276,6 +283,12 @@ struct vusb_vhcd {
 static struct platform_device *vusb_platform_device = NULL;
 static DEFINE_MUTEX(vusb_xen_pm_mutex);
 
+static bool
+vusb_start_processing(struct vusb_device *vdev);
+static void
+vusb_stop_processing(struct vusb_device *vdev);
+static void
+vusb_restart_processing(struct work_struct *work);
 static void
 vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp);
 static int
@@ -697,9 +710,7 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	vusb_process_requests(vdev, urbp);
 
 	/* Finished processing */
-	spin_lock_irqsave(&vhcd->lock, flags);
-	vdev->processing = 0;
-	spin_unlock_irqrestore(&vhcd->lock, flags);
+	vusb_stop_processing(vdev);
 
 	return 0;
 }
@@ -1668,6 +1679,7 @@ vusb_worker_start(struct vusb_vhcd *vhcd)
 		vhcd->vdev_ports[i].present = 0;
 		vhcd->vdev_ports[i].processing = 0;
 		spin_lock_init(&vhcd->vdev_ports[i].lock);
+		INIT_WORK(&vhcd->vdev_ports[i].work, vusb_restart_processing);
 	}
 
 	vhcd->rh_state = VUSB_INACTIVE;
@@ -1804,6 +1816,13 @@ vusb_put_ring(struct vusb_device *vdev, struct vusb_shadow *shadow)
 		xc_notify_remote_via_irq(vdev->irq);
 }
 
+static void
+vusb_restart_processing_callback(void *arg)
+{
+	struct vusb_device *vdev = (struct vusb_device*)arg;
+	schedule_work(&vdev->work);
+}
+
 static int
 vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 		unsigned long *mfns, u32 nr_mfns)
@@ -1814,11 +1833,9 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 	dprintk(D_RING2, "Allocate gref for %d mfns\n", (int)nr_mfns);
 
 	if (xc_gnttab_alloc_grant_references(nr_mfns, &gref_head) < 0) {
-		/* TOOD RJP xc_gnttab_request_free_callback(
-			&info->callback,
-			blkif_restart_queue_callback,
-			info,
-			BLKIF_MAX_SEGMENTS_PER_REQUEST);*/
+		xc_gnttab_request_free_callback(&vdev->callback,
+			vusb_restart_processing_callback,
+			vdev, nr_mfns);
 		return 1;
 	}
 
@@ -1845,6 +1862,36 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 
 /****************************************************************************/
 /* VUSB Devices                                                             */
+
+static bool
+vusb_start_processing(struct vusb_device *vdev)
+{
+	struct vusb_vhcd *vhcd = vdev->parent;
+	unsigned long flags;
+
+	spin_lock_irqsave(&vhcd->lock, flags);
+
+	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
+		spin_unlock_irqrestore(&vhcd->lock, flags);
+		return false;
+	}
+
+	vdev->processing = 1;
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+
+	return true;
+}
+
+static void
+vusb_stop_processing(struct vusb_device *vdev)
+{
+	struct vusb_vhcd *vhcd = vdev->parent;
+	unsigned long flags;
+
+	spin_lock_irqsave(&vhcd->lock, flags);
+	vdev->processing = 0;
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+}
 
 static void
 vusb_check_reset_devices(struct vusb_vhcd *vhcd)
@@ -1878,9 +1925,11 @@ vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp)
 
 	spin_lock_irqsave(&vdev->lock, flags);
 
-	/* Queue it at the back and drive the processing */
-	list_add_tail(&urbp->urbp_list, &vdev->urbp_list);
+	/* New URB, queue it at the back */
+	if (urbp)
+		list_add_tail(&urbp->urbp_list, &vdev->urbp_list);
 
+	/* Drive request processing */
 	list_for_each_entry_safe(pos, next, &vdev->urbp_list, urbp_list) {
 		/* TODO RJP fix to return values, schedule work if we cannot drain the queue */
 		vusb_send_urb(vdev, pos);
@@ -1893,6 +1942,22 @@ vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp)
 		vhcd->poll = 0;
 		usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
 	}
+}
+
+static void
+vusb_restart_processing(struct work_struct *work)
+{
+	struct vusb_device *vdev = container_of(work, struct vusb_device, work);
+
+	if (!vusb_start_processing(vdev))
+		return;
+
+	/* TODO RJP Start response processing again */
+
+	/* Start request processing again */
+	vusb_process_requests(vdev, NULL);
+
+	vusb_stop_processing(vdev);
 }
 
 static irqreturn_t
@@ -2167,6 +2232,11 @@ vusb_destroy_device(struct vusb_device *vdev)
 	struct vusb_vhcd *vhcd = vdev->parent;
 	unsigned long flags;
 
+	/* Disconnect gref free callback so it schedules no more work */
+	xc_gnttab_cancel_free_callback(&vdev->callback);
+
+	/* Shutdown all work. Must be done with no locks held. */
+	flush_work_sync(&vdev->work);
 again:
 	spin_lock_irqsave(&vhcd->lock, flags);
 
