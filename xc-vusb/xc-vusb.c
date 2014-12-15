@@ -240,7 +240,7 @@ struct vusb_device {
 	u16				shadow_free;
 
 	/* This VUSB device's list of pending URBs */
-	struct list_head        	urbp_list;
+	struct list_head        	pending_list;
 	struct list_head        	release_list;
 
 	struct work_struct 		work;
@@ -761,7 +761,7 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 	spin_lock_irqsave(&vdev->lock, flags);
 
 	/* Retrieve URBp */
-	list_for_each_entry(urbp, &vdev->urbp_list, urbp_list) {
+	list_for_each_entry(urbp, &vdev->pending_list, urbp_list) {
 		if (urbp->urb == urb)
 			break;
 	}
@@ -1038,7 +1038,7 @@ vusb_urbp_list_dump(const struct vusb_device *vdev, const char *fn)
 	const struct vusb_urbp *urbp;
 
 	dprintk(D_URB2, "===== Current URB List in %s =====\n", fn);
-	list_for_each_entry(urbp, &vdev->urbp_list, urbp_list) {
+	list_for_each_entry(urbp, &vdev->pending_list, urbp_list) {
 		dprintk(D_URB1, "URB handle 0x%x port %u device %u\n",
 			urbp->handle, urbp->port, vdev->device_id);
 	}
@@ -1051,7 +1051,7 @@ vusb_urb_by_handle(struct vusb_device *vdev, u16 handle)
 {
 	struct vusb_urbp *urbp;
 
-	list_for_each_entry(urbp, &vdev->urbp_list, urbp_list) {
+	list_for_each_entry(urbp, &vdev->pending_list, urbp_list) {
 		if (urbp->handle == handle)
 			return urbp;
 	}
@@ -1893,10 +1893,10 @@ vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp)
 
 	/* New URB, queue it at the back */
 	if (urbp)
-		list_add_tail(&urbp->urbp_list, &vdev->urbp_list);
+		list_add_tail(&urbp->urbp_list, &vdev->pending_list);
 
 	/* Drive request processing */
-	list_for_each_entry_safe(pos, next, &vdev->urbp_list, urbp_list) {
+	list_for_each_entry_safe(pos, next, &vdev->pending_list, urbp_list) {
 		/* TODO RJP fix to schedule work if we cannot drain the queue */
 		vusb_send_urb(vdev, pos);
 	}
@@ -2162,7 +2162,7 @@ vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 	vdev->connecting = 1;
 	vdev->vhcd = vhcd;
 	vdev->xendev = dev;
-	INIT_LIST_HEAD(&vdev->urbp_list);
+	INIT_LIST_HEAD(&vdev->pending_list);
 	INIT_LIST_HEAD(&vdev->release_list);
 
 	/* Strap our VUSB device onto the Xen device context */
@@ -2241,10 +2241,10 @@ vusb_destroy_device(struct vusb_device *vdev)
 	vusb_flush_requests(vdev);
 
 	/* Copy ready to release urbps to temp list */
-        list_splice_init(&vdev->urbp_list, &tmp[0]);
+        list_splice_init(&vdev->release_list, &tmp[0]);
 
 	/* Copy pending urbps to temp list */
-        list_splice_init(&vdev->urbp_list, &tmp[1]);
+        list_splice_init(&vdev->pending_list, &tmp[1]);
 
 	spin_unlock_irqrestore(&vdev->lock, flags);
 
