@@ -122,7 +122,8 @@
 # define VUSB_PORTS    USB_MAXCHILDREN
 #endif
 
-/* Status codes */
+/* TODO these will go away, use USBIF_RSP_USB_* codes.
+ *Status codes */
 #define VUSB_URB_STATUS_SUCCESS            0x00000000
 #define VUSB_URB_STATUS_FAILURE            0xFFFFFFFF
 
@@ -772,6 +773,12 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 		return -ENODEV;
 	}
 
+	/* TODO this may actually be an abort using the internal abort request
+	 * USBIF_T_ABORT_PIPE. At this level it may simply be setting another
+	 * state and processing. Down below it may require sometime like
+	 * ProcessAbortPipe or AbortEndpointWorker. Not really sure why there
+	 * are two of them, needs investigation.
+	 */
 	urbp->state = VUSB_URBP_CANCEL;
 	spin_unlock_irqrestore(&vdev->lock, flags);
 
@@ -998,6 +1005,161 @@ static const struct hc_driver vusb_hcd_driver = {
 };
 
 /****************************************************************************/
+/* Ring Processing                                                          */
+
+static struct vusb_shadow*
+vusb_get_shadow(struct vusb_device *vdev)
+{
+	if (!vdev->shadow_free) {
+		printk(KERN_ERR "Requesting shadow when shadow_free == 0!\n");
+		return NULL;
+	}
+
+	vdev->shadow_free--;
+
+	if (vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].in_use) {
+		printk(KERN_ERR "Requesting shadow at %d which is in use!\n",
+			vdev->shadow_free);
+		return NULL;
+	}
+
+	vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].in_use = 1;
+	vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].req.nr_segments = 0;
+	vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].req.nr_packets = 0;
+	vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].req.flags = 0;
+	vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].req.length = 0;
+
+	return &vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]];
+}
+
+static void
+vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
+{
+	usbif_indirect_request_t *ireq;
+	usbif_indirect_pages_t *ipage;
+	int i, j;
+
+	if (!shadow->in_use) {
+		printk(KERN_ERR "Returning shadow %p that is not in use to list!\n",
+			shadow);
+		return;
+	}
+
+	/* Free any resources in use */
+	if (shadow->iso_packet_descriptor) {
+		kfree(shadow->iso_packet_descriptor);
+		shadow->iso_packet_descriptor = NULL;
+	}
+
+	if (shadow->indirect_page_memory) {
+		ireq = (usbif_indirect_request_t*)shadow->indirect_page_memory;
+		ipage = (usbif_indirect_pages_t*)shadow->indirect_pages;
+
+		for (i = 0; i < shadow->req.nr_segments; i++) {
+			for (j = 0; j < ireq[j].nr_segments; j++) {
+				xc_gnttab_end_foreign_access(ireq[i].gref[j],
+					ipage[i].ro[j], ipage[i].pages[j]);
+			}
+		}
+		kfree(shadow->indirect_page_memory);
+		shadow->indirect_page_memory = NULL;
+		kfree(shadow->indirect_pages);
+		shadow->indirect_pages = NULL;
+	}
+
+	for (i = 0; i < shadow->req.nr_segments; i++) {
+		xc_gnttab_end_foreign_access(shadow->req.gref[i],
+			shadow->ro[i], shadow->pages[i]);
+	}
+
+	memset(&shadow->pages[0], 0,
+		(sizeof(unsigned long)*USBIF_MAX_SEGMENTS_PER_REQUEST));
+	memset(&shadow->ro[0], 0,
+		(sizeof(int)*USBIF_MAX_SEGMENTS_PER_REQUEST));
+	shadow->req.nr_segments = 0;
+	shadow->urbp = NULL;
+	shadow->in_use = 0;
+
+	if (vdev->shadow_free >= SHADOW_ENTRIES) {
+		printk(KERN_ERR "Shadow free value too big: %d!\n",
+			vdev->shadow_free);
+		return;
+	}
+
+	vdev->shadow_free_list[vdev->shadow_free] = (u16)shadow->req.id;
+	vdev->shadow_free++;
+}
+
+static void
+vusb_flush_requests(struct vusb_device *vdev)
+{
+	int notify;
+
+	RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&vdev->ring, notify);
+
+	if (notify)
+		xc_notify_remote_via_irq(vdev->irq);
+}
+
+static void
+vusb_put_ring(struct vusb_device *vdev, struct vusb_shadow *shadow)
+{
+	usbif_request_t *req;
+
+	/* If we have a shadow allocation, we know there is space on the ring */	
+	req = RING_GET_REQUEST(&vdev->ring, vdev->ring.req_prod_pvt);
+	memcpy(req, &shadow->req, sizeof(usbif_request_t));
+
+	vdev->ring.req_prod_pvt++;
+
+	vusb_flush_requests(vdev);
+}
+
+static void
+vusb_restart_processing_callback(void *arg)
+{
+	struct vusb_device *vdev = (struct vusb_device*)arg;
+	schedule_work(&vdev->work);
+}
+
+static int
+vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
+		unsigned long *mfns, u32 nr_mfns)
+{
+	u32 i, ref;
+	grant_ref_t gref_head;
+
+	dprintk(D_RING2, "Allocate gref for %d mfns\n", (int)nr_mfns);
+
+	if (xc_gnttab_alloc_grant_references(nr_mfns, &gref_head) < 0) {
+		xc_gnttab_request_free_callback(&vdev->callback,
+			vusb_restart_processing_callback,
+			vdev, nr_mfns);
+		return 1;
+	}
+
+	for (i = 0; i < nr_mfns; i++)
+	{
+		unsigned long mfn = mfns[i];
+
+		ref = xc_gnttab_claim_grant_reference(&gref_head);
+		BUG_ON(ref == -ENOSPC);
+
+		shadow->req.gref[shadow->req.nr_segments] = ref;
+
+		xc_gnttab_grant_foreign_access_ref(ref,
+				vdev->xendev->otherend_id, mfn,
+				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
+
+		shadow->req.nr_segments++;
+ 	}
+
+	xc_gnttab_free_grant_references(gref_head);
+
+	return 0;
+}
+
+/****************************************************************************/
 /* URB Processing                                                           */
 
 /* Convert URB transfer flags to VUSB flags */
@@ -1205,6 +1367,9 @@ vusb_urb_status_to_errno(u32 status)
 {
 	int32_t st = status;
 
+	/* TODO this will be changed to map USBIF_RSP_USB_* to errnos
+	 * sort of like the Windows version MapUsbifToUsbdStatus
+	 */
 	switch (status) {
 	case VUSB_URB_STATUS_SUCCESS:
 		return 0;
@@ -1226,6 +1391,9 @@ vusb_status_to_string(u32 status)
 {
 	int32_t st = status;
 
+	/* TODO this will be changed to use USBIF_RSP_USB_* if
+	 * it evens sticks around.
+	 */
 	switch (status) {
 	case VUSB_URB_STATUS_SUCCESS:
 		return "SUCCESS";
@@ -1619,161 +1787,6 @@ vusb_send_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 			vusb_state_to_string(urbp));
 		vusb_urbp_queue_release(vdev, urbp);
 	}
-}
-
-/****************************************************************************/
-/* Ring Processing                                                          */
-
-static struct vusb_shadow*
-vusb_get_shadow(struct vusb_device *vdev)
-{
-	if (!vdev->shadow_free) {
-		printk(KERN_ERR "Requesting shadow when shadow_free == 0!\n");
-		return NULL;
-	}
-
-	vdev->shadow_free--;
-
-	if (vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].in_use) {
-		printk(KERN_ERR "Requesting shadow at %d which is in use!\n",
-			vdev->shadow_free);
-		return NULL;
-	}
-
-	vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].in_use = 1;
-	vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].req.nr_segments = 0;
-	vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].req.nr_packets = 0;
-	vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].req.flags = 0;
-	vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]].req.length = 0;
-
-	return &vdev->shadows[vdev->shadow_free_list[vdev->shadow_free]];
-}
-
-static void
-vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
-{
-	usbif_indirect_request_t *ireq;
-	usbif_indirect_pages_t *ipage;
-	int i, j;
-
-	if (!shadow->in_use) {
-		printk(KERN_ERR "Returning shadow %p that is not in use to list!\n",
-			shadow);
-		return;
-	}
-
-	/* Free any resources in use */
-	if (shadow->iso_packet_descriptor) {
-		kfree(shadow->iso_packet_descriptor);
-		shadow->iso_packet_descriptor = NULL;
-	}
-
-	if (shadow->indirect_page_memory) {
-		ireq = (usbif_indirect_request_t*)shadow->indirect_page_memory;
-		ipage = (usbif_indirect_pages_t*)shadow->indirect_pages;
-
-		for (i = 0; i < shadow->req.nr_segments; i++) {
-			for (j = 0; j < ireq[j].nr_segments; j++) {
-				xc_gnttab_end_foreign_access(ireq[i].gref[j],
-					ipage[i].ro[j], ipage[i].pages[j]);
-			}
-		}
-		kfree(shadow->indirect_page_memory);
-		shadow->indirect_page_memory = NULL;
-		kfree(shadow->indirect_pages);
-		shadow->indirect_pages = NULL;
-	}
-
-	for (i = 0; i < shadow->req.nr_segments; i++) {
-		xc_gnttab_end_foreign_access(shadow->req.gref[i],
-			shadow->ro[i], shadow->pages[i]);
-	}
-
-	memset(&shadow->pages[0], 0,
-		(sizeof(unsigned long)*USBIF_MAX_SEGMENTS_PER_REQUEST));
-	memset(&shadow->ro[0], 0,
-		(sizeof(int)*USBIF_MAX_SEGMENTS_PER_REQUEST));
-	shadow->req.nr_segments = 0;
-	shadow->urbp = NULL;
-	shadow->in_use = 0;
-
-	if (vdev->shadow_free >= SHADOW_ENTRIES) {
-		printk(KERN_ERR "Shadow free value too big: %d!\n",
-			vdev->shadow_free);
-		return;
-	}
-
-	vdev->shadow_free_list[vdev->shadow_free] = (u16)shadow->req.id;
-	vdev->shadow_free++;
-}
-
-static void
-vusb_flush_requests(struct vusb_device *vdev)
-{
-	int notify;
-
-	RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&vdev->ring, notify);
-
-	if (notify)
-		xc_notify_remote_via_irq(vdev->irq);
-}
-
-static void
-vusb_put_ring(struct vusb_device *vdev, struct vusb_shadow *shadow)
-{
-	usbif_request_t *req;
-
-	/* If we have a shadow allocation, we know there is space on the ring */	
-	req = RING_GET_REQUEST(&vdev->ring, vdev->ring.req_prod_pvt);
-	memcpy(req, &shadow->req, sizeof(usbif_request_t));
-
-	vdev->ring.req_prod_pvt++;
-
-	vusb_flush_requests(vdev);
-}
-
-static void
-vusb_restart_processing_callback(void *arg)
-{
-	struct vusb_device *vdev = (struct vusb_device*)arg;
-	schedule_work(&vdev->work);
-}
-
-static int
-vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
-		unsigned long *mfns, u32 nr_mfns)
-{
-	u32 i, ref;
-	grant_ref_t gref_head;
-
-	dprintk(D_RING2, "Allocate gref for %d mfns\n", (int)nr_mfns);
-
-	if (xc_gnttab_alloc_grant_references(nr_mfns, &gref_head) < 0) {
-		xc_gnttab_request_free_callback(&vdev->callback,
-			vusb_restart_processing_callback,
-			vdev, nr_mfns);
-		return 1;
-	}
-
-	for (i = 0; i < nr_mfns; i++)
-	{
-		unsigned long mfn = mfns[i];
-
-		ref = xc_gnttab_claim_grant_reference(&gref_head);
-		BUG_ON(ref == -ENOSPC);
-
-		shadow->req.gref[shadow->req.nr_segments] = ref;
-
-		xc_gnttab_grant_foreign_access_ref(ref,
-				vdev->xendev->otherend_id, mfn,
-				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
-
-		shadow->req.nr_segments++;
- 	}
-
-	xc_gnttab_free_grant_references(gref_head);
-
-	return 0;
 }
 
 /****************************************************************************/
