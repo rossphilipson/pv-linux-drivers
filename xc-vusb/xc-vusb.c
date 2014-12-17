@@ -188,16 +188,24 @@ struct vusb_urbp {
 	int                     port;
 };
 
+/* Internal request structure */
+struct vusb_internal {
+	u8 type;
+	u8 endpoint;
+	void *buffer;
+	usbif_request_len_t length;
+	u16 offset;
+	int is_reset;
+};
+
 struct usbif_indirect_pages {
-	unsigned long	pages[USBIF_MAX_SEGMENTS_PER_IREQUEST];
-	int		ro[USBIF_MAX_SEGMENTS_PER_IREQUEST];
+	unsigned long		frames[USBIF_MAX_SEGMENTS_PER_IREQUEST];
 };
 typedef struct usbif_indirect_pages usbif_indirect_pages_t;
 
 struct vusb_shadow {
 	usbif_request_t		req;
-	unsigned long		pages[USBIF_MAX_SEGMENTS_PER_REQUEST];
-	int			ro[USBIF_MAX_SEGMENTS_PER_REQUEST];
+	unsigned long		frames[USBIF_MAX_SEGMENTS_PER_REQUEST];
     	int			in_use;
 	struct vusb_urbp	*urbp;
 	int			is_reset;
@@ -516,6 +524,7 @@ vusb_get_urb_handle(struct vusb_vhcd *vhcd)
 {
 	vhcd->urb_handle += 1;
 
+	/* TODO this will probably go away and we will use the req.id */
 	if (vhcd->urb_handle >= 0xfff0)
 		/* reset to 0 we never have lots URB in the list */
 		vhcd->urb_handle = 0;
@@ -773,11 +782,19 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 		return -ENODEV;
 	}
 
-	/* TODO this may actually be an abort using the internal abort request
+	/* TODO I think I am wrong about using the abort. We may need another
+	 * inernal command to cancel at the URB level. The backend would call
+	 * something like usb_kill_urb or usb_unlink_urb. Leaving the earlier
+	 * note in case...
+	 *
+	 * TODO this may actually be an abort using the internal abort request
 	 * USBIF_T_ABORT_PIPE. At this level it may simply be setting another
 	 * state and processing. Down below it may require sometime like
 	 * ProcessAbortPipe or AbortEndpointWorker. Not really sure why there
 	 * are two of them, needs investigation.
+	 *
+	 * Oh and note, this is exactly what ctxusb used to do with CTXUSB_URBP_CANCEL
+	 * which is an internal request. So abort is probably the right thing here.
 	 */
 	urbp->state = VUSB_URBP_CANCEL;
 	spin_unlock_irqrestore(&vdev->lock, flags);
@@ -1036,7 +1053,6 @@ static void
 vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 {
 	usbif_indirect_request_t *ireq;
-	usbif_indirect_pages_t *ipage;
 	int i, j;
 
 	if (!shadow->in_use) {
@@ -1053,12 +1069,10 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 
 	if (shadow->indirect_page_memory) {
 		ireq = (usbif_indirect_request_t*)shadow->indirect_page_memory;
-		ipage = (usbif_indirect_pages_t*)shadow->indirect_pages;
 
 		for (i = 0; i < shadow->req.nr_segments; i++) {
 			for (j = 0; j < ireq[j].nr_segments; j++) {
-				xc_gnttab_end_foreign_access(ireq[i].gref[j],
-					ipage[i].ro[j], ipage[i].pages[j]);
+				xc_gnttab_end_foreign_access(ireq[i].gref[j], 0, 0UL);
 			}
 		}
 		kfree(shadow->indirect_page_memory);
@@ -1068,14 +1082,11 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 	}
 
 	for (i = 0; i < shadow->req.nr_segments; i++) {
-		xc_gnttab_end_foreign_access(shadow->req.gref[i],
-			shadow->ro[i], shadow->pages[i]);
+		xc_gnttab_end_foreign_access(shadow->req.gref[i], 0, 0UL);
 	}
 
-	memset(&shadow->pages[0], 0,
+	memset(&shadow->frames[0], 0,
 		(sizeof(unsigned long)*USBIF_MAX_SEGMENTS_PER_REQUEST));
-	memset(&shadow->ro[0], 0,
-		(sizeof(int)*USBIF_MAX_SEGMENTS_PER_REQUEST));
 	shadow->req.nr_segments = 0;
 	shadow->urbp = NULL;
 	shadow->in_use = 0;
@@ -1124,22 +1135,31 @@ vusb_restart_processing_callback(void *arg)
 
 static int
 vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
-		unsigned long *mfns, u32 nr_mfns)
+		unsigned long *mfns, u32 nr_mfns, bool restart)
 {
 	u32 i, ref;
 	grant_ref_t gref_head;
+	int ret;
 
 	dprintk(D_RING2, "Allocate gref for %d mfns\n", (int)nr_mfns);
 
-	if (xc_gnttab_alloc_grant_references(nr_mfns, &gref_head) < 0) {
+	/* NOTE: we are following the blkback model where we are not
+	 * freeing the pages on gnttab_end_foreign_access so we don't
+	 * have to track them. That memory belongs to the USB core
+	 * in most cases or is the internal request page.
+	 */
+
+	ret = xc_gnttab_alloc_grant_references(nr_mfns, &gref_head);
+	if (ret < 0) {
+		if (!restart)
+			return ret;
 		xc_gnttab_request_free_callback(&vdev->callback,
 			vusb_restart_processing_callback,
 			vdev, nr_mfns);
-		return 1;
+		return -EBUSY;
 	}
 
-	for (i = 0; i < nr_mfns; i++)
-	{
+	for (i = 0; i < nr_mfns; i++) {
 		unsigned long mfn = mfns[i];
 
 		ref = xc_gnttab_claim_grant_reference(&gref_head);
@@ -1151,12 +1171,64 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 				vdev->xendev->otherend_id, mfn,
 				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
 
+		shadow->frames[i] = mfn_to_pfn(mfn);
 		shadow->req.nr_segments++;
  	}
 
 	xc_gnttab_free_grant_references(gref_head);
 
 	return 0;
+}
+
+static int
+vusb_put_internal_request(struct vusb_device *vdev, struct vusb_internal *vint)
+{
+	struct vusb_shadow *shadow;
+	unsigned long mfn;
+	int ret = 0;
+
+	/* Internal request can use the last entry */
+	if (vdev->shadow_free == 0)
+		return -ENOMEM;
+
+	/* All internal requests fit on a page */
+	mfn = pfn_to_mfn(virt_to_phys(vint->buffer) << PAGE_SHIFT);
+
+	shadow = vusb_get_shadow(vdev);
+	BUG_ON(!shadow);
+
+	if (vint->is_reset) {
+		shadow->req.endpoint = 0;
+		shadow->req.type = 0;
+		shadow->req.length = 0;
+		shadow->req.offset = 0;
+		shadow->req.flags = USBIF_F_RESET;
+		shadow->is_reset = 1;
+	}
+	else {
+		shadow->req.endpoint = vint->endpoint;
+		shadow->req.type = vint->type;
+		shadow->req.length = vint->length;
+		BUG_ON(vint->offset >= 0x00010000);
+		shadow->req.offset = vint->offset;
+		shadow->req.flags = USBIF_F_SHORTOK;
+		shadow->is_reset = 0;
+	}
+
+	shadow->req.nr_segments = 0;
+	shadow->req.setup = 0L;
+
+	/* Get some of them grefs */
+	ret = vusb_allocate_grefs(vdev, shadow, &mfn, 1, false);
+	if (ret) {
+		/* Can't handle failures */
+		vusb_put_shadow(vdev, shadow);
+		return ret;
+	}
+	
+	vusb_put_ring(vdev, shadow);
+
+	return ret;
 }
 
 /****************************************************************************/
@@ -1727,6 +1799,8 @@ vusb_send_cancel_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	void *packet;
 
 	/* TODO RJP this may be a special something that needs internal processing */
+	/* TODO and yes, this is an abort in vusb. This will get replaced with internal
+	 * requests. */
 	vusb_initialize_packet(vdev, &packet,
 			0 /* STUB cancel internal command */,
 			0 /* STUB cancel length */,
@@ -1957,6 +2031,7 @@ vusb_interrupt(int irq, void *dev_id)
 		return IRQ_HANDLED;
 
 	/* TODO RJP */
+	/* TODO process the results from internal requests in here */
 	spin_lock_irqsave(&vdev->lock, flags);
 	spin_unlock_irqrestore(&vdev->lock, flags);
 
@@ -2199,9 +2274,12 @@ static int
 vusb_start_device(struct vusb_device *vdev)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
-	enum usb_device_speed speed;
+	void *internal_page;
 	unsigned long flags;
 	int rc = 0;
+
+	/* Page to grant for requesting speed */
+	internal_page = (void *)__get_free_page(GFP_NOIO | __GFP_HIGH);
 
 	spin_lock_irqsave(&vhcd->lock, flags);
 
@@ -2210,8 +2288,8 @@ vusb_start_device(struct vusb_device *vdev)
 	/* TODO RJP get link speed - need to send a packet to the backend to do this */
 	vdev->present = 1;
 	vdev->connecting = 0;
-	vdev->speed = speed;
-	vdev->port_status |= usb_speed_to_port_stat(speed)
+	/* TODO this will happen in the irq vdev->speed = speed;*/
+	vdev->port_status |= usb_speed_to_port_stat(vdev->speed)
 					 | USB_PORT_STAT_CONNECTION
 					 | USB_PORT_STAT_C_CONNECTION << 16;
 
@@ -2220,6 +2298,7 @@ vusb_start_device(struct vusb_device *vdev)
 	vusb_set_link_state(vdev);
 /*out:*/
 	spin_unlock_irqrestore(&vhcd->lock, flags);
+	free_page((unsigned long)internal_page);
 	usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
 	return rc;
 }
@@ -2463,6 +2542,7 @@ vusb_send_reset_device_cmd(struct vusb_device *vdev)
 	vusb_create_packet(iovec, 1);
 	void *packet;
 
+	/* TODO this is an internal request too, this will get replaced */
 	if (!vdev->present) {
 		wprintk("Ignore reset for not present device port %u\n", vdev->port);
 		vdev->reset = 0;
@@ -2615,6 +2695,7 @@ vusb_usbfront_resume(struct xenbus_device *dev)
 	mutex_lock(&vusb_xen_pm_mutex);
 	printk(KERN_INFO "xen_usbif: pm restore event received, unregister net device\n");
 	/* TODO RJP not sure what to do here yet
+	 * maybe something like blkif_recover - that is why I kept the frame[] arrays around
         info->suspending = 0;
 	err = xennet_init_rings(info);
 	if (!err)
