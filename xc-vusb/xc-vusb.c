@@ -190,12 +190,12 @@ struct vusb_urbp {
 
 /* Internal request structure */
 struct vusb_internal {
-	u8 type;
-	u8 endpoint;
-	void *buffer;
-	usbif_request_len_t length;
-	u16 offset;
-	int is_reset;
+	u8 			type;
+	u8 			endpoint;
+	void 			*page;
+	usbif_request_len_t 	length;
+	u16 			offset;
+	unsigned		is_reset:1;
 };
 
 struct usbif_indirect_pages {
@@ -206,12 +206,12 @@ typedef struct usbif_indirect_pages usbif_indirect_pages_t;
 struct vusb_shadow {
 	usbif_request_t		req;
 	unsigned long		frames[USBIF_MAX_SEGMENTS_PER_REQUEST];
-    	int			in_use;
 	struct vusb_urbp	*urbp;
-	int			is_reset;
 	void			*iso_packet_descriptor;
 	void			*indirect_page_memory;
 	void			*indirect_pages;
+    	unsigned		in_use:1;
+    	unsigned		is_reset:1;
 };
 
 /* Virtual USB device on of the RH ports */
@@ -1192,7 +1192,7 @@ vusb_put_internal_request(struct vusb_device *vdev, struct vusb_internal *vint)
 		return -ENOMEM;
 
 	/* All internal requests fit on a page */
-	mfn = pfn_to_mfn(virt_to_phys(vint->buffer) << PAGE_SHIFT);
+	mfn = pfn_to_mfn(virt_to_phys(vint->page) << PAGE_SHIFT);
 
 	shadow = vusb_get_shadow(vdev);
 	BUG_ON(!shadow);
