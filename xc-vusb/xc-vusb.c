@@ -1921,8 +1921,10 @@ again:
 static void
 vusb_check_reset_device(struct vusb_device *vdev)
 {
+	struct vusb_internal vint_req;
 	unsigned long flags;
 	bool reset = false;
+	int ret;
 
 	/* Lock it and see if this port needs resetting. */
 	spin_lock_irqsave(&vdev->vhcd->lock, flags);
@@ -1935,7 +1937,21 @@ vusb_check_reset_device(struct vusb_device *vdev)
 
 	spin_unlock_irqrestore(&vdev->vhcd->lock, flags);
 
-	/* TODO send internal reset request */
+	if (!reset)
+		return;
+
+	/* Send internal reset request */
+	memset(&vint_req, 0, sizeof(struct vusb_internal));
+	vint_req.is_reset = 1;
+
+	spin_lock_irqsave(&vdev->lock, flags);
+	ret = vusb_put_internal_request(vdev, &vint_req);
+	spin_unlock_irqrestore(&vdev->lock, flags);
+
+	if (ret) {
+		eprintk("Failed to send reset for device %p - ret: %d\n", vdev, ret);
+		return;
+	}
 
 	spin_lock_irqsave(&vdev->vhcd->lock, flags);
 	/* Signal reset completion */
