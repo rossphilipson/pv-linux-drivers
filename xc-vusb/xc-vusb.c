@@ -196,6 +196,7 @@ struct vusb_internal {
 	usbif_request_len_t 	length;
 	u16 			offset;
 	unsigned		is_reset:1;
+	unsigned		is_cycle:1;
 };
 
 struct usbif_indirect_pages {
@@ -211,7 +212,6 @@ struct vusb_shadow {
 	void			*indirect_page_memory;
 	void			*indirect_pages;
     	unsigned		in_use:1;
-    	unsigned		is_reset:1;
 };
 
 /* Virtual USB device on of the RH ports */
@@ -279,12 +279,6 @@ struct vusb_vhcd {
 	struct vusb_device		vdev_ports[VUSB_PORTS];
 
 	u16				urb_handle;
-
-	/*
-	 * Update hub can't be done in critical section.
-	 * Is the driver need to update the hub?
-	 */
-	unsigned			poll:1;
 };
 
 static struct platform_device *vusb_platform_device = NULL;
@@ -303,8 +297,6 @@ vusb_send_packet(struct vusb_device *vdev, const struct iovec *iovec, size_t nio
 static void
 vusb_initialize_packet(struct vusb_device *vdev, void *packet,
 		u8 command, u32 hlen, u32 dlen);
-static void
-vusb_send_reset_device_cmd(struct vusb_device *vdev);
 
 /****************************************************************************/
 /* Miscellaneous Routines                                                   */
@@ -449,11 +441,12 @@ vusb_port_reset(struct vusb_vhcd *vhcd, struct vusb_device *vdev)
 
 	vdev->reset = 1;
 
-	/* TODO RJP vusb_worker_notify(vhcd);*/
+	/* Schedule it, can do it here in the VHCD lock */
+	schedule_work(&vdev->work);
 }
 
 static void
-set_port_feature(struct vusb_vhcd *vhcd, struct vusb_device *vdev, u16 val)
+vusb_set_port_feature(struct vusb_vhcd *vhcd, struct vusb_device *vdev, u16 val)
 {
 	if (!vdev)
 		return;
@@ -486,7 +479,7 @@ set_port_feature(struct vusb_vhcd *vhcd, struct vusb_device *vdev, u16 val)
 }
 
 static void
-clear_port_feature(struct vusb_device *vdev, u16 val)
+vusb_clear_port_feature(struct vusb_device *vdev, u16 val)
 {
 	switch (val) {
 	case USB_PORT_FEAT_INDICATOR:
@@ -916,7 +909,7 @@ vusb_hcd_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 		dprintk(D_CTRL, "ClearPortFeature port %d val: 0x%04x\n",
 				wIndex, wValue);
 		vusb_check_port("ClearPortFeature", wIndex);
-	    	clear_port_feature(vusb_device_by_port(vhcd, wIndex), wValue);
+	    	vusb_clear_port_feature(vusb_device_by_port(vhcd, wIndex), wValue);
 		break;
 	case GetHubDescriptor:
 		vusb_hub_descriptor((struct usb_hub_descriptor *)buf);
@@ -939,7 +932,7 @@ vusb_hcd_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 	case SetPortFeature:
 		vusb_check_port("SetPortStatus", wIndex);
 		dprintk(D_CTRL, "SetPortFeature port %d val: 0x%04x\n", wIndex, wValue);
-		set_port_feature(vhcd, vusb_device_by_port(vhcd, wIndex), wValue);
+		vusb_set_port_feature(vhcd, vusb_device_by_port(vhcd, wIndex), wValue);
 		break;
 
 	default:
@@ -954,7 +947,7 @@ vusb_hcd_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 
 	if (wIndex >= 1 && wIndex <= VUSB_PORTS) {
 		if ((vusb_device_by_port(vhcd, wIndex)->port_status & PORT_C_MASK) != 0)
-			 usb_hcd_poll_rh_status (hcd);
+			 usb_hcd_poll_rh_status(hcd);
 	}
 
 	dprintk(D_MISC, "<vusb_hub_control %d\n", retval);
@@ -1200,13 +1193,12 @@ vusb_put_internal_request(struct vusb_device *vdev, struct vusb_internal *vint)
 	shadow = vusb_get_shadow(vdev);
 	BUG_ON(!shadow);
 
-	if (vint->is_reset) {
+	if (vint->is_reset || vint->is_cycle) {
 		shadow->req.endpoint = 0;
-		shadow->req.type = 0;
+		shadow->req.type = (vint->is_cycle ? 0 : USBIF_T_RESET);
 		shadow->req.length = 0;
 		shadow->req.offset = 0;
-		shadow->req.flags = USBIF_F_RESET;
-		shadow->is_reset = 1;
+		shadow->req.flags = (vint->is_cycle ? USBIF_F_CYCLE_PORT : USBIF_F_RESET);
 	}
 	else {
 		shadow->req.endpoint = vint->endpoint;
@@ -1215,7 +1207,6 @@ vusb_put_internal_request(struct vusb_device *vdev, struct vusb_internal *vint)
 		BUG_ON(vint->offset >= 0x00010000);
 		shadow->req.offset = vint->offset;
 		shadow->req.flags = USBIF_F_SHORTOK;
-		shadow->is_reset = 0;
 	}
 
 	shadow->req.nr_segments = 0;
@@ -1928,23 +1919,33 @@ again:
 }
 
 static void
-vusb_check_reset_devices(struct vusb_vhcd *vhcd)
+vusb_check_reset_device(struct vusb_device *vdev)
 {
 	unsigned long flags;
-	int i;
+	bool reset = false;
 
-	/* TODO RJP this needs some work - may not be ok - need to queue? */
-	spin_lock_irqsave(&vhcd->lock, flags);
+	/* Lock it and see if this port needs resetting. */
+	spin_lock_irqsave(&vdev->vhcd->lock, flags);
 
-	/* Check if we need to reset a device */
-	for (i = 0; i < VUSB_PORTS; i++) {
-		if (vhcd->vdev_ports[i].reset == 1) {
-			vhcd->vdev_ports[i].reset = 2;
-			vusb_send_reset_device_cmd(&vhcd->vdev_ports[i]);
-		}
+	/* TODO why 2? */
+	if (vdev->reset == 1) {
+		vdev->reset = 2;
+		reset = true;
 	}
 
-	spin_unlock_irqrestore(&vhcd->lock, flags);
+	spin_unlock_irqrestore(&vdev->vhcd->lock, flags);
+
+	/* TODO send internal reset request */
+
+	spin_lock_irqsave(&vdev->vhcd->lock, flags);
+	/* Signal reset completion */
+	vdev->port_status |= (USB_PORT_STAT_C_RESET << 16);
+
+	vusb_set_link_state(vdev);
+	spin_unlock_irqrestore(&vdev->vhcd->lock, flags);
+
+	/* Update RH outside of critical section */
+	usb_hcd_poll_rh_status(vhcd_to_hcd(vdev->vhcd));
 }
 
 /* Notify USB stack that the URB is finished and release it. This
@@ -1977,7 +1978,7 @@ vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	unsigned long flags;
 
 	/* TODO RJP check elsewhere like in work/bh */
-	vusb_check_reset_devices(vhcd);
+	vusb_check_reset_device(vdev);
 
 	spin_lock_irqsave(&vdev->lock, flags);
 
@@ -1999,12 +2000,6 @@ vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	/* Clean them up outside the lock */
 	list_for_each_entry_safe(pos, next, &tmp, urbp_list) {
 		vusb_urbp_release(vhcd, pos);
-	}
-
-	/* TODO RJP check elsewhere like in work/bh */
-	if (vhcd->poll) { /* Update Hub status */
-		vhcd->poll = 0;
-		usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
 	}
 }
 
@@ -2348,7 +2343,7 @@ vusb_start_device(struct vusb_device *vdev)
 
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
-	/* This will find this port in the connected state */
+	/* Update RH, this will find this port in the connected state */
 	usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
 
 	free_page((unsigned long)vint_req.page);
@@ -2364,6 +2359,7 @@ vusb_destroy_device(struct vusb_device *vdev)
 	struct vusb_urbp *pos;
 	struct vusb_urbp *next;
 	unsigned long flags;
+	bool update_rh = false;
 
 	dprintk(D_PORT1, "Remove device from port %u\n", vdev->port);
 
@@ -2414,15 +2410,13 @@ vusb_destroy_device(struct vusb_device *vdev)
 	vusb_set_link_state(vdev);
 
 	if (vhcd->state != VUSB_INACTIVE)
-		vhcd->poll = 1;
+		update_rh = true;
 
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
-	/* Update hub status, device gone, port empty */
-	if (vhcd->poll) {
-		vhcd->poll = 0;
+	/* Update root hub status, device gone, port empty */
+	if (update_rh) 
 		usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
-	}
 }
 
 /**
@@ -2583,42 +2577,6 @@ vusb_process_packet(struct vusb_vhcd *vhcd, const void *packet)
 	}
 
 	return 0;
-}
-
-/*
- * Send a reset command
- * TODO: Add return value and check return
- */
-static void
-vusb_send_reset_device_cmd(struct vusb_device *vdev)
-{
-	vusb_create_packet(iovec, 1);
-	void *packet;
-
-	/* TODO things in here need the vhcd lock */
-	/* TODO this is an internal request too, this will get replaced */
-	if (!vdev->present) {
-		wprintk("Ignore reset for not present device port %u\n", vdev->port);
-		vdev->reset = 0;
-		vusb_set_link_state(vdev);
-		return;
-	}
-
-	dprintk(D_URB2, "Send reset command, port = %u\n", vdev->port);
-
-	vusb_initialize_packet(vdev, &packet, 
-			0 /* STUB reset internal command */,
-			0 /* STUB reset length */,
-			0);
-
-	vusb_set_packet_header(iovec, &packet, 0 /* STUB reset length */);
-	vusb_send_packet(vdev, iovec, 1);
-
-	/* Signal reset completion */
-	vdev->port_status |= (USB_PORT_STAT_C_RESET << 16);
-
-	vusb_set_link_state(vdev);
-	vdev->vhcd->poll = 1;
 }
 
 /****************************************************************************/
