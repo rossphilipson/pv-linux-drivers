@@ -220,7 +220,6 @@ struct vusb_device {
 	u32				port_status;
 	u16				address;
 	u16				port;
-	enum usb_device_speed		speed;
 	unsigned			present:1;
 	unsigned			connecting:1;
 	unsigned			processing:1;
@@ -255,6 +254,8 @@ struct vusb_device {
 	struct work_struct 		work;
 
 	wait_queue_head_t		wait_queue;
+
+	enum usb_device_speed		speed;
 };
 
 /* Virtual USB HCD/RH pieces */
@@ -1914,7 +1915,7 @@ vusb_wait_stop_processing(struct vusb_device *vdev)
 again:
 	spin_lock_irqsave(&vhcd->lock, flags);
 
-	vdev->closing = 0; /* Goning away now... */
+	vdev->closing = 0; /* Going away now... */
 
 	if (vdev->processing) {
 		spin_unlock_irqrestore(&vhcd->lock, flags);
@@ -2033,7 +2034,7 @@ vusb_interrupt(int irq, void *dev_id)
 		return IRQ_HANDLED;
 
 	/* TODO RJP */
-	/* TODO process the results from internal requests in here */
+	/* TODO process the results from internal requests in here, like setting speed */
 	spin_lock_irqsave(&vdev->lock, flags);
 	spin_unlock_irqrestore(&vdev->lock, flags);
 
@@ -2291,44 +2292,66 @@ vusb_start_device(struct vusb_device *vdev)
 	if (!vint_req.page)
 		return -ENOMEM;
 	
-	/* TODO need a reset here? The WFE gets that info from the registry */
+	/* TODO need a reset in here? The WFE gets that info from the registry */
 
+	/* Take the VHCD lock to change the state flags */
 	spin_lock_irqsave(&vhcd->lock, flags);
-
-
 	vdev->present = 1;
 	vdev->connecting = 0;
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+
+	/* The rest are vdev operations with the device lock */
+	spin_lock_irqsave(&vdev->lock, flags);
 	vdev->speed = (unsigned int)-1;
 
 	ret = vusb_put_internal_request(vdev, &vint_req);
 	if (ret) {
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		free_page((unsigned long)vint_req.page);
-		eprintk("Failed to get device speed - ret: %d\n", ret);
+		eprintk("Failed to get device %p speed - ret: %d\n", vdev, ret);
 		return ret;
 	}
-	spin_unlock_irqrestore(&vhcd->lock, flags);
+	spin_unlock_irqrestore(&vdev->lock, flags);
 
 	/* Wait for a response with no lock */
 	wait_event_interruptible(vdev->wait_queue, vdev->speed != (unsigned int)-1);
 
+	/* vdev->speed should be set, sanity check the speed */
+	switch (vdev->speed) {
+	case USB_SPEED_LOW:
+		iprintk("Speed set to USB_SPEED_LOW for device %p", vdev);
+		break;
+	case USB_SPEED_FULL:
+		iprintk("Speed set to USB_SPEED_FULL for device %p", vdev);
+		break;
+	case USB_SPEED_HIGH:
+		iprintk("Speed set to USB_SPEED_HIGH for device %p", vdev);
+		break;
+	default:
+		wprintk("Warning, setting default USB_SPEED_HIGH"
+			" for device %p - original value: %d",
+			vdev, vdev->speed);
+		vdev->speed = USB_SPEED_HIGH;
+	}
+
+	/* Root hub port state is owned by the VHCD so use its lock */
 	spin_lock_irqsave(&vhcd->lock, flags);
 
-	/* TODO this will happen in the irq vdev->speed = speed, sanity check the speed */
 	vdev->port_status |= vusb_speed_to_port_stat(vdev->speed)
 					 | USB_PORT_STAT_CONNECTION
 					 | USB_PORT_STAT_C_CONNECTION << 16;
 
-	/* final bits from ctxusb_add_device to make device known*/
 	vusb_set_link_state(vdev);
+
 	dprintk(D_PORT1, "new status: 0x%08x speed: 0x%04x\n",
 			vdev->port_status, vdev->speed);
 
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
-	free_page((unsigned long)vint_req.page);
+	/* This will find this port in the connected state */
 	usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
 
+	free_page((unsigned long)vint_req.page);
 
 	return 0;
 }
@@ -2572,6 +2595,7 @@ vusb_send_reset_device_cmd(struct vusb_device *vdev)
 	vusb_create_packet(iovec, 1);
 	void *packet;
 
+	/* TODO things in here need the vhcd lock */
 	/* TODO this is an internal request too, this will get replaced */
 	if (!vdev->present) {
 		wprintk("Ignore reset for not present device port %u\n", vdev->port);
