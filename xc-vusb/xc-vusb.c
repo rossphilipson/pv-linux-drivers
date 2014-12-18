@@ -292,8 +292,6 @@ static void
 vusb_restart_processing(struct work_struct *work);
 static void
 vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp);
-static int
-vusb_send_packet(struct vusb_device *vdev, const struct iovec *iovec, size_t niov);
 static void
 vusb_initialize_packet(struct vusb_device *vdev, void *packet,
 		u8 command, u32 hlen, u32 dlen);
@@ -1586,14 +1584,14 @@ vusb_send_urb_packet(struct vusb_device *vdev, struct vusb_urbp *urbp,
 		void *packet, u32 hlen, bool has_data)
 {
 	vusb_create_packet(iovec, 2);
-	int r;
+	int r = 0;
 
 	vusb_set_packet_header(iovec, packet, hlen);
 	if (has_data)
 		vusb_set_packet_data(iovec, urbp->urb->transfer_buffer,
 				urbp->urb->transfer_buffer_length);
 
-	r = vusb_send_packet(vdev, iovec, (has_data) ? 2 : 1);
+	/*r = vusb_send_packet(vdev, iovec, (has_data) ? 2 : 1);*/
 
 	if (r < 0) {
 		/* An error occured drop the URB and notify the USB stack */
@@ -1743,7 +1741,7 @@ vusb_send_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	/* TODO: use typeof? */
 	u32 length[urb->number_of_packets]; /* avoid kmalloc */
 	int i = 0;
-	int r;
+	int r = 0;
 
 	dprintk(D_URB2, "Send Isochronous URB Device: %u Endpoint: %u in: %u\n",
 		usb_pipedevice(urb->pipe),
@@ -1775,7 +1773,7 @@ vusb_send_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 		vusb_iov_set(iovec, 2, urb->transfer_buffer,
 				urb->transfer_buffer_length);
 
-	r = vusb_send_packet(vdev, iovec, (usb_urb_dir_out(urb)) ? 3 : 2);
+	/*r = vusb_send_packet(vdev, iovec, (usb_urb_dir_out(urb)) ? 3 : 2);*/
 
 	if (r < 0) {
 		/* An error occured drop the URB and notify the USB stack */
@@ -1806,7 +1804,7 @@ vusb_send_cancel_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 		vdev->device_id, vdev->port, urbp->handle);
 
 	vusb_set_packet_header(iovec, &packet, 0 /* STUB cancel length */);
-	vusb_send_packet(vdev, iovec, 1);
+	/*vusb_send_packet(vdev, iovec, 1);*/
 }
 
 /* Send an URB */
@@ -2435,166 +2433,6 @@ vusb_destroy_device(struct vusb_device *vdev)
 		usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
 }
 
-/**
- * Inititialize a packet header to send
- * @packet: packet to initialize (already allocated)
- * @devid: device id used to discuss with the host
- * @command: what do we want?
- * @hlen: size of header
- * @dlen: size of data
- * TODO RJP nuke it...
- */
-static void
-vusb_initialize_packet(struct vusb_device *vdev, void *packet,
-			u8 command, u32 hlen, u32 dlen)
-{
-	dprintk(D_URB2, "allocate packet len=%u\n",  hlen + dlen);
-	/* STUB */
-}
-
-/*
- * Send a request to the host
- * A packet is describe as multiple vectors
- * TODO RJP nuke it and all those packet macros...
- */
-static int
-vusb_send_packet(struct vusb_device *vdev, const struct iovec *iovec, size_t niov)
-{
-	/* TODO this was a r = vusb_write(v, iovec[i].iov_base, iovec[i].iov_len);*/
-
-	return 0;
-}
-
-/*
- * Main task
- * - Read command
- * - Send command if the task receive an interrupt (not efficient)
- */
-static void
-vusb_mainloop(struct vusb_vhcd *vhcd)
-{
-	/* TODO RJP:
-	 * process writes to rings that were full.
-	 * process reads from rings that were empty.
-	 *
-	 * Original code for reference for now
-	 *
-	 * Outbound path fe -> be
-	 *
-	 * Moved in with the device functions. Something like this will
-	 * become a device function driven by enqueue and work. The kthread
-	 * will go away.
-	 *
-	 * Update: this thing is a mess. It is both the inbound and outbound
-	 * processor. Just leave it here for reference.
-	int nr = 0;
-	int expected = 0; // STUB packet header length
-	int count = 0;
-	int r;
-	// STUB get packet header
-
-	// FIXME: check return 
-	vusb_send_bind_request(v);
-	do {
-		nr = vusb_read(v, pbuf + count, expected - count);
-
-		dprintk(D_V4V1, "vusb_read: %d\n", nr);
-
-		if (nr == -EINTR || nr == -ERESTARTSYS) { // Sig INT occured 
-			// Check if we need to stop
-			if (kthread_should_stop())
-			        return;
-			flush_signals(current);
-			vusb_process_urbs(v);
-			dprintk(D_V4V1, "vusb: got interrupted, restarting read\n");
-			continue;
-		} else if (nr < 0) { // TODO: handle EAGAIN EDISCONNECT
-			wprintk("Unexpected error on read: %d\n", nr);
-			return;
-		} else if (nr == 0) {
-			wprintk("zero read, assuming server close connection\n");
-			// TODO: Don't close the thread. Check if we can restart the connection 
-			return;
-		}
-
-		count = count + nr;
-
-		if (count < expected) {
-			dprintk(D_V4V2, "Partial read, remaining: %d\n", expected-count);
-			continue;
-		} else  if (expected == 0) { // STUB packet header length 
-			expected = 0; // STUB payload length 
-			if (expected > VUSB_MAX_PACKET_SIZE) {
-				wprintk("Packet too large (%u)\n", expected);
-				// TODO: Skip the packet, don't close the connection
-				return;
-			}
-		}
-
-		if (count > expected) {
-			BUG();
-		}
-		if (count == expected) {
-			dprintk(D_V4V1, "All data received calling handler\n");
-			r = vusb_process_packet(v, (void *)pbuf);
-			if (v->poll) { // Update Hub status
-				v->poll = 0;
-				usb_hcd_poll_rh_status(vhcd_to_hcd(v));
-			}
-
-			if (r < 0) {
-				return;
-			}
-			if (r == 2) {
-				vusb_process_urbs(v);
-			}
-			expected = 0; // STUB packet header length
-			count = 0;
-		}
-	} while(1);
-	*/
-}
-
-/* Process packet received from vusb daemon */
-static int
-vusb_process_packet(struct vusb_vhcd *vhcd, const void *packet)
-{
-	int res = 0;
-
-	/* TODO RJP
-	 *
-	 * Inbound path: be -> fe
-	 *
-	 * This will also become a device function driven by the irq/bh/work
-	 *
-	 */
-	switch (vhcd->state) {
-	case VUSB_WAIT_BIND_RESPONSE:
-		iprintk("Wait bind response send it\n");
-
-		/* TODO this is all v4v stuffs, fix res = vusb_send_bind_commit(v);*/
-		if (res != 0) {
-			eprintk("Failed to send bind commit command\n");
-			return res;
-		}
-		break;
-
-	case VUSB_RUNNING:
-		/* STUB handle events calling one of:
-		vusb_handle_announce_device(v, packet);
-		vusb_handle_device_gone(v, packet);
-		vusb_handle_urb_response(v, packet);
-		vusb_handle_urb_status(v, packet);*/
-		break;
-
-	default:
-		wprintk("Invalid state %u in process_packet\n",	vhcd->state);
-		return -1;
-	}
-
-	return 0;
-}
-
 /****************************************************************************/
 /* VUSB Xen Devices & Driver                                                */
 
@@ -2834,6 +2672,8 @@ vusb_platform_probe(struct platform_device *pdev)
 		goto err_add;
 
 	vusb_init_hcd(vhcd);
+
+	/* TODO VHCD is up, now initialize this device for xenbus */
 
 	dprintk(D_MISC, "<vusb_hcd_probe %d\n", retval);
 
