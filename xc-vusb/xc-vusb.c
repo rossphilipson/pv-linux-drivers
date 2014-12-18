@@ -253,6 +253,8 @@ struct vusb_device {
 	struct list_head        	release_list;
 
 	struct work_struct 		work;
+
+	wait_queue_head_t		wait_queue;
 };
 
 /* Virtual USB HCD/RH pieces */
@@ -382,7 +384,7 @@ vusb_state_to_string(const struct vusb_urbp *urbp)
 #endif /* VUSB_DEBUG */
 
 static inline u16
-usb_speed_to_port_stat(enum usb_device_speed speed)
+vusb_speed_to_port_stat(enum usb_device_speed speed)
 {
 	switch (speed) {
 	case USB_SPEED_HIGH:
@@ -406,7 +408,7 @@ vusb_set_link_state(struct vusb_device *vdev)
 
 	if (vdev->present) {
 		newstatus |= (USB_PORT_STAT_CONNECTION) |
-					usb_speed_to_port_stat(vdev->speed);
+					vusb_speed_to_port_stat(vdev->speed);
 	} else {
 		newstatus &= ~(USB_PORT_STAT_CONNECTION |
 					USB_PORT_STAT_LOW_SPEED |
@@ -2252,6 +2254,7 @@ vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 	vdev->xendev = dev;
 	INIT_LIST_HEAD(&vdev->pending_list);
 	INIT_LIST_HEAD(&vdev->release_list);
+	init_waitqueue_head(&vdev->wait_queue);
 
 	/* Strap our VUSB device onto the Xen device context */
 	dev_set_drvdata(&dev->dev, vdev);
@@ -2274,33 +2277,60 @@ static int
 vusb_start_device(struct vusb_device *vdev)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
-	void *internal_page;
+	struct vusb_internal vint_req;
 	unsigned long flags;
-	int rc = 0;
+	int ret = 0;
 
-	/* Page to grant for requesting speed */
-	internal_page = (void *)__get_free_page(GFP_NOIO | __GFP_HIGH);
+	vint_req.type = USBIF_T_GET_SPEED;
+	vint_req.endpoint = 0 | USB_DIR_IN;
+	vint_req.page = (void *)__get_free_page(GFP_NOIO | __GFP_HIGH);
+	vint_req.length = sizeof(u32);
+	vint_req.offset = 0;
+	vint_req.is_reset = 0;
+
+	if (!vint_req.page)
+		return -ENOMEM;
+	
+	/* TODO need a reset here? The WFE gets that info from the registry */
 
 	spin_lock_irqsave(&vhcd->lock, flags);
 
-	/* bits from windows fe for resets and get speed, start sending packets */
-	/* final bits from vusb_add_device to make device known*/
-	/* TODO RJP get link speed - need to send a packet to the backend to do this */
+
 	vdev->present = 1;
 	vdev->connecting = 0;
-	/* TODO this will happen in the irq vdev->speed = speed;*/
-	vdev->port_status |= usb_speed_to_port_stat(vdev->speed)
+	vdev->speed = (unsigned int)-1;
+
+	ret = vusb_put_internal_request(vdev, &vint_req);
+	if (ret) {
+		spin_unlock_irqrestore(&vhcd->lock, flags);
+		free_page((unsigned long)vint_req.page);
+		eprintk("Failed to get device speed - ret: %d\n", ret);
+		return ret;
+	}
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+
+	/* Wait for a response with no lock */
+	wait_event_interruptible(vdev->wait_queue, vdev->speed != (unsigned int)-1);
+
+	spin_lock_irqsave(&vhcd->lock, flags);
+
+	/* TODO this will happen in the irq vdev->speed = speed, sanity check the speed */
+	vdev->port_status |= vusb_speed_to_port_stat(vdev->speed)
 					 | USB_PORT_STAT_CONNECTION
 					 | USB_PORT_STAT_C_CONNECTION << 16;
 
-	dprintk(D_PORT1, "new status: 0x%08x speed: 0x%04x\n",
-			vdev->port_status, speed);
+	/* final bits from ctxusb_add_device to make device known*/
 	vusb_set_link_state(vdev);
-/*out:*/
+	dprintk(D_PORT1, "new status: 0x%08x speed: 0x%04x\n",
+			vdev->port_status, vdev->speed);
+
 	spin_unlock_irqrestore(&vhcd->lock, flags);
-	free_page((unsigned long)internal_page);
+
+	free_page((unsigned long)vint_req.page);
 	usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
-	return rc;
+
+
+	return 0;
 }
 
 static void
