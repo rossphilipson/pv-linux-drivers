@@ -292,9 +292,6 @@ static void
 vusb_restart_processing(struct work_struct *work);
 static void
 vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp);
-static void
-vusb_initialize_packet(struct vusb_device *vdev, void *packet,
-		u8 command, u32 hlen, u32 dlen);
 
 /****************************************************************************/
 /* Miscellaneous Routines                                                   */
@@ -1061,6 +1058,9 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 		shadow->iso_packet_descriptor = NULL;
 	}
 
+	/* N.B. it turns out he readonly param to gnttab_end_foreign_access is,
+	 * unused, that is why we don't have to track it and use it here.
+	 */
 	if (shadow->indirect_page_memory) {
 		ireq = (usbif_indirect_request_t*)shadow->indirect_page_memory;
 
@@ -1549,6 +1549,13 @@ vusb_handle_urb_status(struct vusb_device *vdev, const void *packet)
 
 	/* RJP lock held, probably don't even need this */
 	vusb_urb_finish(vdev, handle, status, 0, NULL);
+}
+
+static void
+vusb_initialize_packet(struct vusb_device *vdev, void *packet,
+		u8 command, u32 hlen, u32 dlen)
+{
+	/* TODO kill me */
 }
 
 /*
@@ -2599,6 +2606,7 @@ vusb_xen_init(void)
 	int rc = 0;
 
 	mutex_lock(&vusb_xen_pm_mutex);
+	/* TODO this will ultimately go away */
 	if (!xen_hvm_domain()) {
 		rc = -ENODEV;
 		goto out;
@@ -2608,7 +2616,7 @@ vusb_xen_init(void)
 	if (rc)
 		goto out;
 
-	printk(KERN_INFO "xen_usbif initialized\n");
+	iprintk("xen_usbif initialized\n");
 out:
 	mutex_unlock(&vusb_xen_pm_mutex);
 	return rc;
@@ -2674,15 +2682,23 @@ vusb_platform_probe(struct platform_device *pdev)
 	vusb_init_hcd(vhcd);
 
 	/* TODO VHCD is up, now initialize this device for xenbus */
+	ret = vusb_xen_init();
+	if (ret)
+		goto err_xen;
 
-	dprintk(D_MISC, "<vusb_hcd_probe %d\n", retval);
+	dprintk(D_MISC, "<vusb_hcd_probe %d\n", ret);
 
 	return 0;
+
+err_xen:
+	hcd->irq = -1;
+
+	usb_remove_hcd(hcd);
 
 err_add:
 	usb_put_hcd(hcd);
 
-	dprintk(D_MISC, "<vusb_hcd_probe %d\n", retval);
+	eprintk("%s failure - ret: %d\n", __FUNCTION__, ret);
 
 	return ret;
 }
@@ -2695,6 +2711,9 @@ vusb_platform_remove(struct platform_device *pdev)
 	struct vusb_vhcd *vhcd;
 
 	hcd = platform_get_drvdata(pdev);
+
+	/* Unregister from xenbus first */
+	vusb_xen_unregister();
 
 	/*
 	 * A warning will result: "IRQ 0 already free".
