@@ -207,9 +207,10 @@ typedef struct usbif_indirect_pages usbif_indirect_pages_t;
 struct vusb_shadow {
 	usbif_request_t		req;
 	unsigned long		frames[USBIF_MAX_SEGMENTS_PER_REQUEST];
+	unsigned long		iso_frame;
 	struct vusb_urbp	*urbp;
 	void			*iso_packet_descriptor;
-	void			*indirect_page_memory;
+	void			*indirect_reqs;
 	void			*indirect_pages;
     	unsigned		in_use:1;
 };
@@ -649,8 +650,8 @@ vusb_hcd_stop(struct usb_hcd *hcd)
 
 	hcd->state = HC_STATE_HALT;
 	/* TODO: remove all URBs */
+	/* TODO: "cleanly make HCD stop writing memory and doing I/O" */
 
-	//device_remove_file (dummy_dev(dum), &dev_attr_urbs);
 	dev_info(vusb_dev(vhcd), "stopped\n");
 	dprintk(D_MISC, "<vusb_stop\n");
 }
@@ -829,7 +830,7 @@ vusb_hcd_hub_status(struct usb_hcd *hcd, char *buf)
 
 	dprintk(D_MISC, ">vusb_hub_status\n");
 
-	/* FIXME: Not sure it's good */
+	/* TODO FIXME: Not sure it's good */
 	if (!HCD_HW_ACCESSIBLE(hcd)) {
 		wprintk("Hub is not running %u\n", hcd->state);
 		dprintk(D_MISC, ">vusb_hub_status 0\n");
@@ -1061,26 +1062,26 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 	/* N.B. it turns out he readonly param to gnttab_end_foreign_access is,
 	 * unused, that is why we don't have to track it and use it here.
 	 */
-	if (shadow->indirect_page_memory) {
-		ireq = (usbif_indirect_request_t*)shadow->indirect_page_memory;
+	if (shadow->indirect_reqs) {
+		ireq = (usbif_indirect_request_t*)shadow->indirect_reqs;
 
 		for (i = 0; i < shadow->req.nr_segments; i++) {
 			for (j = 0; j < ireq[j].nr_segments; j++) {
 				xc_gnttab_end_foreign_access(ireq[i].gref[j], 0, 0UL);
 			}
 		}
-		kfree(shadow->indirect_page_memory);
-		shadow->indirect_page_memory = NULL;
+		kfree(shadow->indirect_reqs);
+		shadow->indirect_reqs = NULL;
 		kfree(shadow->indirect_pages);
 		shadow->indirect_pages = NULL;
 	}
 
-	for (i = 0; i < shadow->req.nr_segments; i++) {
+	for (i = 0; i < shadow->req.nr_segments; i++)
 		xc_gnttab_end_foreign_access(shadow->req.gref[i], 0, 0UL);
-	}
 
 	memset(&shadow->frames[0], 0,
 		(sizeof(unsigned long)*USBIF_MAX_SEGMENTS_PER_REQUEST));
+	shadow->iso_frame = 0;
 	shadow->req.nr_segments = 0;
 	shadow->urbp = NULL;
 	shadow->in_use = 0;
@@ -1131,9 +1132,9 @@ static int
 vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 		unsigned long *mfns, u32 nr_mfns, bool restart)
 {
-	u32 i, ref;
+	u32 ref;
 	grant_ref_t gref_head;
-	int ret;
+	int i, ret;
 
 	dprintk(D_RING2, "Allocate gref for %d mfns\n", (int)nr_mfns);
 
@@ -1154,24 +1155,109 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 	}
 
 	for (i = 0; i < nr_mfns; i++) {
-		unsigned long mfn = mfns[i];
-
 		ref = xc_gnttab_claim_grant_reference(&gref_head);
 		BUG_ON(ref == -ENOSPC);
 
 		shadow->req.gref[shadow->req.nr_segments] = ref;
 
 		xc_gnttab_grant_foreign_access_ref(ref,
-				vdev->xendev->otherend_id, mfn,
+				vdev->xendev->otherend_id, mfns[i],
 				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
 
-		shadow->frames[i] = mfn_to_pfn(mfn);
+		shadow->frames[i] = mfn_to_pfn(mfns[i]);
 		shadow->req.nr_segments++;
  	}
 
 	xc_gnttab_free_grant_references(gref_head);
 
 	return 0;
+}
+
+static int
+vusb_allocate_indirect_grefs(struct vusb_device *vdev,
+			struct vusb_shadow *shadow,
+			unsigned long *ind_mfns, u32 nr_ind_mfns,
+			unsigned long *data_mfns, u32 nr_data_mfns,
+			unsigned long iso_mfn, bool has_iso_mfn)
+{
+	usbif_indirect_request_t *indirect_reqs =
+		(usbif_indirect_request_t*)shadow->indirect_reqs;
+	usbif_indirect_pages_t *indirect_pages = 
+		(usbif_indirect_pages_t*)shadow->indirect_pages;
+	grant_ref_t gref_head;
+	u32 nr_total = nr_data_mfns + (has_iso_mfn ? 1 : 0);
+	u32 ref;
+	int ret, i = 0, j = 0, k = 0;
+
+	BUG_ON(!indirect_reqs);
+	BUG_ON(!indirect_pages);
+	shadow->req.nr_segments = 0;
+
+	/* Set up the descriptors for the indirect pages in the request. */
+	ret = vusb_allocate_grefs(vdev, shadow, ind_mfns, nr_ind_mfns, true);
+	if (ret)
+		return ret; /* may just be EBUSY */
+
+	ret = xc_gnttab_alloc_grant_references(nr_total, &gref_head);
+	if (ret < 0) {
+		xc_gnttab_request_free_callback(&vdev->callback,
+			vusb_restart_processing_callback,
+			vdev, nr_total);
+		/* Clean up what we did above */
+		ret = -EBUSY;
+		goto cleanup;
+	}
+
+	/* Set up the descriptor for the iso packets - it is the first page of
+	 * the first indirect page. The first gref of the first page points
+	 * to the iso packet descriptor page.
+	 */
+	if (has_iso_mfn) {
+		ref = xc_gnttab_claim_grant_reference(&gref_head);
+		BUG_ON(ref == -ENOSPC);
+
+		indirect_reqs[0].gref[0] = ref;
+
+		xc_gnttab_grant_foreign_access_ref(ref,
+				vdev->xendev->otherend_id, iso_mfn,
+				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
+
+		shadow->iso_frame = mfn_to_pfn(iso_mfn);
+		indirect_reqs[0].nr_segments++;
+		j++;
+	}
+
+	for ( ; i < nr_data_mfns; i++) {
+		ref = xc_gnttab_claim_grant_reference(&gref_head);
+		BUG_ON(ref == -ENOSPC);
+
+		indirect_reqs[j].gref[k] = ref;
+
+		xc_gnttab_grant_foreign_access_ref(ref,
+				vdev->xendev->otherend_id, data_mfns[i],
+				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
+
+		indirect_pages->frames[i] = mfn_to_pfn(data_mfns[i]);
+		indirect_reqs[j].nr_segments++;
+		if (++k ==  USBIF_MAX_SEGMENTS_PER_IREQUEST) {
+			indirect_reqs[++j].nr_segments++;
+			k = 0;
+		}
+ 	}
+
+	xc_gnttab_free_grant_references(gref_head);
+
+	return 0;
+
+cleanup:
+	for (i = 0; i < shadow->req.nr_segments; i++)
+		xc_gnttab_end_foreign_access(shadow->req.gref[i], 0, 0UL);
+
+	memset(&shadow->frames[0], 0,
+		(sizeof(unsigned long)*USBIF_MAX_SEGMENTS_PER_REQUEST));
+	shadow->req.nr_segments = 0;
+
+	return ret;
 }
 
 static int
@@ -2453,11 +2539,11 @@ vusb_usbfront_probe(struct xenbus_device *dev, const struct xenbus_device_id *id
 	/* Make device ids out of the virtual-device value from xenstore */
 	err = xc_xenbus_scanf(XBT_NIL, dev->nodename, "virtual-device", "%i", &vid);
 	if (err != 1) {
-		printk(KERN_ERR "Failed to read virtual-device value\n");
+		eprintk("Failed to read virtual-device value\n");
 		return err;
 	}
 
-	printk(KERN_INFO "Creating new VUSB device - virtual-device: %i devicetype: %s\n",
+	iprintk("Creating new VUSB device - virtual-device: %i devicetype: %s\n",
 		vid, id->devicetype);
 
 	return vusb_create_device(vhcd, dev, (u16)vid);
@@ -2541,7 +2627,7 @@ vusb_usbfront_suspend(struct xenbus_device *dev)
 	/* TODO RJP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
 
 	mutex_lock(&vusb_xen_pm_mutex);
-	printk(KERN_INFO "xen_netif: pm freeze event received, detaching netfront\n");
+	iprintk("xen_usbif: pm freeze event received, detaching usbfront\n");
 	/* TODO RJP not sure what to do here yet
         info->suspending = 1;
 
@@ -2566,7 +2652,7 @@ vusb_usbfront_resume(struct xenbus_device *dev)
 	/* TODO RJP our ctx: struct netfront_info *info = dev_get_drvdata(&dev->dev);*/
 
 	mutex_lock(&vusb_xen_pm_mutex);
-	printk(KERN_INFO "xen_usbif: pm restore event received, unregister net device\n");
+	iprintk("xen_usbif: pm restore event received, unregister usb device\n");
 	/* TODO RJP not sure what to do here yet
 	 * maybe something like blkif_recover - that is why I kept the frame[] arrays around
         info->suspending = 0;
