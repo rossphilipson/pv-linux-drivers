@@ -186,6 +186,7 @@ struct vusb_urbp {
 	u16                     handle;
 	struct list_head	urbp_list;
 	int                     port;
+	gfp_t			mem_flags;
 };
 
 /* Internal request structure */
@@ -195,6 +196,7 @@ struct vusb_internal {
 	void 			*page;
 	usbif_request_len_t 	length;
 	u16 			offset;
+	gfp_t			mem_flags;
 	unsigned		is_reset:1;
 	unsigned		is_cycle:1;
 };
@@ -211,6 +213,7 @@ struct vusb_shadow {
 	struct vusb_urbp	*urbp;
 	void			*iso_packet_descriptor;
 	void			*indirect_reqs;
+	u32			indirect_size;
 	void			*indirect_pages;
     	unsigned		in_use:1;
 };
@@ -679,6 +682,7 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	urbp->state = VUSB_URBP_NEW;
 	/* Port numbered from 1 */
 	urbp->port = urb->dev->portnum;
+	urbp->mem_flags = mem_flags;
 	urbp->urb = urb;
 
 	spin_lock_irqsave(&vhcd->lock, flags);
@@ -1074,6 +1078,7 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 		shadow->indirect_reqs = NULL;
 		kfree(shadow->indirect_pages);
 		shadow->indirect_pages = NULL;
+		shadow->indirect_size = 0;
 	}
 
 	for (i = 0; i < shadow->req.nr_segments; i++)
@@ -1096,7 +1101,195 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 }
 
 static void
-vusb_flush_requests(struct vusb_device *vdev)
+vusb_restart_processing_callback(void *arg)
+{
+	struct vusb_device *vdev = (struct vusb_device*)arg;
+	schedule_work(&vdev->work);
+}
+
+#define BYTE_OFFSET(a) ((u32)((unsigned long)a & (PAGE_SIZE - 1)))
+#define SPAN_PAGES(a, s) ((u32)((s >> PAGE_SHIFT) + ((BYTE_OFFSET(a) + BYTE_OFFSET(s) + PAGE_SIZE - 1) >> PAGE_SHIFT)))
+static unsigned long * 
+vusb_alloc_mfn_array(u8 *addr, u32 size, gfp_t mem_flags, u32 *nr_mfns_out)
+{
+	unsigned long *mfns;
+	u32 i, nr_mfns;
+
+	nr_mfns = SPAN_PAGES(addr, size);
+	mfns = kmalloc((size_t)nr_mfns, mem_flags);
+	if (!mfns)
+		return NULL;
+
+	addr = (u8*)((unsigned long)addr & PAGE_MASK);
+	for (i = 0; i < nr_mfns; i++, addr += PAGE_SIZE)
+		mfns[i] = pfn_to_mfn(virt_to_phys(addr) << PAGE_SHIFT);
+
+	*nr_mfns_out = nr_mfns;
+	return mfns;
+}
+
+static int
+vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
+		void *addr, u32 size, gfp_t mem_flags, bool restart)
+{
+	grant_ref_t gref_head;
+	u32 ref;
+	int i, ret;
+	u32 nr_mfns;
+	unsigned long *mfns;
+
+	mfns = vusb_alloc_mfn_array(addr, size, mem_flags, &nr_mfns);
+	if (!mfns) {
+		eprintk("%s out of memory\n", __FUNCTION__);
+		return -ENOMEM;
+	}
+
+	dprintk(D_RING2, "Allocate gref for %d mfns\n", (int)nr_mfns);
+
+	/* NOTE: we are following the blkback model where we are not
+	 * freeing the pages on gnttab_end_foreign_access so we don't
+	 * have to track them. That memory belongs to the USB core
+	 * in most cases or is the internal request page.
+	 */
+
+	ret = xc_gnttab_alloc_grant_references(nr_mfns, &gref_head);
+	if (ret < 0) {
+		if (!restart)
+			return ret;
+		xc_gnttab_request_free_callback(&vdev->callback,
+			vusb_restart_processing_callback,
+			vdev, nr_mfns);
+		kfree(mfns);
+		return -EBUSY;
+	}
+
+	for (i = 0; i < nr_mfns; i++) {
+		ref = xc_gnttab_claim_grant_reference(&gref_head);
+		BUG_ON(ref == -ENOSPC);
+
+		shadow->req.gref[shadow->req.nr_segments] = ref;
+
+		xc_gnttab_grant_foreign_access_ref(ref,
+				vdev->xendev->otherend_id, mfns[i],
+				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
+
+		shadow->frames[i] = mfn_to_pfn(mfns[i]);
+		shadow->req.nr_segments++;
+ 	}
+
+	xc_gnttab_free_grant_references(gref_head);
+	kfree(mfns);
+
+	return 0;
+}
+
+static int
+vusb_allocate_indirect_grefs(struct vusb_device *vdev,
+			struct vusb_shadow *shadow,
+			void *addr, u32 size,
+			void *iso_addr, gfp_t mem_flags)
+{
+	usbif_indirect_request_t *indirect_reqs =
+		(usbif_indirect_request_t*)shadow->indirect_reqs;
+	usbif_indirect_pages_t *indirect_pages = 
+		(usbif_indirect_pages_t*)shadow->indirect_pages;
+	u32 nr_mfns;
+	unsigned long *mfns;
+	unsigned long iso_mfn;
+	grant_ref_t gref_head;
+	u32 nr_total = nr_mfns + (iso_addr ? 1 : 0);
+	u32 ref;
+	int iso_frame = (iso_addr ? 1 : 0);
+	int ret, i = 0, j = 0, k = 0;
+
+	BUG_ON(!indirect_reqs);
+	BUG_ON(!indirect_pages);
+
+	mfns = vusb_alloc_mfn_array(addr, size, mem_flags, &nr_mfns);
+	if (!mfns) {
+		eprintk("%s out of memory\n", __FUNCTION__);
+		return -ENOMEM;
+	}
+
+	if (iso_addr)
+		iso_mfn = pfn_to_mfn(virt_to_phys(iso_addr) << PAGE_SHIFT);
+
+	shadow->req.nr_segments = 0;
+
+	/* Set up the descriptors for the indirect pages in the request. */
+	ret = vusb_allocate_grefs(vdev, shadow, indirect_reqs,
+			shadow->indirect_size, mem_flags, true);
+	if (ret) {
+		kfree(mfns);
+		return ret; /* may just be EBUSY */
+	}
+
+	ret = xc_gnttab_alloc_grant_references(nr_total, &gref_head);
+	if (ret < 0) {
+		xc_gnttab_request_free_callback(&vdev->callback,
+			vusb_restart_processing_callback,
+			vdev, nr_total);
+		/* Clean up what we did above */
+		ret = -EBUSY;
+		goto cleanup;
+	}
+
+	/* Set up the descriptor for the iso packets - it is the first page of
+	 * the first indirect page. The first gref of the first page points
+	 * to the iso packet descriptor page.
+	 */
+	if (iso_addr) {
+		ref = xc_gnttab_claim_grant_reference(&gref_head);
+		BUG_ON(ref == -ENOSPC);
+
+		indirect_reqs[0].gref[0] = ref;
+
+		xc_gnttab_grant_foreign_access_ref(ref,
+				vdev->xendev->otherend_id, iso_mfn,
+				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
+
+		indirect_pages->frames[0] = mfn_to_pfn(iso_mfn);
+		indirect_reqs[0].nr_segments++;
+		j++;
+	}
+
+	for ( ; i < nr_mfns; i++) {
+		ref = xc_gnttab_claim_grant_reference(&gref_head);
+		BUG_ON(ref == -ENOSPC);
+
+		indirect_reqs[j].gref[k] = ref;
+
+		xc_gnttab_grant_foreign_access_ref(ref,
+				vdev->xendev->otherend_id, mfns[i],
+				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
+
+		indirect_pages->frames[i + iso_frame] = mfn_to_pfn(mfns[i]);
+		indirect_reqs[j].nr_segments++;
+		if (++k ==  USBIF_MAX_SEGMENTS_PER_IREQUEST) {
+			indirect_reqs[++j].nr_segments++;
+			k = 0;
+		}
+ 	}
+
+	xc_gnttab_free_grant_references(gref_head);
+	kfree(mfns);
+	
+	return 0;
+
+cleanup:
+	kfree(mfns);
+	for (i = 0; i < shadow->req.nr_segments; i++)
+		xc_gnttab_end_foreign_access(shadow->req.gref[i], 0, 0UL);
+
+	memset(&shadow->frames[0], 0,
+		(sizeof(unsigned long)*USBIF_MAX_SEGMENTS_PER_REQUEST));
+	shadow->req.nr_segments = 0;
+
+	return ret;
+}
+
+static void
+vusb_flush_ring(struct vusb_device *vdev)
 {
 	int notify;
 
@@ -1117,154 +1310,13 @@ vusb_put_ring(struct vusb_device *vdev, struct vusb_shadow *shadow)
 
 	vdev->ring.req_prod_pvt++;
 
-	vusb_flush_requests(vdev);
-}
-
-static void
-vusb_restart_processing_callback(void *arg)
-{
-	struct vusb_device *vdev = (struct vusb_device*)arg;
-	schedule_work(&vdev->work);
-}
-
-static int
-vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
-		unsigned long *mfns, u32 nr_mfns, bool restart)
-{
-	u32 ref;
-	grant_ref_t gref_head;
-	int i, ret;
-
-	dprintk(D_RING2, "Allocate gref for %d mfns\n", (int)nr_mfns);
-
-	/* NOTE: we are following the blkback model where we are not
-	 * freeing the pages on gnttab_end_foreign_access so we don't
-	 * have to track them. That memory belongs to the USB core
-	 * in most cases or is the internal request page.
-	 */
-
-	ret = xc_gnttab_alloc_grant_references(nr_mfns, &gref_head);
-	if (ret < 0) {
-		if (!restart)
-			return ret;
-		xc_gnttab_request_free_callback(&vdev->callback,
-			vusb_restart_processing_callback,
-			vdev, nr_mfns);
-		return -EBUSY;
-	}
-
-	for (i = 0; i < nr_mfns; i++) {
-		ref = xc_gnttab_claim_grant_reference(&gref_head);
-		BUG_ON(ref == -ENOSPC);
-
-		shadow->req.gref[shadow->req.nr_segments] = ref;
-
-		xc_gnttab_grant_foreign_access_ref(ref,
-				vdev->xendev->otherend_id, mfns[i],
-				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
-
-		shadow->frames[i] = mfn_to_pfn(mfns[i]);
-		shadow->req.nr_segments++;
- 	}
-
-	xc_gnttab_free_grant_references(gref_head);
-
-	return 0;
-}
-
-static int
-vusb_allocate_indirect_grefs(struct vusb_device *vdev,
-			struct vusb_shadow *shadow,
-			unsigned long *ind_mfns, u32 nr_ind_mfns,
-			unsigned long *data_mfns, u32 nr_data_mfns,
-			unsigned long iso_mfn, bool has_iso_mfn)
-{
-	usbif_indirect_request_t *indirect_reqs =
-		(usbif_indirect_request_t*)shadow->indirect_reqs;
-	usbif_indirect_pages_t *indirect_pages = 
-		(usbif_indirect_pages_t*)shadow->indirect_pages;
-	grant_ref_t gref_head;
-	u32 nr_total = nr_data_mfns + (has_iso_mfn ? 1 : 0);
-	u32 ref;
-	int iso_frame = (has_iso_mfn ? 1 : 0);
-	int ret, i = 0, j = 0, k = 0;
-
-	BUG_ON(!indirect_reqs);
-	BUG_ON(!indirect_pages);
-	shadow->req.nr_segments = 0;
-
-	/* Set up the descriptors for the indirect pages in the request. */
-	ret = vusb_allocate_grefs(vdev, shadow, ind_mfns, nr_ind_mfns, true);
-	if (ret)
-		return ret; /* may just be EBUSY */
-
-	ret = xc_gnttab_alloc_grant_references(nr_total, &gref_head);
-	if (ret < 0) {
-		xc_gnttab_request_free_callback(&vdev->callback,
-			vusb_restart_processing_callback,
-			vdev, nr_total);
-		/* Clean up what we did above */
-		ret = -EBUSY;
-		goto cleanup;
-	}
-
-	/* Set up the descriptor for the iso packets - it is the first page of
-	 * the first indirect page. The first gref of the first page points
-	 * to the iso packet descriptor page.
-	 */
-	if (has_iso_mfn) {
-		ref = xc_gnttab_claim_grant_reference(&gref_head);
-		BUG_ON(ref == -ENOSPC);
-
-		indirect_reqs[0].gref[0] = ref;
-
-		xc_gnttab_grant_foreign_access_ref(ref,
-				vdev->xendev->otherend_id, iso_mfn,
-				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
-
-		indirect_pages->frames[0] = mfn_to_pfn(iso_mfn);
-		indirect_reqs[0].nr_segments++;
-		j++;
-	}
-
-	for ( ; i < nr_data_mfns; i++) {
-		ref = xc_gnttab_claim_grant_reference(&gref_head);
-		BUG_ON(ref == -ENOSPC);
-
-		indirect_reqs[j].gref[k] = ref;
-
-		xc_gnttab_grant_foreign_access_ref(ref,
-				vdev->xendev->otherend_id, data_mfns[i],
-				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
-
-		indirect_pages->frames[i + iso_frame] = mfn_to_pfn(data_mfns[i]);
-		indirect_reqs[j].nr_segments++;
-		if (++k ==  USBIF_MAX_SEGMENTS_PER_IREQUEST) {
-			indirect_reqs[++j].nr_segments++;
-			k = 0;
-		}
- 	}
-
-	xc_gnttab_free_grant_references(gref_head);
-
-	return 0;
-
-cleanup:
-	for (i = 0; i < shadow->req.nr_segments; i++)
-		xc_gnttab_end_foreign_access(shadow->req.gref[i], 0, 0UL);
-
-	memset(&shadow->frames[0], 0,
-		(sizeof(unsigned long)*USBIF_MAX_SEGMENTS_PER_REQUEST));
-	shadow->req.nr_segments = 0;
-
-	return ret;
+	vusb_flush_ring(vdev);
 }
 
 static int
 vusb_put_internal_request(struct vusb_device *vdev, struct vusb_internal *vint)
 {
 	struct vusb_shadow *shadow;
-	unsigned long mfn;
 	int ret = 0;
 
 	/* NOTE USBIF_T_ABORT_PIPE is not currently supported */
@@ -1277,9 +1329,7 @@ vusb_put_internal_request(struct vusb_device *vdev, struct vusb_internal *vint)
 	BUG_ON(!shadow);
 
 	if (vint->is_reset || vint->is_cycle) {
-		/* Resets/cycles are easy - there are not data pages or grefs. The
-		 * 
-		 */
+		/* Resets/cycles are easy - there are not data pages or grefs. */
 		shadow->req.endpoint = 0;
 		shadow->req.type = (vint->is_cycle ? 0 : USBIF_T_RESET);
 		shadow->req.length = 0;
@@ -1301,11 +1351,9 @@ vusb_put_internal_request(struct vusb_device *vdev, struct vusb_internal *vint)
 	shadow->req.offset = vint->offset;
 	shadow->req.flags = USBIF_F_SHORTOK;
 
-	/* All internal requests fit on a page */
-	mfn = pfn_to_mfn(virt_to_phys(vint->page) << PAGE_SHIFT);
-
 	/* Get some of them grefs */
-	ret = vusb_allocate_grefs(vdev, shadow, &mfn, 1, false);
+	ret = vusb_allocate_grefs(vdev, shadow, vint->page,
+				1, vint->mem_flags, false);
 	if (ret) {
 		/* Can't handle failures */
 		vusb_put_shadow(vdev, shadow);
@@ -2416,9 +2464,10 @@ vusb_start_device(struct vusb_device *vdev)
 
 	vint_req.type = USBIF_T_GET_SPEED;
 	vint_req.endpoint = 0 | USB_DIR_IN;
-	vint_req.page = (void *)__get_free_page(GFP_NOIO | __GFP_HIGH);
+	vint_req.page = (void *)__get_free_page(GFP_KERNEL);
 	vint_req.length = sizeof(u32);
 	vint_req.offset = 0;
+	vint_req.mem_flags = GFP_KERNEL;
 	vint_req.is_reset = 0;
 
 	if (!vint_req.page)
@@ -2516,7 +2565,7 @@ vusb_destroy_device(struct vusb_device *vdev)
 	spin_lock_irqsave(&vdev->lock, flags);
 
 	/* Give usbback a chance to consume the ring */
-	vusb_flush_requests(vdev);
+	vusb_flush_ring(vdev);
 
 	/* Copy ready to release urbps to temp list */
         list_splice_init(&vdev->release_list, &tmp[0]);
