@@ -200,14 +200,14 @@ struct vusb_internal {
 };
 
 struct usbif_indirect_pages {
-	unsigned long		frames[USBIF_MAX_SEGMENTS_PER_IREQUEST];
+	/* Extra 1 for leading ISO descriptor frame if it exists */
+	unsigned long		frames[USBIF_MAX_SEGMENTS_PER_IREQUEST + 1];
 };
 typedef struct usbif_indirect_pages usbif_indirect_pages_t;
 
 struct vusb_shadow {
 	usbif_request_t		req;
 	unsigned long		frames[USBIF_MAX_SEGMENTS_PER_REQUEST];
-	unsigned long		iso_frame;
 	struct vusb_urbp	*urbp;
 	void			*iso_packet_descriptor;
 	void			*indirect_reqs;
@@ -1081,7 +1081,6 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 
 	memset(&shadow->frames[0], 0,
 		(sizeof(unsigned long)*USBIF_MAX_SEGMENTS_PER_REQUEST));
-	shadow->iso_frame = 0;
 	shadow->req.nr_segments = 0;
 	shadow->urbp = NULL;
 	shadow->in_use = 0;
@@ -1187,6 +1186,7 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 	grant_ref_t gref_head;
 	u32 nr_total = nr_data_mfns + (has_iso_mfn ? 1 : 0);
 	u32 ref;
+	int iso_frame = (has_iso_mfn ? 1 : 0);
 	int ret, i = 0, j = 0, k = 0;
 
 	BUG_ON(!indirect_reqs);
@@ -1222,7 +1222,7 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 				vdev->xendev->otherend_id, iso_mfn,
 				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
 
-		shadow->iso_frame = mfn_to_pfn(iso_mfn);
+		indirect_pages->frames[0] = mfn_to_pfn(iso_mfn);
 		indirect_reqs[0].nr_segments++;
 		j++;
 	}
@@ -1237,7 +1237,7 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 				vdev->xendev->otherend_id, data_mfns[i],
 				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
 
-		indirect_pages->frames[i] = mfn_to_pfn(data_mfns[i]);
+		indirect_pages->frames[i + iso_frame] = mfn_to_pfn(data_mfns[i]);
 		indirect_reqs[j].nr_segments++;
 		if (++k ==  USBIF_MAX_SEGMENTS_PER_IREQUEST) {
 			indirect_reqs[++j].nr_segments++;
