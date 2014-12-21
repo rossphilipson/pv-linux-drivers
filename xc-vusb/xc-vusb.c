@@ -1267,34 +1267,42 @@ vusb_put_internal_request(struct vusb_device *vdev, struct vusb_internal *vint)
 	unsigned long mfn;
 	int ret = 0;
 
+	/* NOTE USBIF_T_ABORT_PIPE is not currently supported */
+
 	/* Internal request can use the last entry */
 	if (vdev->shadow_free == 0)
 		return -ENOMEM;
-
-	/* All internal requests fit on a page */
-	mfn = pfn_to_mfn(virt_to_phys(vint->page) << PAGE_SHIFT);
 
 	shadow = vusb_get_shadow(vdev);
 	BUG_ON(!shadow);
 
 	if (vint->is_reset || vint->is_cycle) {
+		/* Resets/cycles are easy - there are not data pages or grefs. The
+		 * 
+		 */
 		shadow->req.endpoint = 0;
 		shadow->req.type = (vint->is_cycle ? 0 : USBIF_T_RESET);
 		shadow->req.length = 0;
 		shadow->req.offset = 0;
+		shadow->req.nr_segments = 0;
+		shadow->req.setup = 0L;
 		shadow->req.flags = (vint->is_cycle ? USBIF_F_CYCLE_PORT : USBIF_F_RESET);
-	}
-	else {
-		shadow->req.endpoint = vint->endpoint;
-		shadow->req.type = vint->type;
-		shadow->req.length = vint->length;
-		BUG_ON(vint->offset >= 0x00010000);
-		shadow->req.offset = vint->offset;
-		shadow->req.flags = USBIF_F_SHORTOK;
+		vusb_put_ring(vdev, shadow);
+		return 0;
 	}
 
+	/* Other internal requests use a data page */
+	shadow->req.endpoint = vint->endpoint;
+	shadow->req.type = vint->type;
+	shadow->req.length = vint->length;
+	BUG_ON(vint->offset >= 0x00010000);
 	shadow->req.nr_segments = 0;
 	shadow->req.setup = 0L;
+	shadow->req.offset = vint->offset;
+	shadow->req.flags = USBIF_F_SHORTOK;
+
+	/* All internal requests fit on a page */
+	mfn = pfn_to_mfn(virt_to_phys(vint->page) << PAGE_SHIFT);
 
 	/* Get some of them grefs */
 	ret = vusb_allocate_grefs(vdev, shadow, &mfn, 1, false);
@@ -1307,6 +1315,24 @@ vusb_put_internal_request(struct vusb_device *vdev, struct vusb_internal *vint)
 	vusb_put_ring(vdev, shadow);
 
 	return ret;
+}
+
+static int
+vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
+{
+	struct vusb_shadow *shadow;
+
+	/* Leave room for resets on ring */
+	if (vdev->shadow_free <= 1)
+		return -ENOMEM;
+
+	shadow = vusb_get_shadow(vdev);
+	BUG_ON(!shadow);
+
+	if (!(urbp->urb->transfer_flags & URB_SHORT_NOT_OK))
+		shadow->req.flags = USBIF_F_SHORTOK;
+
+	return 0;
 }
 
 /****************************************************************************/
@@ -2031,7 +2057,7 @@ vusb_check_reset_device(struct vusb_device *vdev)
 	if (!reset)
 		return;
 
-	/* Send internal reset request */
+	/* Send internal reset request, no data page */
 	memset(&vint_req, 0, sizeof(struct vusb_internal));
 	vint_req.is_reset = 1;
 
@@ -2043,6 +2069,10 @@ vusb_check_reset_device(struct vusb_device *vdev)
 		eprintk("Failed to send reset for device %p - ret: %d\n", vdev, ret);
 		return;
 	}
+
+	/* Not waiting for the reset, the page will be cleaned up during
+	 * response processing.
+	 */
 
 	spin_lock_irqsave(&vdev->vhcd->lock, flags);
 	/* Signal reset completion */
