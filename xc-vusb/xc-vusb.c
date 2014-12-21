@@ -1109,40 +1109,16 @@ vusb_restart_processing_callback(void *arg)
 
 #define BYTE_OFFSET(a) ((u32)((unsigned long)a & (PAGE_SIZE - 1)))
 #define SPAN_PAGES(a, s) ((u32)((s >> PAGE_SHIFT) + ((BYTE_OFFSET(a) + BYTE_OFFSET(s) + PAGE_SIZE - 1) >> PAGE_SHIFT)))
-static unsigned long * 
-vusb_alloc_mfn_array(u8 *addr, u32 size, gfp_t mem_flags, u32 *nr_mfns_out)
-{
-	unsigned long *mfns;
-	u32 i, nr_mfns;
-
-	nr_mfns = SPAN_PAGES(addr, size);
-	mfns = kmalloc((size_t)nr_mfns, mem_flags);
-	if (!mfns)
-		return NULL;
-
-	addr = (u8*)((unsigned long)addr & PAGE_MASK);
-	for (i = 0; i < nr_mfns; i++, addr += PAGE_SIZE)
-		mfns[i] = pfn_to_mfn(virt_to_phys(addr) << PAGE_SHIFT);
-
-	*nr_mfns_out = nr_mfns;
-	return mfns;
-}
 
 static int
 vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
-		void *addr, u32 size, gfp_t mem_flags, bool restart)
+		void *addr, u32 size, bool restart)
 {
 	grant_ref_t gref_head;
-	u32 ref;
+	unsigned long mfn;
+	u8 *va = (u8*)((unsigned long)addr & PAGE_MASK);
+	u32 ref, nr_mfns = SPAN_PAGES(addr, size);
 	int i, ret;
-	u32 nr_mfns;
-	unsigned long *mfns;
-
-	mfns = vusb_alloc_mfn_array(addr, size, mem_flags, &nr_mfns);
-	if (!mfns) {
-		eprintk("%s out of memory\n", __FUNCTION__);
-		return -ENOMEM;
-	}
 
 	dprintk(D_RING2, "Allocate gref for %d mfns\n", (int)nr_mfns);
 
@@ -1159,26 +1135,26 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 		xc_gnttab_request_free_callback(&vdev->callback,
 			vusb_restart_processing_callback,
 			vdev, nr_mfns);
-		kfree(mfns);
 		return -EBUSY;
 	}
 
-	for (i = 0; i < nr_mfns; i++) {
+	for (i = 0; i < nr_mfns; i++, va += PAGE_SIZE) {
+		mfn = pfn_to_mfn(virt_to_phys(va) << PAGE_SHIFT);
+
 		ref = xc_gnttab_claim_grant_reference(&gref_head);
 		BUG_ON(ref == -ENOSPC);
 
 		shadow->req.gref[shadow->req.nr_segments] = ref;
 
 		xc_gnttab_grant_foreign_access_ref(ref,
-				vdev->xendev->otherend_id, mfns[i],
+				vdev->xendev->otherend_id, mfn,
 				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
 
-		shadow->frames[i] = mfn_to_pfn(mfns[i]);
+		shadow->frames[i] = mfn_to_pfn(mfn);
 		shadow->req.nr_segments++;
  	}
 
 	xc_gnttab_free_grant_references(gref_head);
-	kfree(mfns);
 
 	return 0;
 }
@@ -1187,16 +1163,16 @@ static int
 vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 			struct vusb_shadow *shadow,
 			void *addr, u32 size,
-			void *iso_addr, gfp_t mem_flags)
+			void *iso_addr)
 {
 	usbif_indirect_request_t *indirect_reqs =
 		(usbif_indirect_request_t*)shadow->indirect_reqs;
 	usbif_indirect_pages_t *indirect_pages = 
 		(usbif_indirect_pages_t*)shadow->indirect_pages;
-	u32 nr_mfns;
-	unsigned long *mfns;
-	unsigned long iso_mfn;
+	unsigned long mfn, iso_mfn;
+	u32 nr_mfns = SPAN_PAGES(addr, size);
 	grant_ref_t gref_head;
+	u8 *va = (u8*)((unsigned long)addr & PAGE_MASK);
 	u32 nr_total = nr_mfns + (iso_addr ? 1 : 0);
 	u32 ref;
 	int iso_frame = (iso_addr ? 1 : 0);
@@ -1205,24 +1181,13 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 	BUG_ON(!indirect_reqs);
 	BUG_ON(!indirect_pages);
 
-	mfns = vusb_alloc_mfn_array(addr, size, mem_flags, &nr_mfns);
-	if (!mfns) {
-		eprintk("%s out of memory\n", __FUNCTION__);
-		return -ENOMEM;
-	}
-
-	if (iso_addr)
-		iso_mfn = pfn_to_mfn(virt_to_phys(iso_addr) << PAGE_SHIFT);
-
 	shadow->req.nr_segments = 0;
 
 	/* Set up the descriptors for the indirect pages in the request. */
 	ret = vusb_allocate_grefs(vdev, shadow, indirect_reqs,
-			shadow->indirect_size, mem_flags, true);
-	if (ret) {
-		kfree(mfns);
+			shadow->indirect_size, true);
+	if (ret)
 		return ret; /* may just be EBUSY */
-	}
 
 	ret = xc_gnttab_alloc_grant_references(nr_total, &gref_head);
 	if (ret < 0) {
@@ -1239,6 +1204,8 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 	 * to the iso packet descriptor page.
 	 */
 	if (iso_addr) {
+		iso_mfn = pfn_to_mfn(virt_to_phys(iso_addr) << PAGE_SHIFT);
+
 		ref = xc_gnttab_claim_grant_reference(&gref_head);
 		BUG_ON(ref == -ENOSPC);
 
@@ -1253,17 +1220,19 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 		j++;
 	}
 
-	for ( ; i < nr_mfns; i++) {
+	for ( ; i < nr_mfns; i++, va += PAGE_SIZE) {
+		mfn = pfn_to_mfn(virt_to_phys(va) << PAGE_SHIFT);
+
 		ref = xc_gnttab_claim_grant_reference(&gref_head);
 		BUG_ON(ref == -ENOSPC);
 
 		indirect_reqs[j].gref[k] = ref;
 
 		xc_gnttab_grant_foreign_access_ref(ref,
-				vdev->xendev->otherend_id, mfns[i],
+				vdev->xendev->otherend_id, mfn,
 				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
 
-		indirect_pages->frames[i + iso_frame] = mfn_to_pfn(mfns[i]);
+		indirect_pages->frames[i + iso_frame] = mfn_to_pfn(mfn);
 		indirect_reqs[j].nr_segments++;
 		if (++k ==  USBIF_MAX_SEGMENTS_PER_IREQUEST) {
 			indirect_reqs[++j].nr_segments++;
@@ -1272,12 +1241,10 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
  	}
 
 	xc_gnttab_free_grant_references(gref_head);
-	kfree(mfns);
 	
 	return 0;
 
 cleanup:
-	kfree(mfns);
 	for (i = 0; i < shadow->req.nr_segments; i++)
 		xc_gnttab_end_foreign_access(shadow->req.gref[i], 0, 0UL);
 
@@ -1352,8 +1319,7 @@ vusb_put_internal_request(struct vusb_device *vdev, struct vusb_internal *vint)
 	shadow->req.flags = USBIF_F_SHORTOK;
 
 	/* Get some of them grefs */
-	ret = vusb_allocate_grefs(vdev, shadow, vint->page,
-				1, vint->mem_flags, false);
+	ret = vusb_allocate_grefs(vdev, shadow, vint->page, 1, false);
 	if (ret) {
 		/* Can't handle failures */
 		vusb_put_shadow(vdev, shadow);
