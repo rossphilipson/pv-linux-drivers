@@ -116,11 +116,7 @@
 #define iprintk(args...) printk(KERN_INFO "vusb: "args)
 
 /* How many ports on the root hub */
-#ifdef VUSB_DEBUG
-# define VUSB_PORTS	2
-#else
-# define VUSB_PORTS    USB_MAXCHILDREN
-#endif
+#define VUSB_PORTS    USB_MAXCHILDREN
 
 /* Command flag aliases for USB kernel URB states */
 #define VUSB_URB_DIRECTION_IN      0x0001
@@ -143,27 +139,6 @@ do {								\
 		break;						\
 	}							\
 } while (0)
-
-/* TODO RJP this stuff will go avay, it is v4v centric biz */
-/*
- * Convenient alias to declare an iovec
- * @packet: name of the packet
- * @nchunk: number of chunk (ex: 2 => header + data)
- */
-#define vusb_create_packet(name, nchunk) struct iovec name[(nchunk)]
-
-/* Convenient alias to set header/data */
-#define vusb_iov_set(packet, off, data, len)			\
-	do {							\
-		(packet)[(off)].iov_base = (data);		\
-		(packet)[(off)].iov_len = (len);		\
-	} while (0)
-
-#define vusb_set_packet_header(packet, header, hlen)		\
-	vusb_iov_set(packet, 0, header, hlen)
-
-#define vusb_set_packet_data(packet, data, dlen)		\
-	vusb_iov_set(packet, 1, data, dlen)
 
 /* Possible state of an urbp */
 enum vusb_urbp_state {
@@ -1670,66 +1645,6 @@ vusb_handle_urb_status(struct vusb_device *vdev, const void *packet)
 	vusb_urb_finish(vdev, handle, status, 0, NULL);
 }
 
-static void
-vusb_initialize_packet(struct vusb_device *vdev, void *packet,
-		u8 command, u32 hlen, u32 dlen)
-{
-	/* TODO kill me */
-}
-
-/*
- * Initialize an URB packet
- * @packet: packet to initialize (already allocated)
- * @command: what do we want?
- * @hlen: size of header
- * @has_data: if true, length will be the one of the transfer buffer
- */
-static void
-vusb_initialize_urb_packet(void *packet,
-		const struct vusb_urbp *urbp, struct vusb_device *vdev,
-		u8 command, u32 hlen, bool has_data)
-{
-	if (has_data) /* Outbound request */
-		vusb_initialize_packet(vdev, packet,
-				command, hlen, urbp->urb->transfer_buffer_length);
-	else
-		vusb_initialize_packet(vdev, packet,
-				command, hlen, 0);
-
-	/* STUB get logical handle: urbp->handle */
-}
-
-/*
- * Send an URB packet to the host
- * This function will setup the iov and add data if needed with the transfer
- * buffer
- * Doesn't fit for isochronous request
- */
-static int
-vusb_send_urb_packet(struct vusb_device *vdev, struct vusb_urbp *urbp, 
-		void *packet, u32 hlen, bool has_data)
-{
-	vusb_create_packet(iovec, 2);
-	int r = 0;
-
-	vusb_set_packet_header(iovec, packet, hlen);
-	if (has_data)
-		vusb_set_packet_data(iovec, urbp->urb->transfer_buffer,
-				urbp->urb->transfer_buffer_length);
-
-	/*r = vusb_send_packet(vdev, iovec, (has_data) ? 2 : 1);*/
-
-	if (r < 0) {
-		/* An error occured drop the URB and notify the USB stack */
-		urbp->state = VUSB_URBP_DROP;
-		urbp->urb->status = r;
-	} else
-		urbp->state = VUSB_URBP_SENT;
-
-	return r;
-}
-
-
 /* Not defined by hcd.h */
 #define InterfaceOutRequest 						\
 	((USB_DIR_OUT|USB_TYPE_STANDARD|USB_RECIP_INTERFACE) << 8)
@@ -1739,13 +1654,11 @@ static void
 vusb_send_control_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
 	struct urb *urb = urbp->urb;
-	void *packet;
 	u32 hlen;
 	const struct usb_ctrlrequest *ctrl;
 	u8 bRequestType, bRequest;
 	u16 typeReq, wValue, wIndex, wLength;
 	bool in;
-	bool has_data = 0;
 
 	/* Convenient aliases on setup packet*/
 	ctrl = (struct usb_ctrlrequest *)urb->setup_packet;
@@ -1768,7 +1681,8 @@ vusb_send_control_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	dprint_hex_dump(D_URB2, "SET: ", DUMP_PREFIX_OFFSET, 16, 1, ctrl, 8, true);
 
 	/* TODO RJP this probably doesn't make sense now. This was split out for
-	 * the ctxusb protocol. Not sure what it will look like for us.
+	 * the ctxusb protocol. Not sure what it will look like for us. We do want
+	 * the one that does not set the address though...
 	 */
 	switch (typeReq) {
 	case DeviceOutRequest | USB_REQ_SET_ADDRESS:
@@ -1781,156 +1695,56 @@ vusb_send_control_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 
 	case DeviceOutRequest | USB_REQ_SET_CONFIGURATION:
 		hlen = 0 /* STUB set configuration length */;
-		vusb_initialize_urb_packet(&packet, urbp, vdev,
-				0 /* STUB set configuration internal command */,
-				hlen, false);
 
 		/* STUB finish packet setup */
 		break;
 
 	case InterfaceOutRequest | USB_REQ_SET_INTERFACE:
 		hlen = 0 /* STUB select interface length */;
-		vusb_initialize_urb_packet(&packet, urbp, vdev,
-				0 /* STUB select interface  internal command */,
-				hlen, false);
 
 		/* STUB finish packet setup */
 		break;
 
 	default:
 		hlen = 0 /* STUB control length */;
-		vusb_initialize_urb_packet(&packet, urbp, vdev,
-				0 /* STUB control internal command */,
-				hlen, !in);
 
 		/* STUB finish packet setup */
 	}
 
-	vusb_send_urb_packet(vdev, urbp, &packet, hlen, has_data /* STUB may or may not have data in packet */);
+	/*vusb_send_urb_packet(vdev, urbp, &packet, hlen, has_data  STUB may or may not have data in packet );*/
 }
 
 /* Send an URB interrup command */
 static void
 vusb_send_interrupt_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
-	struct urb *urb = urbp->urb;
-	void *packet;
-
 	dprintk(D_URB2, "Send Interrupt URB Device: %u Endpoint: %u in: %u\n",
 		usb_pipedevice(urb->pipe),
 		usb_pipeendpoint(urb->pipe),
 		usb_urb_dir_in(urb));
-
-	vusb_initialize_urb_packet(&packet, urbp, vdev,
-			0 /* STUB interrupt internal command */,
-			0 /* STUB interrupt length */,
-			usb_urb_dir_out(urb));
-
-	/* STUB finish packet setup */
-
-	vusb_send_urb_packet(vdev, urbp, &packet,
-			0 /* STUB interrupt length */,
-			usb_urb_dir_out(urb));
+	/* TODO */
 }
 
 /* Send an URB bulk command */
 static void
 vusb_send_bulk_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
-	struct urb *urb = urbp->urb;
-	void *packet;
-
 	dprintk(D_URB2, "Send Bulk URB Device: %u Endpoint: %u in: %u\n",
 		usb_pipedevice(urb->pipe),
 		usb_pipeendpoint(urb->pipe),
 		usb_urb_dir_in(urb));
-
-	vusb_initialize_urb_packet(&packet, urbp, vdev,
-			0 /* STUB bulk internal command */,
-			0 /* STUB bulk length */,
-			usb_urb_dir_out(urb));
-
-	/* STUB finish packet setup */
-
-	vusb_send_urb_packet(vdev, urbp, &packet,
-			0 /* STUB bulk length */,
-			usb_urb_dir_out(urb));
+	/* TODO */
 }
 
 /* Send an isochronous urb command */
 static void
 vusb_send_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
-	struct urb *urb = urbp->urb;
-	void *packet;
-	vusb_create_packet(iovec, 3);
-	/* TODO: use typeof? */
-	u32 length[urb->number_of_packets]; /* avoid kmalloc */
-	int i = 0;
-	int r = 0;
-
 	dprintk(D_URB2, "Send Isochronous URB Device: %u Endpoint: %u in: %u\n",
-		usb_pipedevice(urb->pipe),
-		usb_pipeendpoint(urb->pipe),
-		usb_urb_dir_in(urb));
-
-	dprintk(D_URB2, "Number of packets = %u\n", urb->number_of_packets);
-
-	/* Use the common urb initialization packet but fix ByteCount */
-	vusb_initialize_urb_packet(&packet, urbp, vdev,
-			0 /* STUB isoch internal command */,
-			0 /* STUB isoch length */,
-			usb_urb_dir_out(urb));
-
-	/* STUB finish packet setup */
-
-	for (i = 0; i < urb->number_of_packets; i++)
-	{
-		dprintk(D_URB2, "packet %d offset = 0x%u length = 0x%u\n",
-			i, urb->iso_frame_desc[i].offset,
-			urb->iso_frame_desc[i].length);
-		length[i] = urb->iso_frame_desc[i].length;
-	}
-
-	vusb_iov_set(iovec, 0, &packet, 0 /* STUB isoch length */);
-	vusb_iov_set(iovec, 1, length, 0 /* STUB isoch packet length */
-			* urb->number_of_packets);
-	if (usb_urb_dir_out(urb))
-		vusb_iov_set(iovec, 2, urb->transfer_buffer,
-				urb->transfer_buffer_length);
-
-	/*r = vusb_send_packet(vdev, iovec, (usb_urb_dir_out(urb)) ? 3 : 2);*/
-
-	if (r < 0) {
-		/* An error occured drop the URB and notify the USB stack */
-		urbp->state = VUSB_URBP_DROP;
-		urbp->urb->status = r;
-	} else
-		urbp->state = VUSB_URBP_SENT;
-}
-
-/* Send a cancel URB command */
-static void
-vusb_send_cancel_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
-{
-	vusb_create_packet(iovec, 1);
-	void *packet;
-
-	/* TODO RJP this may be a special something that needs internal processing */
-	/* TODO and yes, this is an abort in vusb. This will get replaced with internal
-	 * requests. */
-	vusb_initialize_packet(vdev, &packet,
-			0 /* STUB cancel internal command */,
-			0 /* STUB cancel length */,
-			0);
-
-	/* STUB finish packet setup */
-
-	dprintk(D_URB1, "send packet URB_CANCEL device %u port %u handle 0x%04x\n",
-		vdev->device_id, vdev->port, urbp->handle);
-
-	vusb_set_packet_header(iovec, &packet, 0 /* STUB cancel length */);
-	/*vusb_send_packet(vdev, iovec, 1);*/
+                usb_pipedevice(urb->pipe),
+                usb_pipeendpoint(urb->pipe),
+                usb_urb_dir_in(urb));
+	/* TODO and yea, the original did something special to handle the iso descriptors too */
 }
 
 /* Send an URB */
@@ -1968,7 +1782,10 @@ vusb_send_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 			wprintk("Unknown urb type %x\n", type);
 		}
 	} else if (urbp->state == VUSB_URBP_CANCEL) {
-		vusb_send_cancel_urb(vdev, urbp);
+		/* TODO this might be an abort but more likely something that
+		 * needs to be added as a custom internal command. The abort is not
+		 * specific to one URB. Need usb_unlink_urb in the backend maybe.
+		vusb_send_cancel_urb(vdev, urbp);*/
 	}
 
 	if (urbp->state == VUSB_URBP_DONE ||
