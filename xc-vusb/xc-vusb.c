@@ -1356,9 +1356,11 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 
 		nr_ind_pages = INDIRECT_PAGES_REQUIRED(nr_mfns);
 		shadow->indirect_reqs_size = nr_ind_pages*PAGE_SIZE;
-		shadow->indirect_reqs = kmalloc(nr_ind_pages*PAGE_SIZE,
-						GFP_ATOMIC);
-		if (!shadow->indirect_reqs) {
+		shadow->indirect_reqs =
+			kmalloc(nr_ind_pages*PAGE_SIZE,	GFP_ATOMIC);
+		shadow->indirect_frames =
+			kmalloc(sizeof(usbif_indirect_frames_t), GFP_ATOMIC);
+		if (!shadow->indirect_reqs || !shadow->indirect_frames) {
 			eprintk("%s out of memory\n", __FUNCTION__);
 			ret = -ENOMEM;
 			goto err0;
@@ -1401,8 +1403,10 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	return 0;
 err1:
 	kfree(shadow->indirect_reqs);
+	kfree(shadow->indirect_frames);
 	shadow->indirect_reqs = NULL;
 	shadow->indirect_reqs_size = 0;
+	shadow->indirect_frames = NULL;
 
 err0:
 	vusb_put_shadow(vdev, shadow);
