@@ -74,6 +74,7 @@
 #define GRANT_INVALID_REF 0
 #define USB_RING_SIZE __CONST_RING_SIZE(usbif, PAGE_SIZE)
 #define SHADOW_ENTRIES USB_RING_SIZE
+#define INDIRECT_PAGES_REQUIRED(p) (((p - 1)/USBIF_MAX_SEGMENTS_PER_IREQUEST) + 1)
 
 #define D_VUSB1 (1 << 0)
 #define D_VUSB2 (1 << 1)
@@ -165,11 +166,11 @@ struct vusb_internal {
 	unsigned		is_cycle:1;
 };
 
-struct usbif_indirect_pages {
+struct usbif_indirect_frames {
 	/* Extra 1 for leading ISO descriptor frame if it exists */
 	unsigned long		frames[USBIF_MAX_SEGMENTS_PER_IREQUEST + 1];
 };
-typedef struct usbif_indirect_pages usbif_indirect_pages_t;
+typedef struct usbif_indirect_frames usbif_indirect_frames_t;
 
 struct vusb_shadow {
 	usbif_request_t		req;
@@ -177,8 +178,8 @@ struct vusb_shadow {
 	struct vusb_urbp	*urbp;
 	void			*iso_packet_descriptor;
 	void			*indirect_reqs;
-	u32			indirect_size;
-	void			*indirect_pages;
+	u32			indirect_reqs_size;
+	void			*indirect_frames;
     	unsigned		in_use:1;
 };
 
@@ -350,6 +351,23 @@ vusb_speed_to_port_stat(enum usb_device_speed speed)
 	case USB_SPEED_FULL:
 	default:
 		return 0;
+	}
+}
+
+static inline u16
+vusb_pipe_type_to_optype(u16 type)
+{
+	switch (type) {
+	case PIPE_ISOCHRONOUS:
+		return USBIF_T_ISOC;
+	case PIPE_INTERRUPT:
+		return USBIF_T_INT;
+	case PIPE_CONTROL:
+		return USBIF_T_CNTRL;
+	case PIPE_BULK:
+		return USBIF_T_BULK;
+	default:
+		return 0xffff;
 	}
 }
 
@@ -1040,9 +1058,9 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 		}
 		kfree(shadow->indirect_reqs);
 		shadow->indirect_reqs = NULL;
-		kfree(shadow->indirect_pages);
-		shadow->indirect_pages = NULL;
-		shadow->indirect_size = 0;
+		kfree(shadow->indirect_frames);
+		shadow->indirect_frames = NULL;
+		shadow->indirect_reqs_size = 0;
 	}
 
 	for (i = 0; i < shadow->req.nr_segments; i++)
@@ -1130,8 +1148,8 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 {
 	usbif_indirect_request_t *indirect_reqs =
 		(usbif_indirect_request_t*)shadow->indirect_reqs;
-	usbif_indirect_pages_t *indirect_pages = 
-		(usbif_indirect_pages_t*)shadow->indirect_pages;
+	usbif_indirect_frames_t *indirect_frames = 
+		(usbif_indirect_frames_t*)shadow->indirect_frames;
 	unsigned long mfn, iso_mfn;
 	u32 nr_mfns = SPAN_PAGES(addr, size);
 	grant_ref_t gref_head;
@@ -1142,13 +1160,13 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 	int ret, i = 0, j = 0, k = 0;
 
 	BUG_ON(!indirect_reqs);
-	BUG_ON(!indirect_pages);
+	BUG_ON(!indirect_frames);
 
 	shadow->req.nr_segments = 0;
 
 	/* Set up the descriptors for the indirect pages in the request. */
 	ret = vusb_allocate_grefs(vdev, shadow, indirect_reqs,
-			shadow->indirect_size, true);
+			shadow->indirect_reqs_size, true);
 	if (ret)
 		return ret; /* may just be EBUSY */
 
@@ -1178,7 +1196,7 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 				vdev->xendev->otherend_id, iso_mfn,
 				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
 
-		indirect_pages->frames[0] = mfn_to_pfn(iso_mfn);
+		indirect_frames->frames[0] = mfn_to_pfn(iso_mfn);
 		indirect_reqs[0].nr_segments++;
 		j++;
 	}
@@ -1195,7 +1213,7 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 				vdev->xendev->otherend_id, mfn,
 				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
 
-		indirect_pages->frames[i + iso_frame] = mfn_to_pfn(mfn);
+		indirect_frames->frames[i + iso_frame] = mfn_to_pfn(mfn);
 		indirect_reqs[j].nr_segments++;
 		if (++k ==  USBIF_MAX_SEGMENTS_PER_IREQUEST) {
 			indirect_reqs[++j].nr_segments++;
@@ -1299,7 +1317,7 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
 	struct vusb_shadow *shadow;
 	struct urb *urb = urbp->urb;
-	u32 nr_mfns = 0;
+	u32 nr_mfns = 0, nr_ind_pages;
 	int ret = 0;
 
 	BUG_ON(!urb);
@@ -1323,25 +1341,70 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	if (nr_mfns > USBIF_MAX_SEGMENTS_PER_REQUEST) {
 		/* Need indirect support here, only used with bulk transfers */
 		if (!usb_pipebulk(urb->pipe)) {
-			wprintk("%p(%s) too many segments for non-bulk transfer: %d\n",
+			eprintk("%p(%s) too many segments for non-bulk transfer: %d\n",
 				vdev, vdev->xendev->nodename, nr_mfns);
 			ret = -E2BIG;
-			goto err;
+			goto err0;
 		}
 
 		if (nr_mfns > USBIF_MAX_SEGMENTS_PER_IREQUEST) {
-			wprintk("%p(%s) too many segments for any transfer: %d\n",
+			eprintk("%p(%s) too many segments for any transfer: %d\n",
 				vdev, vdev->xendev->nodename, nr_mfns);
 			ret = -E2BIG;
-			goto err;
+			goto err0;
+		}
+
+		nr_ind_pages = INDIRECT_PAGES_REQUIRED(nr_mfns);
+		shadow->indirect_reqs_size = nr_ind_pages*PAGE_SIZE;
+		shadow->indirect_reqs = kmalloc(nr_ind_pages*PAGE_SIZE,
+						GFP_ATOMIC);
+		if (!shadow->indirect_reqs) {
+			eprintk("%s out of memory\n", __FUNCTION__);
+			ret = -ENOMEM;
+			goto err0;
+		}
+
+		ret = vusb_allocate_indirect_grefs(vdev, shadow,
+						urb->transfer_buffer,
+						urb->transfer_buffer_length,
+						NULL);
+		if (ret) {
+			eprintk("%s failed to alloc indirect grefs\n", __FUNCTION__);
+			goto err1;
+		}
+		shadow->req.flags |= USBIF_F_INDIRECT;
+		
+	}
+	else if (nr_mfns > 0) {
+		ret = vusb_allocate_grefs(vdev, shadow,
+					urb->transfer_buffer,
+					urb->transfer_buffer_length,
+					true);
+		if (ret) {
+			eprintk("%s failed to alloc grefs\n", __FUNCTION__);
+			goto err1;
 		}
 	}
 
-	/* TODO may not have data so no grefs, check transfer_buffer_length */
-	/* TODO may not have setup, check urb type */
+	/* Setup the request for the ring */
+	shadow->req.type = vusb_pipe_type_to_optype(usb_pipetype(urb->pipe));
+	shadow->req.endpoint = usb_pipeendpoint(urb->pipe);
+	shadow->req.offset = BYTE_OFFSET(urb->transfer_buffer);
+	shadow->req.length = urb->transfer_buffer_length;
+	shadow->req.nr_packets = 0;
+	shadow->req.startframe = 0;
+	if (usb_pipecontrol(urb->pipe) && urb->setup_packet)
+		memcpy(&shadow->req.setup, urb->setup_packet, 8);
+
+	vusb_put_ring(vdev, shadow);
 
 	return 0;
-err:
+err1:
+	kfree(shadow->indirect_reqs);
+	shadow->indirect_reqs = NULL;
+	shadow->indirect_reqs_size = 0;
+
+err0:
 	vusb_put_shadow(vdev, shadow);
 	return ret;
 }
