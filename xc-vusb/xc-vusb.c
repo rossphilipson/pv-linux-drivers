@@ -22,12 +22,11 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-/***
- *** TODO
- *** - Add branch prediction
- *** - Devices are not kept accross suspend/hibernate (vusb daemon issue)
- *** - Reorganize the code
- ***/
+/* TODO
+ * Modify to use a new HCD interface
+ * Use DMA buffers
+ * Add branch prediction
+ */
 
 #include <linux/mm.h>
 #include <linux/version.h>
@@ -70,7 +69,7 @@
 #define VUSB_DRIVER_DESC		"OpenXT Virtual USB Host Controller"
 #define VUSB_DRIVER_VERSION		"1.0.0"
 
-#define POWER_BUDGET	5000 /* mA */
+#define POWER_BUDGET		5000 /* mA */
 
 #define GRANT_INVALID_REF 0
 #define USB_RING_SIZE __CONST_RING_SIZE(usbif, PAGE_SIZE)
@@ -117,11 +116,6 @@
 
 /* How many ports on the root hub */
 #define VUSB_PORTS    USB_MAXCHILDREN
-
-/* Command flag aliases for USB kernel URB states */
-#define VUSB_URB_DIRECTION_IN      0x0001
-#define VUSB_URB_SHORT_OK          0x0002
-#define VUSB_URB_ISO_TRANSFER_ASAP 0x0004
 
 #if ( LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0) )
 # define USBFRONT_IRQF 0
@@ -1132,8 +1126,7 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 static int
 vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 			struct vusb_shadow *shadow,
-			void *addr, u32 size,
-			void *iso_addr)
+			void *addr, u32 size, void *iso_addr)
 {
 	usbif_indirect_request_t *indirect_reqs =
 		(usbif_indirect_request_t*)shadow->indirect_reqs;
@@ -1305,6 +1298,11 @@ static int
 vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
 	struct vusb_shadow *shadow;
+	struct urb *urb = urbp->urb;
+	u32 nr_mfns = 0;
+	int ret = 0;
+
+	BUG_ON(!urb);
 
 	/* Leave room for resets on ring */
 	if (vdev->shadow_free <= 1)
@@ -1313,32 +1311,43 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	shadow = vusb_get_shadow(vdev);
 	BUG_ON(!shadow);
 
-	if (!(urbp->urb->transfer_flags & URB_SHORT_NOT_OK))
+	if (!(urb->transfer_flags & URB_SHORT_NOT_OK) && usb_urb_dir_out(urb))
 		shadow->req.flags = USBIF_F_SHORTOK;
 
+	/* Is there any data to transfer, e.g. a control transaction may
+	 * just be the setup packet. */
+	if (urb->transfer_buffer_length > 0)
+		nr_mfns = SPAN_PAGES(urb->transfer_buffer,
+				urb->transfer_buffer_length);
+
+	if (nr_mfns > USBIF_MAX_SEGMENTS_PER_REQUEST) {
+		/* Need indirect support here, only used with bulk transfers */
+		if (!usb_pipebulk(urb->pipe)) {
+			wprintk("%p(%s) too many segments for non-bulk transfer: %d\n",
+				vdev, vdev->xendev->nodename, nr_mfns);
+			ret = -E2BIG;
+			goto err;
+		}
+
+		if (nr_mfns > USBIF_MAX_SEGMENTS_PER_IREQUEST) {
+			wprintk("%p(%s) too many segments for any transfer: %d\n",
+				vdev, vdev->xendev->nodename, nr_mfns);
+			ret = -E2BIG;
+			goto err;
+		}
+	}
+
+	/* TODO may not have data so no grefs, check transfer_buffer_length */
+	/* TODO may not have setup, check urb type */
+
 	return 0;
+err:
+	vusb_put_shadow(vdev, shadow);
+	return ret;
 }
 
 /****************************************************************************/
 /* URB Processing                                                           */
-
-/* Convert URB transfer flags to VUSB flags */
-static inline u16
-vusb_urb_to_flags(struct urb *urb)
-{
-	u16 flags = 0;
-
-	if (usb_urb_dir_in(urb))
-		flags |= VUSB_URB_DIRECTION_IN;
-
-	if (!(urb->transfer_flags & URB_SHORT_NOT_OK))
-		flags |= VUSB_URB_SHORT_OK;
-
-	if (urb->transfer_flags & URB_ISO_ASAP)
-		flags |= VUSB_URB_ISO_TRANSFER_ASAP;
-
-	return flags;
-}
 
 /* Retrieve endpoint from URB */
 static inline u8
@@ -2193,20 +2202,24 @@ vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 		if (vhcd->vdev_ports[i].device_id == id) {
 			wprintk("Device id 0x%04x already exists on port %d\n",
 			       id, vhcd->vdev_ports[i].port);
-			ret = -EEXIST;
-			goto out;
+			spin_unlock_irqrestore(&vhcd->lock, flags);
+			return -EEXIST;
 		}
 	}
 
 	if (i >= VUSB_PORTS) {
 		wprintk("Attempt to add a device but no free ports on the root hub.\n");
-		ret = -ENOMEM;
-		goto out;
+		spin_unlock_irqrestore(&vhcd->lock, flags);
+		return -ENOMEM;
 	}
 
 	vdev = &vhcd->vdev_ports[i];
 	vdev->device_id = id;
 	vdev->connecting = 1;
+	/* End of state protected by the vHCD lock, the reset can finish
+	 * without a lock since the device is not in use yet */
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+
 	vdev->vhcd = vhcd;
 	vdev->xendev = dev;
 	INIT_LIST_HEAD(&vdev->pending_list);
@@ -2217,16 +2230,13 @@ vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 	dev_set_drvdata(&dev->dev, vdev);
 	
 	/* Setup the rings, event channel and xenstore. Internal failures cleanup
-	 * the usbif bits. Wipe the new VUSB dev and bail out.
-	 */
+	 * the usbif bits. Wipe the new VUSB dev and bail out. */
 	ret = vusb_talk_to_usbback(vdev);
 	if (ret) {
 		printk(KERN_ERR "Failed to initialize the device - id: %d\n", id);
 		vusb_device_clear(vdev);
 	}
 
-out:
-	spin_unlock_irqrestore(&vhcd->lock, flags);
 	return ret;
 }
 
