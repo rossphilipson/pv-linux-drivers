@@ -122,11 +122,6 @@
 # define VUSB_PORTS    USB_MAXCHILDREN
 #endif
 
-/* TODO these will go away, use USBIF_RSP_USB_* codes.
- *Status codes */
-#define VUSB_URB_STATUS_SUCCESS            0x00000000
-#define VUSB_URB_STATUS_FAILURE            0xFFFFFFFF
-
 /* Command flag aliases for USB kernel URB states */
 #define VUSB_URB_DIRECTION_IN      0x0001
 #define VUSB_URB_SHORT_OK          0x0002
@@ -1555,49 +1550,47 @@ vusb_urb_interrupt_finish(struct vusb_device *vdev, struct vusb_urbp *urbp, u32 
 static int
 vusb_urb_status_to_errno(u32 status)
 {
-	int32_t st = status;
-
-	/* TODO this will be changed to map USBIF_RSP_USB_* to errnos
-	 * sort of like the Windows version MapUsbifToUsbdStatus
-	 */
 	switch (status) {
-	case VUSB_URB_STATUS_SUCCESS:
+	case USBIF_RSP_OKAY:
 		return 0;
-	/* STUB probably want others */
-	case VUSB_URB_STATUS_FAILURE:
+	case USBIF_RSP_EOPNOTSUPP:
+		return -ENOENT;
+	case USBIF_RSP_USB_CANCELED:
+		return -ECANCELED;
+	case USBIF_RSP_USB_PENDING:
+		return -EINPROGRESS;
+	case USBIF_RSP_USB_PROTO:
+		return -EPROTO;
+	case USBIF_RSP_USB_CRC:
+		return -EILSEQ;
+	case USBIF_RSP_USB_TIMEOUT:
+		return -ETIME;
+	case USBIF_RSP_USB_STALLED:
+		return -EPIPE;
+	case USBIF_RSP_USB_INBUFF:
+		return -ECOMM;
+	case USBIF_RSP_USB_OUTBUFF:
+		return -ENOSR;
+	case USBIF_RSP_USB_OVERFLOW:
+		return -EOVERFLOW;
+	case USBIF_RSP_USB_SHORTPKT:
+		return -EREMOTEIO;
+	case USBIF_RSP_USB_DEVRMVD:
+		return -ENODEV;
+	case USBIF_RSP_USB_PARTIAL:
+		return -EXDEV;
+	case USBIF_RSP_USB_INVALID:
+		return -EINVAL;
+	case USBIF_RSP_USB_RESET:
+		return -ECONNRESET;
+	case USBIF_RSP_USB_SHUTDOWN:
+		return -ESHUTDOWN;
+	case USBIF_RSP_ERROR:
+	case USBIF_RSP_USB_UNKNOWN:
+	default:
 		return -EIO;
-	default:
-		if (st < 0) /* Already an errno */
-			return st;
-		else
-			return -EIO;
 	}
 }
-
-#ifdef VUSB_DEBUG
-/* Convert status to a string */
-static const char*
-vusb_status_to_string(u32 status)
-{
-	int32_t st = status;
-
-	/* TODO this will be changed to use USBIF_RSP_USB_* if
-	 * it evens sticks around.
-	 */
-	switch (status) {
-	case VUSB_URB_STATUS_SUCCESS:
-		return "SUCCESS";
-	/* STUB probably want others */
-	case VUSB_URB_STATUS_FAILURE:
-		return "FAILURE";
-	default:
-		if (st < 0) /* Already an errno */
-			return "ERRNO";
-		else
-			return "UNKNOWN";
-	}
-}
-#endif /* VUSB_DEBUG */
 
 /*
  * Finish an URB request
