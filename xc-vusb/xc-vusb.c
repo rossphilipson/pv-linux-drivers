@@ -140,8 +140,8 @@ enum vusb_urbp_state {
 	VUSB_URBP_NEW,
 	VUSB_URBP_SENT,
 	VUSB_URBP_DONE,
-	VUSB_URBP_DROP, /* Only here for debug purpose, it's same as done */
-	VUSB_URBP_CANCEL,
+	VUSB_URBP_DROP, /* when an error occurs and unsent */
+	VUSB_URBP_CANCEL
 };
 
 /* URB tracking structure */
@@ -422,7 +422,7 @@ vusb_port_reset(struct vusb_vhcd *vhcd, struct vusb_device *vdev)
 
 	vdev->reset = 1;
 
-	/* Schedule it, can do it here in the VHCD lock */
+	/* Schedule it, can't do it here in the vHCD lock */
 	schedule_work(&vdev->work);
 }
 
@@ -523,8 +523,7 @@ vusb_urbp_dump(struct vusb_urbp *urbp)
 		urbp->handle, vusb_state_to_string(urbp),
 		urb->status, vusb_pipe_to_string(urb), type);
 	iprintk("Device: %u Endpoint: %u In: %u\n",
-		usb_pipedevice(urb->pipe),
-		usb_pipeendpoint(urb->pipe),
+		usb_pipedevice(urb->pipe), usb_pipeendpoint(urb->pipe),
 		usb_urb_dir_in(urb));
 }
 #endif /* VUSB_DEBUG */
@@ -533,8 +532,7 @@ static void
 vusb_urbp_queue_release(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
 	/* Remove from the active urbp list and place it on the release list.
-	 * This is called from the urb processing routines holding the vdev lock.
-	 */
+	 * Called from the urb processing routines holding the vdev lock. */
 	list_del(&urbp->urbp_list);
 
 	list_add_tail(&urbp->urbp_list, &vdev->release_list);
@@ -728,8 +726,7 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 
 	/* If it can't be processed, the urbp and urb will be released
 	 * in the device teardown code which is where this device is going
-	 * (or gone).
-	 */
+	 * (or gone). */
 	vdev = vusb_device_by_port(vhcd, urb->dev->portnum);
 	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
 		eprintk("Dequeue start processing called while device(s) in invalid states\n");
@@ -1046,8 +1043,7 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 	}
 
 	/* N.B. it turns out he readonly param to gnttab_end_foreign_access is,
-	 * unused, that is why we don't have to track it and use it here.
-	 */
+	 * unused, that is why we don't have to track it and use it here. */
 	if (shadow->indirect_reqs) {
 		ireq = (usbif_indirect_request_t*)shadow->indirect_reqs;
 
@@ -1107,8 +1103,7 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 	/* NOTE: we are following the blkback model where we are not
 	 * freeing the pages on gnttab_end_foreign_access so we don't
 	 * have to track them. That memory belongs to the USB core
-	 * in most cases or is the internal request page.
-	 */
+	 * in most cases or is the internal request page. */
 
 	ret = xc_gnttab_alloc_grant_references(nr_mfns, &gref_head);
 	if (ret < 0) {
@@ -1182,8 +1177,7 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 
 	/* Set up the descriptor for the iso packets - it is the first page of
 	 * the first indirect page. The first gref of the first page points
-	 * to the iso packet descriptor page.
-	 */
+	 * to the iso packet descriptor page. */
 	if (iso_addr) {
 		iso_mfn = pfn_to_mfn(virt_to_phys(iso_addr) << PAGE_SHIFT);
 
@@ -1324,7 +1318,7 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 
 	/* Leave room for resets on ring */
 	if (vdev->shadow_free <= 1)
-		return -ENOMEM;
+		return -EAGAIN;
 
 	shadow = vusb_get_shadow(vdev);
 	BUG_ON(!shadow);
@@ -1384,7 +1378,7 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 					true);
 		if (ret) {
 			eprintk("%s failed to alloc grefs\n", __FUNCTION__);
-			goto err1;
+			goto err0;
 		}
 	}
 
@@ -1486,10 +1480,8 @@ vusb_urb_common_finish(struct vusb_device *vdev, struct vusb_urbp *urbp, bool in
 	} else { /* Inbound */
 		dprintk(D_URB2, "Incoming URB completed status %d len %u\n",
 			urb->status, len);
-		/*
-		 * Sanity check on len, should be less or equal to
-		 * the length of the transfer buffer
-		 */
+		/* Sanity check on len, should be less or equal to
+		 * the length of the transfer buffer */
 		if (len > urb->transfer_buffer_length) {
 			wprintk("Length mismatch for incoming URB"
 				" (wanted %u bug got %u)\n",
@@ -1721,19 +1713,31 @@ vusb_handle_urb_status(struct vusb_device *vdev, const void *packet)
 	vusb_urb_finish(vdev, handle, status, 0, NULL);
 }
 
+static void
+vusb_send(struct vusb_device *vdev, struct vusb_urbp *urbp)
+{
+	int ret = vusb_put_urb(vdev, urbp);
+	if (!ret)
+		urbp->state = VUSB_URBP_SENT;
+	else if (ret == -EAGAIN)
+		schedule_work(&vdev->work);
+	else {
+		urbp->state = VUSB_URBP_DROP;
+		urbp->urb->status = ret;
+	}
+}
+
 /* Not defined by hcd.h */
 #define InterfaceOutRequest 						\
 	((USB_DIR_OUT|USB_TYPE_STANDARD|USB_RECIP_INTERFACE) << 8)
 
-/* Send an urb control to the host */
 static void
 vusb_send_control_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
 	struct urb *urb = urbp->urb;
-	u32 hlen;
 	const struct usb_ctrlrequest *ctrl;
 	u8 bRequestType, bRequest;
-	u16 typeReq, wValue, wIndex, wLength;
+	u16 typeReq, wValue;
 	bool in;
 
 	/* Convenient aliases on setup packet*/
@@ -1741,8 +1745,6 @@ vusb_send_control_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	bRequestType = ctrl->bRequestType;
 	bRequest = ctrl->bRequest;
 	wValue = le16_to_cpu(ctrl->wValue);
-	wIndex = le16_to_cpu(ctrl->wIndex);
-	wLength = le16_to_cpu(ctrl->wLength);
 
 	typeReq = (bRequestType << 8) | bRequest;
 	in = (bRequestType & USB_DIR_IN) != 0;
@@ -1756,63 +1758,19 @@ vusb_send_control_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	dprintk(D_URB2, "Setup packet, tb_len=%d\n", urb->transfer_buffer_length);
 	dprint_hex_dump(D_URB2, "SET: ", DUMP_PREFIX_OFFSET, 16, 1, ctrl, 8, true);
 
-	/* TODO RJP this probably doesn't make sense now. This was split out for
-	 * the ctxusb protocol. Not sure what it will look like for us. We do want
-	 * the one that does not set the address though...
-	 */
-	switch (typeReq) {
-	case DeviceOutRequest | USB_REQ_SET_ADDRESS:
-		/* Don't forward set address command, directly return */
+	/* The only special case it a set address request. We can't actually
+	 * let the guest do this in the backend - it would cause chaos and mayhem */
+	if (typeReq == (DeviceOutRequest | USB_REQ_SET_ADDRESS)) {
 		vdev->address = wValue;
 		dprintk(D_URB2, "SET ADDRESS %u\n", vdev->address);
 		urb->status = 0;
 		urbp->state = VUSB_URBP_DONE;
 		return;
-
-	case DeviceOutRequest | USB_REQ_SET_CONFIGURATION:
-		hlen = 0 /* STUB set configuration length */;
-
-		/* STUB finish packet setup */
-		break;
-
-	case InterfaceOutRequest | USB_REQ_SET_INTERFACE:
-		hlen = 0 /* STUB select interface length */;
-
-		/* STUB finish packet setup */
-		break;
-
-	default:
-		hlen = 0 /* STUB control length */;
-
-		/* STUB finish packet setup */
 	}
 
-	/*vusb_send_urb_packet(vdev, urbp, &packet, hlen, has_data  STUB may or may not have data in packet );*/
+	vusb_send(vdev, urbp);
 }
 
-/* Send an URB interrup command */
-static void
-vusb_send_interrupt_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
-{
-	dprintk(D_URB2, "Send Interrupt URB Device: %u Endpoint: %u in: %u\n",
-		usb_pipedevice(urb->pipe),
-		usb_pipeendpoint(urb->pipe),
-		usb_urb_dir_in(urb));
-	/* TODO */
-}
-
-/* Send an URB bulk command */
-static void
-vusb_send_bulk_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
-{
-	dprintk(D_URB2, "Send Bulk URB Device: %u Endpoint: %u in: %u\n",
-		usb_pipedevice(urb->pipe),
-		usb_pipeendpoint(urb->pipe),
-		usb_urb_dir_in(urb));
-	/* TODO */
-}
-
-/* Send an isochronous urb command */
 static void
 vusb_send_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
@@ -1823,7 +1781,6 @@ vusb_send_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	/* TODO and yea, the original did something special to handle the iso descriptors too */
 }
 
-/* Send an URB */
 static void
 vusb_send_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
@@ -1832,30 +1789,27 @@ vusb_send_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 
 	type = usb_pipetype(urb->pipe);
 
-	dprintk(D_URB2, "urb handle: 0x%x status: %s pipe: %s(%u)\n",
+	dprintk(D_URB2, "urbp handle: 0x%x state: %s pipe: %s(t:%u e:%u d:%u)\n",
 		urbp->handle, vusb_state_to_string(urbp),
-		vusb_pipe_to_string(urb), type);
+		vusb_pipe_to_string(urb), type, usb_pipeendpoint(urb->pipe),
+                usb_urb_dir_in(urb));
 
 	if (urbp->state == VUSB_URBP_NEW) {
 		switch (type) {
 		case PIPE_ISOCHRONOUS:
 			vusb_send_isochronous_urb(vdev, urbp);
 			break;
-
-		case PIPE_INTERRUPT:
-			vusb_send_interrupt_urb(vdev, urbp);
-			break;
-
 		case PIPE_CONTROL:
 			vusb_send_control_urb(vdev, urbp);
 			break;
-
+		case PIPE_INTERRUPT:
 		case PIPE_BULK:
-			vusb_send_bulk_urb(vdev, urbp);
+			vusb_send(vdev, urbp);
 			break;
-
 		default:
 			wprintk("Unknown urb type %x\n", type);
+			urbp->state = VUSB_URBP_DROP;
+			urb->status = -ENODEV;
 		}
 	} else if (urbp->state == VUSB_URBP_CANCEL) {
 		/* TODO this might be an abort but more likely something that
@@ -1971,8 +1925,7 @@ vusb_check_reset_device(struct vusb_device *vdev)
 	}
 
 	/* Not waiting for the reset, the page will be cleaned up during
-	 * response processing.
-	 */
+	 * response processing. */
 
 	spin_lock_irqsave(&vdev->vhcd->lock, flags);
 	/* Signal reset completion */
