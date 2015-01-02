@@ -152,6 +152,7 @@ struct vusb_urbp {
 	struct list_head	urbp_list;
 	int                     port;
 	gfp_t			mem_flags;
+	usbif_response_t	rsp;
 };
 
 /* Internal request structure */
@@ -216,12 +217,13 @@ struct vusb_device {
 	u16				*shadow_free_list;
 	u16				shadow_free;
 
-	/* This VUSB device's list of pending URBs */
-	struct list_head        	pending_list;
-	struct list_head        	release_list;
+	/* This VUSB device's lists of pending URB work */
+	struct list_head		request_list;
+	struct list_head		release_list;
+	struct list_head		response_list;
 
 	struct work_struct 		work;
-
+	struct tasklet_struct		tasklet;
 	wait_queue_head_t		wait_queue;
 
 	enum usb_device_speed		speed;
@@ -258,7 +260,9 @@ vusb_start_processing(struct vusb_device *vdev);
 static void
 vusb_stop_processing(struct vusb_device *vdev);
 static void
-vusb_restart_processing(struct work_struct *work);
+vusb_work_handler(struct work_struct *work);
+static void
+vusb_bh_handler(unsigned long data);
 static void
 vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp);
 
@@ -589,7 +593,9 @@ vusb_init_hcd(struct vusb_vhcd *vhcd)
 		vhcd->vdev_ports[i].processing = 0;
 		vhcd->vdev_ports[i].closing = 0;
 		spin_lock_init(&vhcd->vdev_ports[i].lock);
-		INIT_WORK(&vhcd->vdev_ports[i].work, vusb_restart_processing);
+		INIT_WORK(&vhcd->vdev_ports[i].work, vusb_work_handler);
+		tasklet_init(&vhcd->vdev_ports[i].tasklet, vusb_bh_handler,
+			(unsigned long)(&vhcd->vdev_ports[i]));
 	}
 
 	vhcd->state = VUSB_INACTIVE;
@@ -746,7 +752,7 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 	spin_lock_irqsave(&vdev->lock, flags);
 
 	/* Retrieve URBp */
-	list_for_each_entry(urbp, &vdev->pending_list, urbp_list) {
+	list_for_each_entry(urbp, &vdev->request_list, urbp_list) {
 		if (urbp->urb == urb)
 			break;
 	}
@@ -1079,7 +1085,7 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 }
 
 static void
-vusb_restart_processing_callback(void *arg)
+vusb_work_handler_callback(void *arg)
 {
 	struct vusb_device *vdev = (struct vusb_device*)arg;
 	schedule_work(&vdev->work);
@@ -1110,7 +1116,7 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 		if (!restart)
 			return ret;
 		xc_gnttab_request_free_callback(&vdev->callback,
-			vusb_restart_processing_callback,
+			vusb_work_handler_callback,
 			vdev, nr_mfns);
 		return -EBUSY;
 	}
@@ -1168,7 +1174,7 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 	ret = xc_gnttab_alloc_grant_references(nr_total, &gref_head);
 	if (ret < 0) {
 		xc_gnttab_request_free_callback(&vdev->callback,
-			vusb_restart_processing_callback,
+			vusb_work_handler_callback,
 			vdev, nr_total);
 		/* Clean up what we did above */
 		ret = -EBUSY;
@@ -1430,7 +1436,7 @@ vusb_urbp_list_dump(const struct vusb_device *vdev, const char *fn)
 	const struct vusb_urbp *urbp;
 
 	dprintk(D_URB2, "===== Current URB List in %s =====\n", fn);
-	list_for_each_entry(urbp, &vdev->pending_list, urbp_list) {
+	list_for_each_entry(urbp, &vdev->request_list, urbp_list) {
 		dprintk(D_URB1, "URB handle 0x%x port %u device %u\n",
 			urbp->handle, urbp->port, vdev->device_id);
 	}
@@ -1438,12 +1444,14 @@ vusb_urbp_list_dump(const struct vusb_device *vdev, const char *fn)
 }
 
 /* Retrieve a URB by handle */
+/* TODO handle stuff is gone I think */
 static struct vusb_urbp*
 vusb_urb_by_handle(struct vusb_device *vdev, u16 handle)
 {
 	struct vusb_urbp *urbp;
 
-	list_for_each_entry(urbp, &vdev->pending_list, urbp_list) {
+	/* TODO if this was used, it would have to get the urbps off the response_list */
+	list_for_each_entry(urbp, &vdev->request_list, urbp_list) {
 		if (urbp->handle == handle)
 			return urbp;
 	}
@@ -1639,6 +1647,7 @@ vusb_urb_status_to_errno(u32 status)
  * Finish an URB request
  * @packet: used by isochronous URB because we need the header FIXME
  */
+/* TODO all this handle business will go away I think */
 static void
 vusb_urb_finish(struct vusb_device *vdev, u16 handle,
 		u32 status, u32 len, const u8 *data)
@@ -1840,7 +1849,7 @@ vusb_start_processing(struct vusb_device *vdev)
 	spin_lock_irqsave(&vhcd->lock, flags);
 
 	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
-		eprintk("Start processing called while device(s) in invalid statesi\n");
+		eprintk("Start processing called while device(s) in invalid states\n");
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		return false;
 	}
@@ -1974,11 +1983,11 @@ vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp)
 
 	/* New URB, queue it at the back */
 	if (urbp)
-		list_add_tail(&urbp->urbp_list, &vdev->pending_list);
+		list_add_tail(&urbp->urbp_list, &vdev->request_list);
 
 	/* Drive request processing */
-	list_for_each_entry_safe(pos, next, &vdev->pending_list, urbp_list) {
-		/* TODO RJP fix to schedule work if we cannot drain the queue */
+	list_for_each_entry_safe(pos, next, &vdev->request_list, urbp_list) {
+		/* Work scheduled if 1 or more URBs cannot be sent */
 		vusb_send_urb(vdev, pos);
 	}
 
@@ -1994,17 +2003,28 @@ vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp)
 }
 
 static void
-vusb_restart_processing(struct work_struct *work)
+vusb_work_handler(struct work_struct *work)
 {
 	struct vusb_device *vdev = container_of(work, struct vusb_device, work);
 
 	if (!vusb_start_processing(vdev))
 		return;
 
-	/* TODO RJP Start response processing again */
+	/* TODO for now keep request and response processing segregated */
 
 	/* Start request processing again */
 	vusb_process_requests(vdev, NULL);
+
+	vusb_stop_processing(vdev);
+}
+
+static void
+vusb_bh_handler(unsigned long data)
+{
+	struct vusb_device *vdev = (struct vusb_device*)data;
+
+	if (!vusb_start_processing(vdev))
+		return;
 
 	vusb_stop_processing(vdev);
 }
@@ -2013,15 +2033,52 @@ static irqreturn_t
 vusb_interrupt(int irq, void *dev_id)
 {
 	struct vusb_device *vdev = (struct vusb_device*)dev_id;
+	struct vusb_shadow *shadow;
+	usbif_response_t *rsp;
+	RING_IDX i, rp;
 	unsigned long flags;
+	int more;
 
+	/* Shutting down or not ready? */
 	if (!vusb_start_processing(vdev))
 		return IRQ_HANDLED;
 
-	/* TODO RJP */
-	/* TODO process the results from internal requests in here, like setting speed */
 	spin_lock_irqsave(&vdev->lock, flags);
+	/* TODO process the results from internal requests in here, like setting speed */
+
+again:
+
+	rp = vdev->ring.sring->rsp_prod;
+	rmb(); /* Ensure we see queued responses up to 'rp'. */
+
+	for (i = vdev->ring.rsp_cons; i != rp; i++) {
+		rsp = RING_GET_RESPONSE(&vdev->ring, i);
+
+		/* Find the shadow block that goes with this req/rsp */
+		shadow = &vdev->shadows[rsp->id];
+		BUG_ON(shadow->in_use);
+
+		/* Make a copy of the response (it is small) and queue for bh */
+		memcpy(&shadow->urbp->rsp, rsp, sizeof(usbif_response_t));
+		list_add_tail(&shadow->urbp->urbp_list, &vdev->response_list);
+
+		/* Not going to free the shadow here - that could be a lot of work;
+		 * dropping it on the BH to take off */
+	}
+
+	vdev->ring.rsp_cons = i;
+
+	if (i != vdev->ring.req_prod_pvt) {
+		more = 0;
+		RING_FINAL_CHECK_FOR_RESPONSES(&vdev->ring, more);
+		if (more)
+			goto again;
+	} else
+		vdev->ring.sring->rsp_event = i + 1;
+
 	spin_unlock_irqrestore(&vdev->lock, flags);
+
+	tasklet_schedule(&vdev->tasklet);
 
 	vusb_stop_processing(vdev);
 
@@ -2242,8 +2299,9 @@ vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 
 	vdev->vhcd = vhcd;
 	vdev->xendev = dev;
-	INIT_LIST_HEAD(&vdev->pending_list);
+	INIT_LIST_HEAD(&vdev->request_list);
 	INIT_LIST_HEAD(&vdev->release_list);
+	INIT_LIST_HEAD(&vdev->response_list);
 	init_waitqueue_head(&vdev->wait_queue);
 
 	/* Strap our VUSB device onto the Xen device context */
@@ -2347,7 +2405,7 @@ static void
 vusb_destroy_device(struct vusb_device *vdev)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
-	struct list_head tmp[2];
+	struct list_head tmp[3];
 	struct vusb_urbp *pos;
 	struct vusb_urbp *next;
 	unsigned long flags;
@@ -2357,12 +2415,16 @@ vusb_destroy_device(struct vusb_device *vdev)
 
 	INIT_LIST_HEAD(&tmp[0]);
 	INIT_LIST_HEAD(&tmp[1]);
+	INIT_LIST_HEAD(&tmp[2]);
 
 	/* Disconnect gref free callback so it schedules no more work */
 	xc_gnttab_cancel_free_callback(&vdev->callback);
 
 	/* Shutdown all work. Must be done with no locks held. */
 	flush_work_sync(&vdev->work);
+
+	/* Disable tasklet and wait for it to shutdown */
+	tasklet_disable(&vdev->tasklet);
 
 	/* Wait for all processing to stop now */
 	vusb_wait_stop_processing(vdev);
@@ -2377,11 +2439,14 @@ vusb_destroy_device(struct vusb_device *vdev)
         list_splice_init(&vdev->release_list, &tmp[0]);
 
 	/* Copy pending urbps to temp list */
-        list_splice_init(&vdev->pending_list, &tmp[1]);
+        list_splice_init(&vdev->request_list, &tmp[1]);
+
+	/* Copy any last minute responses in between the irq handler and bh */
+        list_splice_init(&vdev->response_list, &tmp[2]);
 
 	spin_unlock_irqrestore(&vdev->lock, flags);
 
-	/* Release all the ready to release URBs and pending URBs - this
+	/* Release all the ready to release, pending and response URBs - this
 	 * has to be done outside a lock
 	 */
 	list_for_each_entry_safe(pos, next, &tmp[0], urbp_list) {
@@ -2391,6 +2456,10 @@ vusb_destroy_device(struct vusb_device *vdev)
 	list_for_each_entry_safe(pos, next, &tmp[1], urbp_list) {
 		pos->urb->status = -ESHUTDOWN;
 		vusb_urbp_release(vhcd, pos);
+	}
+
+	list_for_each_entry_safe(pos, next, &tmp[2], urbp_list) {
+		/* TODO not sure yet, maybe drive response processing */
 	}
 
 	spin_lock_irqsave(&vhcd->lock, flags);
