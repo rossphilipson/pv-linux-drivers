@@ -504,20 +504,6 @@ vusb_clear_port_feature(struct vusb_device *vdev, u16 val)
 	}
 }
 
-/* Get a uniq URB handle */
-static u16
-vusb_get_urb_handle(struct vusb_vhcd *vhcd)
-{
-	vhcd->urb_handle += 1;
-
-	/* TODO this will probably go away and we will use the req.id */
-	if (vhcd->urb_handle >= 0xfff0)
-		/* reset to 0 we never have lots URB in the list */
-		vhcd->urb_handle = 0;
-
-	return vhcd->urb_handle;
-}
-
 #ifdef VUSB_DEBUG
 /* Dump URBp */
 static inline void
@@ -677,8 +663,6 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	urbp->urb = urb;
 
 	spin_lock_irqsave(&vhcd->lock, flags);
-	/* Allocate a handle as a unique ID */
-	urbp->handle = vusb_get_urb_handle(vhcd);
 
 	vdev = vusb_device_by_port(vhcd, urbp->port);
 	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
@@ -1448,27 +1432,53 @@ vusb_urbp_list_dump(const struct vusb_device *vdev, const char *fn)
 	dprintk(D_URB2, "===== End URB List in %s ====\n", fn);
 }
 
-/* Retrieve a URB by handle */
-/* TODO handle stuff is gone I think */
-static struct vusb_urbp*
-vusb_urb_by_handle(struct vusb_device *vdev, u16 handle)
+/* Convert status to errno */
+static int
+vusb_urb_status_to_errno(u32 status)
 {
-	struct vusb_urbp *urbp;
-
-	/* TODO if this was used, it would have to get the urbps off the response_list */
-	list_for_each_entry(urbp, &vdev->request_list, urbp_list) {
-		if (urbp->handle == handle)
-			return urbp;
+	switch (status) {
+	case USBIF_RSP_OKAY:
+		return 0;
+	case USBIF_RSP_EOPNOTSUPP:
+		return -ENOENT;
+	case USBIF_RSP_USB_CANCELED:
+		return -ECANCELED;
+	case USBIF_RSP_USB_PENDING:
+		return -EINPROGRESS;
+	case USBIF_RSP_USB_PROTO:
+		return -EPROTO;
+	case USBIF_RSP_USB_CRC:
+		return -EILSEQ;
+	case USBIF_RSP_USB_TIMEOUT:
+		return -ETIME;
+	case USBIF_RSP_USB_STALLED:
+		return -EPIPE;
+	case USBIF_RSP_USB_INBUFF:
+		return -ECOMM;
+	case USBIF_RSP_USB_OUTBUFF:
+		return -ENOSR;
+	case USBIF_RSP_USB_OVERFLOW:
+		return -EOVERFLOW;
+	case USBIF_RSP_USB_SHORTPKT:
+		return -EREMOTEIO;
+	case USBIF_RSP_USB_DEVRMVD:
+		return -ENODEV;
+	case USBIF_RSP_USB_PARTIAL:
+		return -EXDEV;
+	case USBIF_RSP_USB_INVALID:
+		return -EINVAL;
+	case USBIF_RSP_USB_RESET:
+		return -ECONNRESET;
+	case USBIF_RSP_USB_SHUTDOWN:
+		return -ESHUTDOWN;
+	case USBIF_RSP_ERROR:
+	case USBIF_RSP_USB_UNKNOWN:
+	default:
+		return -EIO;
 	}
-
-	dprintk(D_URB1, "Unable to retrieve URB handle 0x%x port %u\n",
-		handle, vdev->port);
-	vusb_urbp_list_dump(vdev, __FUNCTION__);
-
-	return NULL;
 }
 
-/* Common part to finish an URB request */
+/* Common finish for most URB request */
 static void
 vusb_urb_common_finish(struct vusb_device *vdev, struct vusb_urbp *urbp, bool in,
 			u32 len, const u8 *data)
@@ -1574,157 +1584,54 @@ iso_err:
 	vusb_urbp_queue_release(vdev, urbp);
 }
 
-/* Finish a control URB */
-static void
-vusb_urb_control_finish(struct vusb_device *vdev, struct vusb_urbp *urbp, u32 len, const u8 *data)
-{
-	const struct usb_ctrlrequest *ctrl;
-	bool in;
-
-	ctrl = (struct usb_ctrlrequest *)urbp->urb->setup_packet;
-
-	in = (ctrl->bRequestType & USB_DIR_IN) != 0;
-
-	vusb_urb_common_finish(vdev, urbp, in, len, data);
-}
-
-/* Finish a bulk URB */
-static void
-vusb_urb_bulk_finish(struct vusb_device *vdev, struct vusb_urbp *urbp, u32 len, const u8 *data)
-{
-	vusb_urb_common_finish(vdev, urbp, usb_urb_dir_in(urbp->urb), len, data);
-}
-
-/* Finish an interrupt URB */
-static void
-vusb_urb_interrupt_finish(struct vusb_device *vdev, struct vusb_urbp *urbp, u32 len, const u8 *data)
-{
-	vusb_urb_common_finish(vdev, urbp, usb_urb_dir_in(urbp->urb), len, data);
-}
-
-/* Convert status to errno */
-static int
-vusb_urb_status_to_errno(u32 status)
-{
-	switch (status) {
-	case USBIF_RSP_OKAY:
-		return 0;
-	case USBIF_RSP_EOPNOTSUPP:
-		return -ENOENT;
-	case USBIF_RSP_USB_CANCELED:
-		return -ECANCELED;
-	case USBIF_RSP_USB_PENDING:
-		return -EINPROGRESS;
-	case USBIF_RSP_USB_PROTO:
-		return -EPROTO;
-	case USBIF_RSP_USB_CRC:
-		return -EILSEQ;
-	case USBIF_RSP_USB_TIMEOUT:
-		return -ETIME;
-	case USBIF_RSP_USB_STALLED:
-		return -EPIPE;
-	case USBIF_RSP_USB_INBUFF:
-		return -ECOMM;
-	case USBIF_RSP_USB_OUTBUFF:
-		return -ENOSR;
-	case USBIF_RSP_USB_OVERFLOW:
-		return -EOVERFLOW;
-	case USBIF_RSP_USB_SHORTPKT:
-		return -EREMOTEIO;
-	case USBIF_RSP_USB_DEVRMVD:
-		return -ENODEV;
-	case USBIF_RSP_USB_PARTIAL:
-		return -EXDEV;
-	case USBIF_RSP_USB_INVALID:
-		return -EINVAL;
-	case USBIF_RSP_USB_RESET:
-		return -ECONNRESET;
-	case USBIF_RSP_USB_SHUTDOWN:
-		return -ESHUTDOWN;
-	case USBIF_RSP_ERROR:
-	case USBIF_RSP_USB_UNKNOWN:
-	default:
-		return -EIO;
-	}
-}
-
-/*
- * Finish an URB request
- * @packet: used by isochronous URB because we need the header FIXME
- */
 /* TODO all this handle business will go away I think */
 static void
-vusb_urb_finish(struct vusb_device *vdev, u16 handle,
-		u32 status, u32 len, const u8 *data)
+vusb_urb_finish(struct vusb_device *vdev, struct vusb_urbp *urbp) 
 {
-	struct vusb_urbp *urbp;
-	struct urb *urb;
+	struct vusb_shadow *shadow;
+	struct urb *urb = urbp->urb;
+	struct usb_ctrlrequest *ctrl;
+	int type = usb_pipetype(urb->pipe);
+	bool in;
 
-	urbp = vusb_urb_by_handle(vdev, handle);
+	/* TODO handle internal requests - probably not here - no urbp? */
 
-	if (!urbp) {
-		dprintk(D_WARN, "Bad handle (0x%x) for Device ID (%u)\n",
-			handle, vdev->device_id);
-		return;
+	/* TODO  free shadow, sanity check, set status */
+
+	shadow = &vdev->shadows[urbp->rsp.id];
+	BUG_ON(!shadow->in_use);
+
+	/* Copy over the final status and get the direction */
+	urb->status = vusb_urb_status_to_errno(urbp->rsp.status);
+
+	if (type == PIPE_CONTROL) {
+		ctrl = (struct usb_ctrlrequest *)urb->setup_packet;
+		in = ((ctrl->bRequestType & USB_DIR_IN) != 0) ? true : false;
 	}
+	else
+		in = usb_urb_dir_in(urbp->urb) ? true : false;
 
-	urb = urbp->urb;
-	urb->status = vusb_urb_status_to_errno(status);
-
-	switch (usb_pipetype(urb->pipe)) {
+	switch (type) {
 	case PIPE_ISOCHRONOUS:
-		vusb_urb_isochronous_finish(vdev, urbp, len, data);
+//		vusb_urb_isochronous_finish(vdev, urbp, len, data);
 		break;
 
 	case PIPE_CONTROL:
-		vusb_urb_control_finish(vdev, urbp, len, data);
+//		vusb_urb_control_finish(vdev, urbp, len, data);
 		break;
 
 	case PIPE_INTERRUPT:
-		vusb_urb_interrupt_finish(vdev, urbp, len, data);
+//		vusb_urb_interrupt_finish(vdev, urbp, len, data);
 		break;
 
 	case PIPE_BULK:
-		vusb_urb_bulk_finish(vdev, urbp, len, data);
+//		vusb_urb_bulk_finish(vdev, urbp, len, data);
 		break;
 
 	default:
 		wprintk("Unknow pipe type %u\n",
 			usb_pipetype(urb->pipe));
 	}
-}
-
-/* Handle command URB response
- *
- * TOP-LEVEL
- */
-static void
-vusb_handle_urb_response(struct vusb_device *vdev, const void *packet)
-{
-	u16 handle = 0 /* STUB logical handle */;
-	u32 status = 0;
-	u32 len = 0;
-
-	/* STUB sanity check and get response values */
-
-	/* TODO RJP another one we dont need */
-	vusb_urb_finish(vdev, handle, status, len, NULL /* STUB the response data */);
-}
-
-/* Handle command URB status
- *
- * TOP-LEVEL
- */
-static void
-vusb_handle_urb_status(struct vusb_device *vdev, const void *packet)
-{
-	u16 handle = 0 /* STUB logical handle */;
-	u32 status = 0;
-
-	/* STUB sanity check and get status values */
-
-	/* RJP lock held, probably don't even need this */
-	vusb_urb_finish(vdev, handle, status, 0, NULL);
 }
 
 static void
@@ -1974,7 +1881,7 @@ vusb_urbp_release(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 
 static void
 vusb_process_all(struct vusb_device *vdev, struct vusb_urbp *urbp,
-		 bool process_reqs)
+		bool process_reqs)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
 	struct vusb_urbp *pos;
@@ -1990,7 +1897,7 @@ vusb_process_all(struct vusb_device *vdev, struct vusb_urbp *urbp,
 
 	/* Always drive any response processing. */
 	list_for_each_entry_safe(pos, next, &vdev->request_list, urbp_list) {
-		/* TODO vusb_send_urb(vdev, pos); */
+		vusb_urb_finish(vdev, pos);
 	}
 
 	if (process_reqs) {
@@ -2071,7 +1978,7 @@ again:
 
 		/* Find the shadow block that goes with this req/rsp */
 		shadow = &vdev->shadows[rsp->id];
-		BUG_ON(shadow->in_use);
+		BUG_ON(!shadow->in_use);
 
 		/* Make a copy of the response (it is small) and queue for bh */
 		memcpy(&shadow->urbp->rsp, rsp, sizeof(usbif_response_t));
