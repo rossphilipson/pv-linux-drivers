@@ -135,6 +135,10 @@ do {								\
 	}							\
 } while (0)
 
+#define vusb_process_requests(v) vusb_process_all(v, NULL, true)
+#define vusb_process_new_requests(v, u) vusb_process_all(v, u, true)
+#define vusb_process_responses(v) vusb_process_all(v, NULL, false)
+
 /* Possible state of an urbp */
 enum vusb_urbp_state {
 	VUSB_URBP_NEW,
@@ -264,7 +268,8 @@ vusb_work_handler(struct work_struct *work);
 static void
 vusb_bh_handler(unsigned long data);
 static void
-vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp);
+vusb_process_all(struct vusb_device *vdev, struct vusb_urbp *urbp,
+		 bool process_reqs);
 
 /****************************************************************************/
 /* Miscellaneous Routines                                                   */
@@ -700,7 +705,7 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	vdev->processing = 1;
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
-	vusb_process_requests(vdev, urbp);
+	vusb_process_new_requests(vdev, urbp);
 
 	/* Finished processing */
 	vusb_stop_processing(vdev);
@@ -780,7 +785,7 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 	urbp->state = VUSB_URBP_CANCEL;
 	spin_unlock_irqrestore(&vdev->lock, flags);
 
-	vusb_process_requests(vdev, NULL);
+	vusb_process_requests(vdev);
 
 	/* Finished processing */
 	vusb_stop_processing(vdev);
@@ -1968,7 +1973,8 @@ vusb_urbp_release(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 }
 
 static void
-vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp)
+vusb_process_all(struct vusb_device *vdev, struct vusb_urbp *urbp,
+		 bool process_reqs)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
 	struct vusb_urbp *pos;
@@ -1976,19 +1982,27 @@ vusb_process_requests(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	struct list_head tmp;
 	unsigned long flags;
 
-	/* TODO RJP check elsewhere like in work/bh */
+	INIT_LIST_HEAD(&tmp);
+
 	vusb_check_reset_device(vdev);
 
 	spin_lock_irqsave(&vdev->lock, flags);
 
-	/* New URB, queue it at the back */
-	if (urbp)
-		list_add_tail(&urbp->urbp_list, &vdev->request_list);
-
-	/* Drive request processing */
+	/* Always drive any response processing. */
 	list_for_each_entry_safe(pos, next, &vdev->request_list, urbp_list) {
-		/* Work scheduled if 1 or more URBs cannot be sent */
-		vusb_send_urb(vdev, pos);
+		/* TODO vusb_send_urb(vdev, pos); */
+	}
+
+	if (process_reqs) {
+		/* New URB, queue it at the back */
+		if (urbp)
+			list_add_tail(&urbp->urbp_list, &vdev->request_list);
+
+		/* Drive request processing */
+		list_for_each_entry_safe(pos, next, &vdev->request_list, urbp_list) {
+			/* Work scheduled if 1 or more URBs cannot be sent */
+			vusb_send_urb(vdev, pos);
+		}
 	}
 
 	/* Copy off any urbps on the release list that need releasing */
@@ -2010,10 +2024,8 @@ vusb_work_handler(struct work_struct *work)
 	if (!vusb_start_processing(vdev))
 		return;
 
-	/* TODO for now keep request and response processing segregated */
-
 	/* Start request processing again */
-	vusb_process_requests(vdev, NULL);
+	vusb_process_requests(vdev);
 
 	vusb_stop_processing(vdev);
 }
@@ -2025,6 +2037,9 @@ vusb_bh_handler(unsigned long data)
 
 	if (!vusb_start_processing(vdev))
 		return;
+
+	/* Process only responses in the BH */
+	vusb_process_responses(vdev);
 
 	vusb_stop_processing(vdev);
 }
