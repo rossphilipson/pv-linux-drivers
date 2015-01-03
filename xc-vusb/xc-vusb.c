@@ -6,7 +6,6 @@
  * Copyright (c) 2014 Ross Philipson <ross.philipson@gmail.com>
  * Copyright (c) 2013 Julien Grall
  * Copyright (c) 2011 Thomas Horsten
- * Copyright (c) 2013 OpenXT Systems, Inc.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License version 2
@@ -1445,10 +1444,9 @@ vusb_urb_status_to_errno(u32 status)
 	}
 }
 
-/* Common finish for most URB request */
 static void
-vusb_urb_common_finish(struct vusb_device *vdev, struct vusb_urbp *urbp, bool in,
-			u32 len, const u8 *data)
+vusb_urb_common_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
+		usbif_response_t *rsp, bool in)
 {
 	struct urb *urb = urbp->urb;
 
@@ -1456,44 +1454,36 @@ vusb_urb_common_finish(struct vusb_device *vdev, struct vusb_urbp *urbp, bool in
 		dprintk(D_URB2, "Outgoing URB completed status %d\n",
 			urb->status);
 		/* Sanity check on len, should be 0 */
-		if (len) {
+		if (rsp->actual_length) {
 			wprintk("Data not expected for outgoing URB\n");
 			urb->status = -EIO;
-		} else {
-			/*
-			 * FIXME: move this part in send
-			 * For outgoing URB, the actual length is the length
-			 * transfered to the vusb daemon
-			 */
+		}
+		else if (!urb->status) {
+			/* Set actual to what we said we sent */
 			urb->actual_length = urb->transfer_buffer_length;
 		}
-	} else { /* Inbound */
+	}
+	else { /* Inbound */
 		dprintk(D_URB2, "Incoming URB completed status %d len %u\n",
-			urb->status, len);
+			urb->status, rsp->actual_length);
 		/* Sanity check on len, should be less or equal to
 		 * the length of the transfer buffer */
-		if (len > urb->transfer_buffer_length) {
-			wprintk("Length mismatch for incoming URB"
-				" (wanted %u bug got %u)\n",
-				urb->transfer_buffer_length, len);
+		if (rsp->actual_length > urb->transfer_buffer_length) {
+			wprintk("Incoming URB too large (expect %u got %u)\n",
+				urb->transfer_buffer_length, rsp->actual_length);
 			urb->status = -EIO;
-		} else {
+		}
+		else if (!urb->status) {
 			dprintk(D_URB2, "In %u bytes out of %u\n",
-				len, urb->transfer_buffer_length);
+				rsp->actual_length, urb->transfer_buffer_length);
 
-			urb->actual_length = len;
-			/* FIXME: use transfer buffer directly to read */
-			if (len > 0)
-				memcpy(urb->transfer_buffer, data, len);
+			urb->actual_length = rsp->actual_length;
 		}
 	}
 
 	vusb_urbp_queue_release(vdev, urbp);
 }
 
-/*
- * Finish an isochronous URB
- */
 static void
 vusb_urb_isochronous_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
 			u32 len, const u8 *data)
@@ -1560,10 +1550,10 @@ vusb_urb_finish(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	int type = usb_pipetype(urb->pipe);
 	bool in;
 
-	/* TODO  free shadow, sanity check, set status */
-
+	/* Done with this shadow entry, give it back */
 	shadow = &vdev->shadows[urbp->rsp.id];
 	BUG_ON(!shadow->in_use);
+	vusb_put_shadow(vdev, shadow);
 
 	/* Copy over the final status and get the direction */
 	urb->status = vusb_urb_status_to_errno(urbp->rsp.status);
@@ -1577,24 +1567,15 @@ vusb_urb_finish(struct vusb_device *vdev, struct vusb_urbp *urbp)
 
 	switch (type) {
 	case PIPE_ISOCHRONOUS:
-//		vusb_urb_isochronous_finish(vdev, urbp, len, data);
+//		vusb_urb_isochronous_finish(vdev, urbp, &shadow->rsp, in);
 		break;
-
 	case PIPE_CONTROL:
-//		vusb_urb_control_finish(vdev, urbp, len, data);
-		break;
-
 	case PIPE_INTERRUPT:
-//		vusb_urb_interrupt_finish(vdev, urbp, len, data);
-		break;
-
 	case PIPE_BULK:
-//		vusb_urb_bulk_finish(vdev, urbp, len, data);
+		vusb_urb_common_finish(vdev, urbp, &urbp->rsp, in);
 		break;
-
 	default:
-		wprintk("Unknow pipe type %u\n",
-			usb_pipetype(urb->pipe));
+		eprintk("Unknown pipe type %u\n", type);
 	}
 }
 
