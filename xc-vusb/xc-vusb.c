@@ -1256,6 +1256,7 @@ vusb_put_internal_request(struct vusb_device *vdev, enum vusb_internal_cmd cmd)
 	shadow = vusb_get_shadow(vdev);
 	BUG_ON(!shadow);
 
+	shadow->urbp = NULL;
 	shadow->req.length = 0;
 	shadow->req.offset = 0;
 	shadow->req.nr_segments = 0;
@@ -1955,6 +1956,18 @@ again:
 		/* Find the shadow block that goes with this req/rsp */
 		shadow = &vdev->shadows[rsp->id];
 		BUG_ON(!shadow->in_use);
+
+		/* Processing internal command right here, no urbp's to queue anyway */
+		if (shadow->req.type > USBIF_T_INT) {
+			/* Only the speed request cmd has data */
+			if (shadow->req.type == USBIF_T_GET_SPEED) {
+				vdev->speed = rsp->data;
+				wake_up(&vdev->wait_queue);
+			}
+			/* Return the shadow which does almost nothing in this case */
+			vusb_put_shadow(vdev, shadow);
+			continue;
+		}
 
 		/* Make a copy of the response (it is small) and queue for bh */
 		memcpy(&shadow->urbp->rsp, rsp, sizeof(usbif_response_t));
