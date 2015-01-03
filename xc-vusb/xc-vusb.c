@@ -148,6 +148,12 @@ enum vusb_urbp_state {
 	VUSB_URBP_CANCEL
 };
 
+enum vusb_internal_cmd {
+	VUSB_CMD_RESET,
+	VUSB_CMD_CYCLE,
+	VUSB_CMD_SPEED
+};
+
 /* URB tracking structure */
 struct vusb_urbp {
 	struct urb		*urb;
@@ -155,20 +161,7 @@ struct vusb_urbp {
 	u16                     handle;
 	struct list_head	urbp_list;
 	int                     port;
-	gfp_t			mem_flags;
 	usbif_response_t	rsp;
-};
-
-/* Internal request structure */
-struct vusb_internal {
-	u8 			type;
-	u8 			endpoint;
-	void 			*page;
-	usbif_request_len_t 	length;
-	u16 			offset;
-	gfp_t			mem_flags;
-	unsigned		is_reset:1;
-	unsigned		is_cycle:1;
 };
 
 struct usbif_indirect_frames {
@@ -659,7 +652,6 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	urbp->state = VUSB_URBP_NEW;
 	/* Port numbered from 1 */
 	urbp->port = urb->dev->portnum;
-	urbp->mem_flags = mem_flags;
 	urbp->urb = urb;
 
 	spin_lock_irqsave(&vhcd->lock, flags);
@@ -1251,10 +1243,9 @@ vusb_put_ring(struct vusb_device *vdev, struct vusb_shadow *shadow)
 }
 
 static int
-vusb_put_internal_request(struct vusb_device *vdev, struct vusb_internal *vint)
+vusb_put_internal_request(struct vusb_device *vdev, enum vusb_internal_cmd cmd)
 {
 	struct vusb_shadow *shadow;
-	int ret = 0;
 
 	/* NOTE USBIF_T_ABORT_PIPE is not currently supported */
 
@@ -1265,40 +1256,30 @@ vusb_put_internal_request(struct vusb_device *vdev, struct vusb_internal *vint)
 	shadow = vusb_get_shadow(vdev);
 	BUG_ON(!shadow);
 
-	if (vint->is_reset || vint->is_cycle) {
-		/* Resets/cycles are easy - there are not data pages or grefs. */
-		shadow->req.endpoint = 0;
-		shadow->req.type = (vint->is_cycle ? 0 : USBIF_T_RESET);
-		shadow->req.length = 0;
-		shadow->req.offset = 0;
-		shadow->req.nr_segments = 0;
-		shadow->req.setup = 0L;
-		shadow->req.flags = (vint->is_cycle ? USBIF_F_CYCLE_PORT : USBIF_F_RESET);
-		vusb_put_ring(vdev, shadow);
-		return 0;
-	}
-
-	/* Other internal requests use a data page */
-	shadow->req.endpoint = vint->endpoint;
-	shadow->req.type = vint->type;
-	shadow->req.length = vint->length;
-	BUG_ON(vint->offset >= 0x00010000);
+	shadow->req.length = 0;
+	shadow->req.offset = 0;
 	shadow->req.nr_segments = 0;
 	shadow->req.setup = 0L;
-	shadow->req.offset = vint->offset;
-	shadow->req.flags = USBIF_F_SHORTOK;
 
-	/* Get some of them grefs */
-	ret = vusb_allocate_grefs(vdev, shadow, vint->page, 1, false);
-	if (ret) {
-		/* Can't handle failures */
-		vusb_put_shadow(vdev, shadow);
-		return ret;
+	if (cmd == VUSB_CMD_RESET || cmd == VUSB_CMD_CYCLE) {
+		/* Resets/cycles are easy - no response data. */
+		shadow->req.endpoint = 0;
+		shadow->req.type = ((cmd == VUSB_CMD_RESET) ? 0 : USBIF_T_RESET);
+		shadow->req.flags = ((cmd == VUSB_CMD_CYCLE) ? 
+			USBIF_F_CYCLE_PORT : USBIF_F_RESET);
 	}
-	
+	else if (cmd == VUSB_CMD_SPEED) {
+		/* Speed requests use the data field in the response */
+		shadow->req.endpoint = 0 | USB_DIR_IN;
+		shadow->req.type = USBIF_T_GET_SPEED;
+		shadow->req.flags = 0;
+	}
+	else
+		return -EINVAL;
+
 	vusb_put_ring(vdev, shadow);
 
-	return ret;
+	return 0;
 }
 
 static int
@@ -1813,7 +1794,6 @@ again:
 static void
 vusb_check_reset_device(struct vusb_device *vdev)
 {
-	struct vusb_internal vint_req;
 	unsigned long flags;
 	bool reset = false;
 	int ret;
@@ -1832,12 +1812,8 @@ vusb_check_reset_device(struct vusb_device *vdev)
 	if (!reset)
 		return;
 
-	/* Send internal reset request, no data page */
-	memset(&vint_req, 0, sizeof(struct vusb_internal));
-	vint_req.is_reset = 1;
-
 	spin_lock_irqsave(&vdev->lock, flags);
-	ret = vusb_put_internal_request(vdev, &vint_req);
+	ret = vusb_put_internal_request(vdev, VUSB_CMD_RESET);
 	spin_unlock_irqrestore(&vdev->lock, flags);
 
 	if (ret) {
@@ -2244,21 +2220,9 @@ static int
 vusb_start_device(struct vusb_device *vdev)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
-	struct vusb_internal vint_req;
 	unsigned long flags;
 	int ret = 0;
 
-	vint_req.type = USBIF_T_GET_SPEED;
-	vint_req.endpoint = 0 | USB_DIR_IN;
-	vint_req.page = (void *)__get_free_page(GFP_KERNEL);
-	vint_req.length = sizeof(u32);
-	vint_req.offset = 0;
-	vint_req.mem_flags = GFP_KERNEL;
-	vint_req.is_reset = 0;
-
-	if (!vint_req.page)
-		return -ENOMEM;
-	
 	/* TODO need a reset in here? The WFE gets that info from the registry */
 
 	/* Take the VHCD lock to change the state flags */
@@ -2271,10 +2235,9 @@ vusb_start_device(struct vusb_device *vdev)
 	spin_lock_irqsave(&vdev->lock, flags);
 	vdev->speed = (unsigned int)-1;
 
-	ret = vusb_put_internal_request(vdev, &vint_req);
+	ret = vusb_put_internal_request(vdev, VUSB_CMD_SPEED);
 	if (ret) {
 		spin_unlock_irqrestore(&vhcd->lock, flags);
-		free_page((unsigned long)vint_req.page);
 		eprintk("Failed to get device %p speed - ret: %d\n", vdev, ret);
 		return ret;
 	}
@@ -2317,8 +2280,6 @@ vusb_start_device(struct vusb_device *vdev)
 
 	/* Update RH, this will find this port in the connected state */
 	usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
-
-	free_page((unsigned long)vint_req.page);
 
 	return 0;
 }
