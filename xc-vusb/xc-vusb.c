@@ -2262,7 +2262,7 @@ static void
 vusb_destroy_device(struct vusb_device *vdev)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
-	struct list_head tmp[3];
+	struct list_head tmp[2];
 	struct vusb_urbp *pos;
 	struct vusb_urbp *next;
 	unsigned long flags;
@@ -2272,7 +2272,6 @@ vusb_destroy_device(struct vusb_device *vdev)
 
 	INIT_LIST_HEAD(&tmp[0]);
 	INIT_LIST_HEAD(&tmp[1]);
-	INIT_LIST_HEAD(&tmp[2]);
 
 	/* Disconnect gref free callback so it schedules no more work */
 	xc_gnttab_cancel_free_callback(&vdev->callback);
@@ -2280,17 +2279,20 @@ vusb_destroy_device(struct vusb_device *vdev)
 	/* Shutdown all work. Must be done with no locks held. */
 	flush_work_sync(&vdev->work);
 
-	/* Disable tasklet and wait for it to shutdown */
-	tasklet_disable(&vdev->tasklet);
-
 	/* Wait for all processing to stop now */
 	vusb_wait_stop_processing(vdev);
+
+	/* Now the irq handler will no longer process the ring, disable the
+	 * tasklet and wait for it to shutdown */
+	tasklet_disable(&vdev->tasklet);
 
 	/* Final device operations */
 	spin_lock_irqsave(&vdev->lock, flags);
 
-	/* Give usbback a chance to consume the ring */
-	vusb_flush_ring(vdev);
+	/* Process any last resonse URBs left */
+	list_for_each_entry_safe(pos, next, &vdev->response_list, urbp_list) {
+		vusb_urb_finish(vdev, pos);
+	}
 
 	/* Copy ready to release urbps to temp list */
         list_splice_init(&vdev->release_list, &tmp[0]);
@@ -2298,14 +2300,10 @@ vusb_destroy_device(struct vusb_device *vdev)
 	/* Copy pending urbps to temp list */
         list_splice_init(&vdev->request_list, &tmp[1]);
 
-	/* Copy any last minute responses in between the irq handler and bh */
-        list_splice_init(&vdev->response_list, &tmp[2]);
-
 	spin_unlock_irqrestore(&vdev->lock, flags);
 
-	/* Release all the ready to release, pending and response URBs - this
-	 * has to be done outside a lock
-	 */
+	/* Release all the ready to release and pending URBs - this
+	 * has to be done outside a lock. */
 	list_for_each_entry_safe(pos, next, &tmp[0], urbp_list) {
 		vusb_urbp_release(vhcd, pos);
 	}
@@ -2315,13 +2313,9 @@ vusb_destroy_device(struct vusb_device *vdev)
 		vusb_urbp_release(vhcd, pos);
 	}
 
-	list_for_each_entry_safe(pos, next, &tmp[2], urbp_list) {
-		/* TODO not sure yet, maybe drive response processing */
-	}
-
 	spin_lock_irqsave(&vhcd->lock, flags);
 
-	/* Final VHCD operations on device */
+	/* Final vHCD operations on device */
 	vusb_usbif_free(vdev, 0);
 	vusb_device_clear(vdev);
 
@@ -2345,7 +2339,6 @@ vusb_usbfront_probe(struct xenbus_device *dev, const struct xenbus_device_id *id
 {
 	struct vusb_vhcd *vhcd = hcd_to_vhcd(platform_get_drvdata(vusb_platform_device));
 	int vid, err;
-
 
 	/* Make device ids out of the virtual-device value from xenstore */
 	err = xc_xenbus_scanf(XBT_NIL, dev->nodename, "virtual-device", "%i", &vid);
