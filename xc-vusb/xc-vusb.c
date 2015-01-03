@@ -587,7 +587,6 @@ vusb_init_hcd(struct vusb_vhcd *vhcd)
 	return 0;
 }
 
-/* HCD start */
 static int
 vusb_hcd_start(struct usb_hcd *hcd)
 {
@@ -609,7 +608,6 @@ vusb_hcd_start(struct usb_hcd *hcd)
 	return 0;
 }
 
-/* HCD stop */
 static void
 vusb_hcd_stop(struct usb_hcd *hcd)
 {
@@ -775,6 +773,7 @@ vusb_hcd_get_frame(struct usb_hcd *hcd)
 	struct timeval	tv;
 
 	dprintk(D_MISC, "*vusb_get_frame\n");
+	/* TODO can we use the internal cmd to do this? */
 	do_gettimeofday(&tv);
 
 	return tv.tv_usec / 1000;
@@ -957,7 +956,6 @@ vusb_hcd_bus_resume(struct usb_hcd *hcd)
 	return ret;
 }
 #endif /* CONFIG_PM */
-
 
 static const struct hc_driver vusb_hcd_driver = {
 	.description = VUSB_HCD_DRIVER_NAME,
@@ -1387,19 +1385,6 @@ err0:
 /****************************************************************************/
 /* URB Processing                                                           */
 
-/* Retrieve endpoint from URB */
-static inline u8
-vusb_urb_to_endpoint(struct urb *urb)
-{
-	u8 endpoint = 0;
-
-	endpoint = usb_pipeendpoint(urb->pipe);
-	if (usb_urb_dir_in(urb))
-		endpoint |= 0x80;
-
-	return endpoint;
-}
-
 /* Dump the URBp list */
 static inline void
 vusb_urbp_list_dump(const struct vusb_device *vdev, const char *fn)
@@ -1566,7 +1551,6 @@ iso_err:
 	vusb_urbp_queue_release(vdev, urbp);
 }
 
-/* TODO all this handle business will go away I think */
 static void
 vusb_urb_finish(struct vusb_device *vdev, struct vusb_urbp *urbp) 
 {
@@ -1575,8 +1559,6 @@ vusb_urb_finish(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	struct usb_ctrlrequest *ctrl;
 	int type = usb_pipetype(urb->pipe);
 	bool in;
-
-	/* TODO handle internal requests - probably not here - no urbp? */
 
 	/* TODO  free shadow, sanity check, set status */
 
@@ -1836,13 +1818,13 @@ vusb_check_reset_device(struct vusb_device *vdev)
 	usb_hcd_poll_rh_status(vhcd_to_hcd(vdev->vhcd));
 }
 
-/* Notify USB stack that the URB is finished and release it. This
- * has to be done outside the all locks.
- */
 static void
 vusb_urbp_release(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 {
 	struct urb *urb = urbp->urb;
+
+	/* Notify USB stack that the URB is finished and release it. This
+	 * has to be done outside the all locks. */
 
 #ifdef VUSB_DEBUG
 	if (urb->status)
@@ -1943,7 +1925,6 @@ vusb_interrupt(int irq, void *dev_id)
 		return IRQ_HANDLED;
 
 	spin_lock_irqsave(&vdev->lock, flags);
-	/* TODO process the results from internal requests in here, like setting speed */
 
 again:
 
@@ -1969,12 +1950,11 @@ again:
 			continue;
 		}
 
-		/* Make a copy of the response (it is small) and queue for bh */
+		/* Make a copy of the response (it is small) and queue for bh.
+		 * Not going to free the shadow here - that could be a lot of work;
+		 * dropping it on the BH to take care of */
 		memcpy(&shadow->urbp->rsp, rsp, sizeof(usbif_response_t));
 		list_add_tail(&shadow->urbp->urbp_list, &vdev->response_list);
-
-		/* Not going to free the shadow here - that could be a lot of work;
-		 * dropping it on the BH to take off */
 	}
 
 	vdev->ring.rsp_cons = i;
@@ -2399,14 +2379,12 @@ vusb_usbfront_probe(struct xenbus_device *dev, const struct xenbus_device_id *id
 	return vusb_create_device(vhcd, dev, (u16)vid);
 }
 
-/**
- * Callback received when the backend's state changes.
- */
 static void
 vusb_usbback_changed(struct xenbus_device *dev, enum xenbus_state backend_state)
 {
 	struct vusb_device *vdev = dev_get_drvdata(&dev->dev);
 
+	/* Callback received when the backend's state changes. */
 	dev_dbg(&dev->dev, "%s\n", xc_xenbus_strstate(backend_state));
 	dev_dbg(&dev->dev, "Mine: %s\n", xc_xenbus_strstate(dev->state));
 
@@ -2415,8 +2393,7 @@ vusb_usbback_changed(struct xenbus_device *dev, enum xenbus_state backend_state)
 		/* if the backend vanishes from xenstore, close frontend */
 		if (!xc_xenbus_exists(XBT_NIL, dev->otherend, "")) {
 			/* Gone is gone, don't care about our state since we do not reconnect
-			 * devices. Just destroy the device.
-			 */
+			 * devices. Just destroy the device. */
 			printk(KERN_INFO "backend vanished, closing frontend\n");
 			xc_xenbus_switch_state(dev, XenbusStateClosed);
 			vusb_destroy_device(vdev);
@@ -2446,8 +2423,7 @@ vusb_usbback_changed(struct xenbus_device *dev, enum xenbus_state backend_state)
 	case XenbusStateClosed:
 		/* Remove the device and transition ourselves to closed, there is no
 		 * reconnect. Do it for the closed state just in case the backend never
-		 * transitioned through closing.
-		 */
+		 * transitioned through closing. */
 		xc_xenbus_switch_state(dev, XenbusStateClosed);
 		vusb_destroy_device(vdev);
 		break;
@@ -2538,7 +2514,6 @@ static struct xenbus_driver vusb_usbfront_driver = {
 static int
 vusb_xen_init(void)
 {
-
 	int rc = 0;
 
 	mutex_lock(&vusb_xen_pm_mutex);
@@ -2617,7 +2592,7 @@ vusb_platform_probe(struct platform_device *pdev)
 
 	vusb_init_hcd(vhcd);
 
-	/* TODO VHCD is up, now initialize this device for xenbus */
+	/* vHCD is up, now initialize this device for xenbus */
 	ret = vusb_xen_init();
 	if (ret)
 		goto err_xen;
@@ -2651,12 +2626,9 @@ vusb_platform_remove(struct platform_device *pdev)
 	/* Unregister from xenbus first */
 	vusb_xen_unregister();
 
-	/*
-	 * A warning will result: "IRQ 0 already free".
-	 * It seems the linux kernel doesn't set hcd->irq to -1 when IRQ
-	 * is not enabled for a USB driver. So we put an hack for this
-	 * before calling usb_remove_hcd().
-	 */
+	/* A warning will result: "IRQ 0 already free". It seems the Linux
+	 * kernel doesn't set hcd->irq to -1 when IRQ is not enabled for a USB
+	 * driver. So we put an hack for this before usb_remove_hcd(). */
 	hcd->irq = -1;
 
 	usb_remove_hcd(hcd);
@@ -2671,10 +2643,6 @@ vusb_platform_remove(struct platform_device *pdev)
 }
 
 #ifdef CONFIG_PM
-/*
- * Platform freeze
- * Called during hibernation process
- */
 static int
 vusb_platform_freeze(struct device *dev)
 {
@@ -2706,7 +2674,6 @@ vusb_platform_freeze(struct device *dev)
 	return ret;
 }
 
-/* Platform restore */
 static int
 vusb_platform_restore(struct device *dev)
 {
