@@ -1764,7 +1764,6 @@ vusb_check_reset_device(struct vusb_device *vdev)
 	/* Lock it and see if this port needs resetting. */
 	spin_lock_irqsave(&vdev->vhcd->lock, flags);
 
-	/* TODO why 2? */
 	if (vdev->reset == 1) {
 		vdev->reset = 2;
 		reset = true;
@@ -1784,8 +1783,8 @@ vusb_check_reset_device(struct vusb_device *vdev)
 		return;
 	}
 
-	/* Not waiting for the reset, the page will be cleaned up during
-	 * response processing. */
+	/* Wait for the reset with no lock */
+	wait_event_interruptible(vdev->wait_queue, (vdev->reset == 0));
 
 	spin_lock_irqsave(&vdev->vhcd->lock, flags);
 	/* Signal reset completion */
@@ -1921,10 +1920,12 @@ again:
 		/* Processing internal command right here, no urbp's to queue anyway */
 		if (shadow->req.type > USBIF_T_INT) {
 			/* Only the speed request cmd has data */
-			if (shadow->req.type == USBIF_T_GET_SPEED) {
+			if (shadow->req.type == USBIF_T_GET_SPEED)
 				vdev->speed = rsp->data;
-				wake_up(&vdev->wait_queue);
-			}
+			else if (shadow->req.type == USBIF_T_RESET)
+				vdev->reset = 0;
+			
+			wake_up(&vdev->wait_queue);
 			/* Return the shadow which does almost nothing in this case */
 			vusb_put_shadow(vdev, shadow);
 			continue;
@@ -2217,7 +2218,7 @@ vusb_start_device(struct vusb_device *vdev)
 	spin_unlock_irqrestore(&vdev->lock, flags);
 
 	/* Wait for a response with no lock */
-	wait_event_interruptible(vdev->wait_queue, vdev->speed != (unsigned int)-1);
+	wait_event_interruptible(vdev->wait_queue, (vdev->speed != (unsigned int)-1));
 
 	/* vdev->speed should be set, sanity check the speed */
 	switch (vdev->speed) {
