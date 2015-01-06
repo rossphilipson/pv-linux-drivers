@@ -24,15 +24,14 @@
 /* TODO
  * Modify to use a new HCD interface
  * Use DMA buffers
+ * Handle errors on internal cmds
+ * Sleep/resume
  * Add branch prediction
  */
 
 #include <linux/mm.h>
 #include <linux/version.h>
 #include <linux/module.h>
-#include <asm/uaccess.h>
-#include <linux/signal.h>
-#include <linux/slab.h>
 #include <linux/platform_device.h>
 #include <linux/usb.h>
 #if ( LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0) )
@@ -49,7 +48,6 @@
 #include <xen/interface/memory.h>
 #include <xen/interface/grant_table.h>
 
-/* TODO looks like we use some old HCD interface, update */
 #if ( LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,35) || (defined(RHEL_RELEASE_CODE)) )
 #include <linux/usb/hcd.h>
 #else
@@ -60,16 +58,14 @@
 #define flush_work_sync(a) flush_scheduled_work()
 #endif
 
-#define VUSB_INTERFACE_VERSION 	3
-#define VUSB_MAX_PACKET_SIZE 	1024*256
-#define VUSB_INVALID_REQ_ID	((u64)-1)
+#define VUSB_INTERFACE_VERSION		3
+#define VUSB_INVALID_REQ_ID		((u64)-1)
 
 #define VUSB_PLATFORM_DRIVER_NAME	"vusb-platform"
 #define VUSB_HCD_DRIVER_NAME		"vusb-hcd"
 #define VUSB_DRIVER_DESC		"OpenXT Virtual USB Host Controller"
 #define VUSB_DRIVER_VERSION		"1.0.0"
-
-#define POWER_BUDGET		5000 /* mA */
+#define VUSB_POWER_BUDGET		5000 /* mA */
 
 #define GRANT_INVALID_REF 0
 #define USB_RING_SIZE __CONST_RING_SIZE(usbif, PAGE_SIZE)
@@ -126,7 +122,7 @@
 
 /* Port are numbered from 1 in linux */
 #define vusb_device_by_port(v, port) (&(v)->vdev_ports[(port) - 1])
-#define vusb_check_port(req, index)					\
+#define vusb_check_port(req, index)				\
 do {								\
 	if ((index) < 1 || (index) > VUSB_PORTS) {		\
 		wprintk(req" with invalid port %u", (index));	\
@@ -135,9 +131,9 @@ do {								\
 	}							\
 } while (0)
 
-#define vusb_process_requests(v) vusb_process_all(v, NULL, true)
-#define vusb_process_new_requests(v, u) vusb_process_all(v, u, true)
-#define vusb_process_responses(v) vusb_process_all(v, NULL, false)
+#define vusb_process_requests(v) vusb_process_main(v, NULL, true)
+#define vusb_process_new_requests(v, u) vusb_process_main(v, u, true)
+#define vusb_process_responses(v) vusb_process_main(v, NULL, false)
 
 /* Possible state of an urbp */
 enum vusb_urbp_state {
@@ -259,8 +255,8 @@ vusb_work_handler(struct work_struct *work);
 static void
 vusb_bh_handler(unsigned long data);
 static void
-vusb_process_all(struct vusb_device *vdev, struct vusb_urbp *urbp,
-		 bool process_reqs);
+vusb_process_main(struct vusb_device *vdev, struct vusb_urbp *urbp,
+		bool process_reqs);
 static int
 vusb_put_internal_request(struct vusb_device *vdev,
 		enum vusb_internal_cmd cmd, u64 cancel_id);
@@ -508,10 +504,10 @@ vusb_urbp_dump(struct vusb_urbp *urbp)
 
 	type = usb_pipetype(urb->pipe);
 
-	iprintk("urb handle: 0x%x state: %s status: %d pipe: %s(%u)\n",
-		urbp->handle, vusb_state_to_string(urbp),
+	iprintk("URB urbp: %p state: %s status: %d pipe: %s(%u)\n",
+		urbp, vusb_state_to_string(urbp),
 		urb->status, vusb_pipe_to_string(urb), type);
-	iprintk("Device: %u Endpoint: %u In: %u\n",
+	iprintk("device: %u endpoint: %u in: %u\n",
 		usb_pipedevice(urb->pipe), usb_pipeendpoint(urb->pipe),
 		usb_urb_dir_in(urb));
 }
@@ -600,7 +596,7 @@ vusb_hcd_start(struct usb_hcd *hcd)
 	vhcd->rh_state = VUSB_RH_RUNNING;
 	vhcd->state = VUSB_RUNNING;
 
-	hcd->power_budget = POWER_BUDGET;
+	hcd->power_budget = VUSB_POWER_BUDGET;
 	hcd->state = HC_STATE_RUNNING;
 	hcd->uses_new_polling = 1;
 
@@ -838,8 +834,8 @@ vusb_hcd_hub_status(struct usb_hcd *hcd, char *buf)
 		struct vusb_device *vdev = &vhcd->vdev_ports[i];
 
 		/* Check status for each port */
-		dprintk(D_PORT2, "check port %u (%08x)\n", vhcd->vdev_ports[i].port,
-				vhcd->device[i].port_status);
+		dprintk(D_PORT2, "check port %u (%08x)\n", vdev->port,
+				vdev->port_status);
 		if ((vdev->port_status & PORT_C_MASK) != 0) {
 			if (i < 7)
 				buf[0] |= 1 << (i + 1);
@@ -1426,8 +1422,8 @@ vusb_urbp_list_dump(const struct vusb_device *vdev, const char *fn)
 
 	dprintk(D_URB2, "===== Current URB List in %s =====\n", fn);
 	list_for_each_entry(urbp, &vdev->pending_list, urbp_list) {
-		dprintk(D_URB1, "URB handle 0x%x port %u device %u\n",
-			urbp->handle, urbp->port, vdev->device_id);
+		dprintk(D_URB2, "URB urbp: %p port %u device %u\n",
+			urbp, urbp->port, vdev->device_id);
 	}
 	dprintk(D_URB2, "===== End URB List in %s ====\n", fn);
 }
@@ -1685,7 +1681,9 @@ vusb_send_control_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 static void
 vusb_send_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
-	dprintk(D_URB2, "Send Isochronous URB Device: %u Endpoint: %u in: %u\n",
+	struct urb *urb = urbp->urb;
+
+	dprintk(D_URB2, "Send Isochronous URB device: %u endpoint: %u in: %u\n",
 		usb_pipedevice(urb->pipe), usb_pipeendpoint(urb->pipe),
 		usb_urb_dir_in(urb));
 	/* TODO and yea, the original did something special to handle the iso descriptors too */
@@ -1699,8 +1697,8 @@ vusb_send_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 
 	type = usb_pipetype(urb->pipe);
 
-	dprintk(D_URB2, "urbp handle: 0x%x state: %s pipe: %s(t:%u e:%u d:%u)\n",
-		urbp->handle, vusb_state_to_string(urbp),
+	dprintk(D_URB2, "URB urbp: %p state: %s pipe: %s(t:%u e:%u d:%u)\n",
+		urbp, vusb_state_to_string(urbp),
 		vusb_pipe_to_string(urb), type, usb_pipeendpoint(urb->pipe),
 		usb_urb_dir_in(urb));
 
@@ -1851,15 +1849,15 @@ vusb_urbp_release(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 		vusb_urbp_dump(urbp);
 #endif
 
-	dprintk(D_URB1, "Giveback URB 0x%x status %d length %u\n",
-		urbp->handle, urb->status, urb->actual_length);
+	dprintk(D_URB2, "Giveback URB urpb: %p status %d length %u\n",
+		urbp, urb->status, urb->actual_length);
 	kfree(urbp);
 	usb_hcd_unlink_urb_from_ep(vhcd_to_hcd(vhcd), urb);
 	usb_hcd_giveback_urb(vhcd_to_hcd(vhcd), urb, urb->status);
 }
 
 static void
-vusb_process_all(struct vusb_device *vdev, struct vusb_urbp *urbp,
+vusb_process_main(struct vusb_device *vdev, struct vusb_urbp *urbp,
 		bool process_reqs)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
@@ -1970,7 +1968,7 @@ again:
 			}
 
 			/* USBIF_T_CANCEL no waiters, no data*/
-			
+
 			/* Return the shadow which does almost nothing in this case */
 			vusb_put_shadow(vdev, shadow);
 			continue;
@@ -2006,7 +2004,7 @@ static void
 vusb_device_clear(struct vusb_device *vdev)
 {
 	if (((vdev->connecting) || (vdev->present)) &&
-	    (vdev->xendev != NULL))
+		(vdev->xendev != NULL))
 		dev_set_drvdata(&vdev->xendev->dev, NULL);
 
 	vdev->xendev = NULL;
@@ -2189,7 +2187,7 @@ vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 	spin_lock_irqsave(&vhcd->lock, flags);
 	for (i = 0; i < VUSB_PORTS; i++) {
 		if ((vhcd->vdev_ports[i].connecting)||(
-		    (vhcd->vdev_ports[i].closing)))
+			(vhcd->vdev_ports[i].closing)))
 			continue;
 		if (!vhcd->vdev_ports[i].present)
 			break;
