@@ -62,6 +62,7 @@
 
 #define VUSB_INTERFACE_VERSION 	3
 #define VUSB_MAX_PACKET_SIZE 	1024*256
+#define VUSB_INVALID_REQ_ID	((u64)-1)
 
 #define VUSB_PLATFORM_DRIVER_NAME	"vusb-platform"
 #define VUSB_HCD_DRIVER_NAME		"vusb-hcd"
@@ -150,14 +151,15 @@ enum vusb_urbp_state {
 enum vusb_internal_cmd {
 	VUSB_CMD_RESET,
 	VUSB_CMD_CYCLE,
-	VUSB_CMD_SPEED
+	VUSB_CMD_SPEED,
+	VUSB_CMD_CANCEL
 };
 
 /* URB tracking structure */
 struct vusb_urbp {
 	struct urb		*urb;
+	u64			id;
 	enum vusb_urbp_state	state;
-	u16			handle;
 	struct list_head	urbp_list;
 	int			port;
 	usbif_response_t	rsp;
@@ -214,9 +216,9 @@ struct vusb_device {
 	u16				shadow_free;
 
 	/* This VUSB device's lists of pending URB work */
-	struct list_head		request_list;
+	struct list_head		pending_list;
 	struct list_head		release_list;
-	struct list_head		response_list;
+	struct list_head		finish_list;
 
 	struct work_struct 		work;
 	struct tasklet_struct		tasklet;
@@ -233,8 +235,7 @@ enum vusb_rh_state {
 
 enum vusb_state {
 	VUSB_INACTIVE,
-	VUSB_WAIT_BIND_RESPONSE,
-	VUSB_RUNNING,
+	VUSB_RUNNING
 };
 
 struct vusb_vhcd {
@@ -244,8 +245,6 @@ struct vusb_vhcd {
 	enum vusb_rh_state		rh_state;
 
 	struct vusb_device		vdev_ports[VUSB_PORTS];
-
-	u16				urb_handle;
 };
 
 static struct platform_device *vusb_platform_device = NULL;
@@ -262,6 +261,9 @@ vusb_bh_handler(unsigned long data);
 static void
 vusb_process_all(struct vusb_device *vdev, struct vusb_urbp *urbp,
 		 bool process_reqs);
+static int
+vusb_put_internal_request(struct vusb_device *vdev,
+		enum vusb_internal_cmd cmd, u64 cancel_id);
 
 /****************************************************************************/
 /* Miscellaneous Routines                                                   */
@@ -650,6 +652,8 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	/* Port numbered from 1 */
 	urbp->port = urb->dev->portnum;
 	urbp->urb = urb;
+	/* No req ID until shadow is allocated */
+	urbp->id = VUSB_INVALID_REQ_ID;
 
 	spin_lock_irqsave(&vhcd->lock, flags);
 
@@ -729,38 +733,56 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 
 	spin_lock_irqsave(&vdev->lock, flags);
 
-	/* Retrieve URBp */
-	list_for_each_entry(urbp, &vdev->request_list, urbp_list) {
+	/* Need to find the urbp. Note the urbp can be in 4 states:
+	 * 1. In the pending queue not sent. In this case we just grab it and
+	 *    release it.
+	 * 2. In the pending queue sent. In this case we need to flag it as
+	 *    cancelled, snipe it with the internal cancel command and clean it
+	 *    up in response finish processing.
+	 * 3. In the finish queue. Not much can be done but to let it get
+	 *    finished and released.
+	 * 4. In the release queue. Again just let it get released.
+	 * In both 3 and 4, we can just drive response processing to drive the
+	 * urbp through to completion. Note there is a window in enqueue where
+	 * the new urbp is not yet on the pending list outside the vdev lock.
+	 * It seems this would be OK - it seems it is unlikely the core would
+	 * call dequeue on the same URB it was currently calling enqueue for. */
+	list_for_each_entry(urbp, &vdev->pending_list, urbp_list) {
 		if (urbp->urb == urb)
 			break;
 	}
 
-	if (!urbp) {
-		wprintk("Try do dequeue an unhandle URB\n");
-		spin_unlock_irqrestore(&vdev->lock, flags);
-		return -ENODEV;
+	while (urbp) {
+		/* Found it in the pending list, see if it is in state 1 */
+		if (urbp->state != VUSB_URBP_SENT) {
+			urbp->state = VUSB_URBP_CANCEL;
+			urbp->urb->status = -ECANCELED;
+			break;
+		}
+
+		/* State 2, this is the hardest one. The urbp cannot be simply
+		 * discarded because it has shadow associated with it. It will
+		 * have to be flagged as canceled and left for response
+		 * processing to handle later. It also has to be shot down in
+		 * the backend processing. */
+		urbp->state = VUSB_URBP_CANCEL;
+		ret = vusb_put_internal_request(vdev, VUSB_CMD_CANCEL, urbp->id);
+		if (ret) {
+			eprintk("Failed cancel command for URB id: %d, err: %d\n",
+				(int)urbp->id, ret);
+			/* Go on and do the best we can... */
+		}
+		break;
 	}
 
-	/* TODO I think I am wrong about using the abort. We may need another
-	 * inernal command to cancel at the URB level. The backend would call
-	 * something like usb_kill_urb or usb_unlink_urb. Leaving the earlier
-	 * note in case...
-	 *
-	 * TODO this may actually be an abort using the internal abort request
-	 * USBIF_T_ABORT_PIPE. At this level it may simply be setting another
-	 * state and processing. Down below it may require sometime like
-	 * ProcessAbortPipe or AbortEndpointWorker. Not really sure why there
-	 * are two of them, needs investigation.
-	 *
-	 * Oh and note, this is exactly what ctxusb used to do with CTXUSB_URBP_CANCEL
-	 * which is an internal request. So abort is probably the right thing here.
-	 */
-	urbp->state = VUSB_URBP_CANCEL;
+	/* For urbp's in states 3 and 4, they will be fishished and released
+	 * and their status is what it is at this point. */
+
 	spin_unlock_irqrestore(&vdev->lock, flags);
 
+	/* Drive processing requests and responses */
 	vusb_process_requests(vdev);
 
-	/* Finished processing */
 	vusb_stop_processing(vdev);
 
 	return 0;
@@ -1044,7 +1066,7 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 	}
 
 	for (i = 0; i < shadow->req.nr_segments; i++)
-		xc_gnttab_end_foreign_access(shadow->req.gref[i], 0, 0UL);
+		xc_gnttab_end_foreign_access(shadow->req.u.gref[i], 0, 0UL);
 
 	memset(&shadow->frames[0], 0,
 		(sizeof(unsigned long)*USBIF_MAX_SEGMENTS_PER_REQUEST));
@@ -1105,7 +1127,7 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 		ref = xc_gnttab_claim_grant_reference(&gref_head);
 		BUG_ON(ref == -ENOSPC);
 
-		shadow->req.gref[shadow->req.nr_segments] = ref;
+		shadow->req.u.gref[shadow->req.nr_segments] = ref;
 
 		xc_gnttab_grant_foreign_access_ref(ref,
 				vdev->xendev->otherend_id, mfn,
@@ -1205,7 +1227,7 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 
 cleanup:
 	for (i = 0; i < shadow->req.nr_segments; i++)
-		xc_gnttab_end_foreign_access(shadow->req.gref[i], 0, 0UL);
+		xc_gnttab_end_foreign_access(shadow->req.u.gref[i], 0, 0UL);
 
 	memset(&shadow->frames[0], 0,
 		(sizeof(unsigned long)*USBIF_MAX_SEGMENTS_PER_REQUEST));
@@ -1240,7 +1262,8 @@ vusb_put_ring(struct vusb_device *vdev, struct vusb_shadow *shadow)
 }
 
 static int
-vusb_put_internal_request(struct vusb_device *vdev, enum vusb_internal_cmd cmd)
+vusb_put_internal_request(struct vusb_device *vdev,
+		enum vusb_internal_cmd cmd, u64 cancel_id)
 {
 	struct vusb_shadow *shadow;
 
@@ -1254,14 +1277,15 @@ vusb_put_internal_request(struct vusb_device *vdev, enum vusb_internal_cmd cmd)
 	BUG_ON(!shadow);
 
 	shadow->urbp = NULL;
+	shadow->req.endpoint = 0;
 	shadow->req.length = 0;
 	shadow->req.offset = 0;
 	shadow->req.nr_segments = 0;
 	shadow->req.setup = 0L;
+	shadow->req.flags = 0;
 
 	if (cmd == VUSB_CMD_RESET || cmd == VUSB_CMD_CYCLE) {
 		/* Resets/cycles are easy - no response data. */
-		shadow->req.endpoint = 0;
 		shadow->req.type = ((cmd == VUSB_CMD_RESET) ? 0 : USBIF_T_RESET);
 		shadow->req.flags = ((cmd == VUSB_CMD_CYCLE) ?
 			USBIF_F_CYCLE_PORT : USBIF_F_RESET);
@@ -1270,7 +1294,12 @@ vusb_put_internal_request(struct vusb_device *vdev, enum vusb_internal_cmd cmd)
 		/* Speed requests use the data field in the response */
 		shadow->req.endpoint = 0 | USB_DIR_IN;
 		shadow->req.type = USBIF_T_GET_SPEED;
-		shadow->req.flags = 0;
+	}
+	else if (cmd == VUSB_CMD_CANCEL) {
+		/* Cancel requests have to set the request ID */
+		shadow->req.type = USBIF_T_CANCEL;
+		shadow->req.flags = USBIF_F_DIRECT_DATA;
+		*((u64*)(&shadow->req.u.data[0])) = cancel_id;
 	}
 	else
 		return -EINVAL;
@@ -1299,6 +1328,9 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 
 	if (!(urb->transfer_flags & URB_SHORT_NOT_OK) && usb_urb_dir_out(urb))
 		shadow->req.flags = USBIF_F_SHORTOK;
+
+	/* Set the req ID to the shadow value */
+	urbp->id = shadow->req.id;
 
 	/* Is there any data to transfer, e.g. a control transaction may
 	 * just be the setup packet. */
@@ -1365,6 +1397,8 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	shadow->req.startframe = 0;
 	if (usb_pipecontrol(urb->pipe) && urb->setup_packet)
 		memcpy(&shadow->req.setup, urb->setup_packet, 8);
+	else
+		shadow->req.setup = 0L;
 
 	vusb_put_ring(vdev, shadow);
 
@@ -1391,7 +1425,7 @@ vusb_urbp_list_dump(const struct vusb_device *vdev, const char *fn)
 	const struct vusb_urbp *urbp;
 
 	dprintk(D_URB2, "===== Current URB List in %s =====\n", fn);
-	list_for_each_entry(urbp, &vdev->request_list, urbp_list) {
+	list_for_each_entry(urbp, &vdev->pending_list, urbp_list) {
 		dprintk(D_URB1, "URB handle 0x%x port %u device %u\n",
 			urbp->handle, urbp->port, vdev->device_id);
 	}
@@ -1450,6 +1484,16 @@ vusb_urb_common_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
 {
 	struct urb *urb = urbp->urb;
 
+	/* If the URB was canceled and shot down in the backend then
+	 * just set an error code and don't bother setting values. */
+	if (urbp->state == VUSB_URBP_CANCEL) {
+		urb->status = -ECANCELED;
+		vusb_urbp_queue_release(vdev, urbp);
+		return;
+	}
+
+	urb->status = vusb_urb_status_to_errno(urbp->rsp.status);
+
 	if (!in) { /* Outbound */
 		dprintk(D_URB2, "Outgoing URB completed status %d\n",
 			urb->status);
@@ -1492,6 +1536,9 @@ vusb_urb_isochronous_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
 	u32 hlen = 0 /* STUB get header lenght */;
 	u32 dlen = 0;
 	int i;
+
+	/* TODO get status, handle CANCEL in here and in frames */
+	urb->status = vusb_urb_status_to_errno(urbp->rsp.status);
 
 	/* STUB sanity check ISO URB */
 
@@ -1555,9 +1602,7 @@ vusb_urb_finish(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	BUG_ON(!shadow->in_use);
 	vusb_put_shadow(vdev, shadow);
 
-	/* Copy over the final status and get the direction */
-	urb->status = vusb_urb_status_to_errno(urbp->rsp.status);
-
+	/* Get direction of request */
 	if (type == PIPE_CONTROL) {
 		ctrl = (struct usb_ctrlrequest *)urb->setup_packet;
 		in = ((ctrl->bRequestType & USB_DIR_IN) != 0) ? true : false;
@@ -1676,13 +1721,9 @@ vusb_send_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 			urbp->state = VUSB_URBP_DROP;
 			urb->status = -ENODEV;
 		}
-	} else if (urbp->state == VUSB_URBP_CANCEL) {
-		/* TODO this might be an abort but more likely something that
-		 * needs to be added as a custom internal command. The abort is not
-		 * specific to one URB. Need usb_unlink_urb in the backend maybe.
-		vusb_send_cancel_urb(vdev, urbp);*/
 	}
 
+	/* This will pick up canceled urbp's from dequeue too */
 	if (urbp->state == VUSB_URBP_DONE ||
 	    urbp->state == VUSB_URBP_DROP ||
 	    urbp->state == VUSB_URBP_CANCEL) {
@@ -1775,7 +1816,7 @@ vusb_check_reset_device(struct vusb_device *vdev)
 		return;
 
 	spin_lock_irqsave(&vdev->lock, flags);
-	ret = vusb_put_internal_request(vdev, VUSB_CMD_RESET);
+	ret = vusb_put_internal_request(vdev, VUSB_CMD_RESET, 0);
 	spin_unlock_irqrestore(&vdev->lock, flags);
 
 	if (ret) {
@@ -1833,18 +1874,19 @@ vusb_process_all(struct vusb_device *vdev, struct vusb_urbp *urbp,
 
 	spin_lock_irqsave(&vdev->lock, flags);
 
-	/* Always drive any response processing. */
-	list_for_each_entry_safe(pos, next, &vdev->request_list, urbp_list) {
+	/* Always drive any response processing. Even if it would get done by
+	 * the tasklet BH processing, this could make room for requests. */
+	list_for_each_entry_safe(pos, next, &vdev->pending_list, urbp_list) {
 		vusb_urb_finish(vdev, pos);
 	}
 
 	if (process_reqs) {
 		/* New URB, queue it at the back */
 		if (urbp)
-			list_add_tail(&urbp->urbp_list, &vdev->request_list);
+			list_add_tail(&urbp->urbp_list, &vdev->pending_list);
 
 		/* Drive request processing */
-		list_for_each_entry_safe(pos, next, &vdev->request_list, urbp_list) {
+		list_for_each_entry_safe(pos, next, &vdev->pending_list, urbp_list) {
 			/* Work scheduled if 1 or more URBs cannot be sent */
 			vusb_send_urb(vdev, pos);
 		}
@@ -1906,7 +1948,6 @@ vusb_interrupt(int irq, void *dev_id)
 	spin_lock_irqsave(&vdev->lock, flags);
 
 again:
-
 	rp = vdev->ring.sring->rsp_prod;
 	rmb(); /* Ensure we see queued responses up to 'rp'. */
 
@@ -1919,13 +1960,17 @@ again:
 
 		/* Processing internal command right here, no urbp's to queue anyway */
 		if (shadow->req.type > USBIF_T_INT) {
-			/* Only the speed request cmd has data */
-			if (shadow->req.type == USBIF_T_GET_SPEED)
+			if (shadow->req.type == USBIF_T_GET_SPEED) {
 				vdev->speed = rsp->data;
-			else if (shadow->req.type == USBIF_T_RESET)
-				vdev->reset = 0;
+				wake_up(&vdev->wait_queue);
+			}
+			else if (shadow->req.type == USBIF_T_RESET) {
+				vdev->reset = 0; /* clear reset, wake waiter */
+				wake_up(&vdev->wait_queue);
+			}
+
+			/* USBIF_T_CANCEL no waiters, no data*/
 			
-			wake_up(&vdev->wait_queue);
 			/* Return the shadow which does almost nothing in this case */
 			vusb_put_shadow(vdev, shadow);
 			continue;
@@ -1935,7 +1980,7 @@ again:
 		 * Not going to free the shadow here - that could be a lot of work;
 		 * dropping it on the BH to take care of */
 		memcpy(&shadow->urbp->rsp, rsp, sizeof(usbif_response_t));
-		list_add_tail(&shadow->urbp->urbp_list, &vdev->response_list);
+		list_add_tail(&shadow->urbp->urbp_list, &vdev->finish_list);
 	}
 
 	vdev->ring.rsp_cons = i;
@@ -2171,9 +2216,9 @@ vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 
 	vdev->vhcd = vhcd;
 	vdev->xendev = dev;
-	INIT_LIST_HEAD(&vdev->request_list);
+	INIT_LIST_HEAD(&vdev->pending_list);
 	INIT_LIST_HEAD(&vdev->release_list);
-	INIT_LIST_HEAD(&vdev->response_list);
+	INIT_LIST_HEAD(&vdev->finish_list);
 	init_waitqueue_head(&vdev->wait_queue);
 
 	/* Strap our VUSB device onto the Xen device context */
@@ -2209,7 +2254,7 @@ vusb_start_device(struct vusb_device *vdev)
 	spin_lock_irqsave(&vdev->lock, flags);
 	vdev->speed = (unsigned int)-1;
 
-	ret = vusb_put_internal_request(vdev, VUSB_CMD_SPEED);
+	ret = vusb_put_internal_request(vdev, VUSB_CMD_SPEED, 0);
 	if (ret) {
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		eprintk("Failed to get device %p speed - ret: %d\n", vdev, ret);
@@ -2290,7 +2335,7 @@ vusb_destroy_device(struct vusb_device *vdev)
 	spin_lock_irqsave(&vdev->lock, flags);
 
 	/* Process any last resonse URBs left */
-	list_for_each_entry_safe(pos, next, &vdev->response_list, urbp_list) {
+	list_for_each_entry_safe(pos, next, &vdev->finish_list, urbp_list) {
 		vusb_urb_finish(vdev, pos);
 	}
 
@@ -2298,7 +2343,7 @@ vusb_destroy_device(struct vusb_device *vdev)
 	list_splice_init(&vdev->release_list, &tmp[0]);
 
 	/* Copy pending urbps to temp list */
-	list_splice_init(&vdev->request_list, &tmp[1]);
+	list_splice_init(&vdev->pending_list, &tmp[1]);
 
 	spin_unlock_irqrestore(&vdev->lock, flags);
 
