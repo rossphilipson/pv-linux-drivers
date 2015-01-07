@@ -27,6 +27,7 @@
  * Handle errors on internal cmds
  * Fix reset logic and locking
  * Sleep/resume
+ * Refactor vusb_put_urb and vusb_put_isochronous_urb into one function.
  * Add branch prediction
  */
 
@@ -1056,8 +1057,9 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 		}
 		kfree(shadow->indirect_reqs);
 		shadow->indirect_reqs = NULL;
-		shadow->indirect_reqs_size = 0;
 	}
+
+	shadow->indirect_reqs_size = 0;
 
 	if (shadow->indirect_frames) {
 		kfree(shadow->indirect_frames);
@@ -1325,8 +1327,8 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	shadow = vusb_get_shadow(vdev);
 	BUG_ON(!shadow);
 
-	if (!(urb->transfer_flags & URB_SHORT_NOT_OK) && usb_urb_dir_out(urb))
-		shadow->req.flags = USBIF_F_SHORTOK;
+	if (!(urb->transfer_flags & URB_SHORT_NOT_OK) && usb_urb_dir_in(urb))
+		shadow->req.flags |= USBIF_F_SHORTOK;
 
 	/* Set the req ID to the shadow value */
 	urbp->id = shadow->req.id;
@@ -1343,14 +1345,14 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 			eprintk("%p(%s) too many pages for non-bulk transfer: %d\n",
 				vdev, vdev->xendev->nodename, nr_mfns);
 			ret = -E2BIG;
-			goto err0;
+			goto err;
 		}
 
 		if (nr_mfns > MAX_PAGES_FOR_INDIRECT_REQUEST) {
 			eprintk("%p(%s) too many pages for any transfer: %d\n",
 				vdev, vdev->xendev->nodename, nr_mfns);
 			ret = -E2BIG;
-			goto err0;
+			goto err;
 		}
 
 		nr_ind_pages = INDIRECT_PAGES_REQUIRED(nr_mfns);
@@ -1364,7 +1366,7 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 		if (!shadow->indirect_reqs || !shadow->indirect_frames) {
 			eprintk("%s out of memory\n", __FUNCTION__);
 			ret = -ENOMEM;
-			goto err0;
+			goto err;
 		}
 
 		ret = vusb_allocate_indirect_grefs(vdev, shadow,
@@ -1373,7 +1375,11 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 						NULL);
 		if (ret) {
 			eprintk("%s failed to alloc indirect grefs\n", __FUNCTION__);
-			goto err1;
+			/* Have to free this here to prevent vusb_put_shadow
+			 * from trying to return grefs */
+			kfree(shadow->indirect_reqs);
+			shadow->indirect_reqs = NULL;
+			goto err;
 		}
 		shadow->req.flags |= USBIF_F_INDIRECT;
 
@@ -1384,8 +1390,10 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 					urb->transfer_buffer_length,
 					true);
 		if (ret) {
-			eprintk("%s failed to alloc grefs\n", __FUNCTION__);
-			goto err0;
+			if (ret != -EBUSY)
+				eprintk("%s failed to alloc grefs\n",
+					__FUNCTION__);
+			goto err;
 		}
 	}
 
@@ -1404,14 +1412,8 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	vusb_put_ring(vdev, shadow);
 
 	return 0;
-err1:
-	kfree(shadow->indirect_reqs);
-	kfree(shadow->indirect_frames);
-	shadow->indirect_reqs = NULL;
-	shadow->indirect_reqs_size = 0;
-	shadow->indirect_frames = NULL;
-
-err0:
+err:
+	/* This will clean up any stuffs allocated above */
 	vusb_put_shadow(vdev, shadow);
 	return ret;
 }
@@ -1435,13 +1437,19 @@ vusb_put_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	shadow = vusb_get_shadow(vdev);
 	BUG_ON(!shadow);
 
+	if (!(urb->transfer_flags & URB_SHORT_NOT_OK) && usb_urb_dir_in(urb))
+		shadow->req.flags |= USBIF_F_SHORTOK;
+
+	if (urb->transfer_flags & URB_ISO_ASAP)
+		shadow->req.flags |= USBIF_F_ASAP;
+
 	/* Set the req ID to the shadow value */
 	urbp->id = shadow->req.id;
 	
 	iso_packets = (usbif_iso_packet_info_t*)kzalloc(PAGE_SIZE, GFP_ATOMIC);
 	if (!iso_packets) {
 		ret = -ENOMEM;
-		goto err0;
+		goto err;
 	}
 	
 	seglen = (u16)urb->transfer_buffer_length/urb->number_of_packets;
@@ -1456,7 +1464,7 @@ vusb_put_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	if (nr_mfns == 0) {
 		eprintk("ISO URB urbp: %p with no data buffers\n", urbp);
 		ret = -EINVAL;
-		goto err0;
+		goto err;
 	}
 
 	if (nr_mfns > USBIF_MAX_ISO_SEGMENTS) {
@@ -1464,14 +1472,79 @@ vusb_put_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 			eprintk("%p(%s) too many pages for ISO transfer: %d\n",
 				vdev, vdev->xendev->nodename, nr_mfns);
 			ret = -E2BIG;
-			goto err0;
+			goto err;
 		}
 
+		/* +1 for the ISO packet page */
+		nr_ind_pages = INDIRECT_PAGES_REQUIRED(nr_mfns + 1);
+		shadow->indirect_reqs_size = nr_ind_pages*PAGE_SIZE;
+		shadow->indirect_reqs =
+			kmalloc(nr_ind_pages*PAGE_SIZE,
+				GFP_ATOMIC);
+		shadow->indirect_frames =
+			kmalloc(nr_ind_pages*USBIF_MAX_SEGMENTS_PER_IREQUEST,
+				GFP_ATOMIC);
+		if (!shadow->indirect_reqs || !shadow->indirect_frames) {
+			eprintk("%s out of memory\n", __FUNCTION__);
+			ret = -ENOMEM;
+			goto err;
+		}
 
+		ret = vusb_allocate_indirect_grefs(vdev, shadow,
+						urb->transfer_buffer,
+						urb->transfer_buffer_length,
+						iso_packets);
+		if (ret) {
+			eprintk("%s failed to alloc ISO indirect grefs\n", __FUNCTION__);
+			/* Have to free this here to prevent vusb_put_shadow
+			 * from trying to return grefs */
+			kfree(shadow->indirect_reqs);
+			shadow->indirect_reqs = NULL;
+			goto err;
+		}
+		shadow->req.flags |= USBIF_F_INDIRECT;
+	}
+	else {
+		/* Setup ISO packet page */
+		ret = vusb_allocate_grefs(vdev, shadow,
+					iso_packets,
+					PAGE_SIZE,
+					true);
+		if (ret) {
+			if (ret != -EBUSY)
+				eprintk("%s failed to alloc ISO packet grefs\n",
+					__FUNCTION__);
+			eprintk("%s failed to alloc grefs\n", __FUNCTION__);
+			goto err;
+		}
+
+		/* The rest are for the data segments */
+		ret = vusb_allocate_grefs(vdev, shadow,
+					urb->transfer_buffer,
+					urb->transfer_buffer_length,
+					true);
+		if (ret) {
+			if (ret != -EBUSY)
+				eprintk("%s failed to alloc grefs\n",
+					__FUNCTION__);
+			goto err;
+		}
 	}
 
+	/* Setup the request for the ring */
+	shadow->req.type = USBIF_T_ISOC;
+	shadow->req.endpoint = usb_pipeendpoint(urb->pipe);
+	shadow->req.offset = BYTE_OFFSET(urb->transfer_buffer);
+	shadow->req.length = urb->transfer_buffer_length;
+	shadow->req.nr_packets = urb->number_of_packets;
+	shadow->req.startframe = urb->start_frame;
+	shadow->req.setup = 0L;
+
+	vusb_put_ring(vdev, shadow);
+
 	return 0;
-err0:
+err:
+	/* This will clean up any stuffs allocated above */
 	vusb_put_shadow(vdev, shadow);
 	return ret;
 }
