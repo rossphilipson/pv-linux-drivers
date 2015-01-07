@@ -25,6 +25,7 @@
  * Modify to use a new HCD interface
  * Use DMA buffers
  * Handle errors on internal cmds
+ * Fix reset logic and locking
  * Sleep/resume
  * Add branch prediction
  */
@@ -71,6 +72,9 @@
 #define USB_RING_SIZE __CONST_RING_SIZE(usbif, PAGE_SIZE)
 #define SHADOW_ENTRIES USB_RING_SIZE
 #define INDIRECT_PAGES_REQUIRED(p) (((p - 1)/USBIF_MAX_SEGMENTS_PER_IREQUEST) + 1)
+#define MAX_INDIRECT_PAGES USBIF_MAX_SEGMENTS_PER_REQUEST
+#define MAX_PAGES_FOR_INDIRECT_REQUEST (MAX_INDIRECT_PAGES * USBIF_MAX_SEGMENTS_PER_IREQUEST)
+#define MAX_PAGES_FOR_INDIRECT_ISO_REQUEST (MAX_PAGES_FOR_INDIRECT_REQUEST - 1)
 
 #define D_VUSB1 (1 << 0)
 #define D_VUSB2 (1 << 1)
@@ -161,12 +165,6 @@ struct vusb_urbp {
 	usbif_response_t	rsp;
 };
 
-struct usbif_indirect_frames {
-	/* Extra 1 for leading ISO descriptor frame if it exists */
-	unsigned long		frames[USBIF_MAX_SEGMENTS_PER_IREQUEST + 1];
-};
-typedef struct usbif_indirect_frames usbif_indirect_frames_t;
-
 struct vusb_shadow {
 	usbif_request_t		req;
 	unsigned long		frames[USBIF_MAX_SEGMENTS_PER_REQUEST];
@@ -174,7 +172,7 @@ struct vusb_shadow {
 	void			*iso_packet_descriptor;
 	void			*indirect_reqs;
 	u32			indirect_reqs_size;
-	void			*indirect_frames;
+	unsigned long		*indirect_frames;
 	unsigned		in_use:1;
 };
 
@@ -339,6 +337,9 @@ vusb_state_to_string(const struct vusb_urbp *urbp)
 
 #endif /* VUSB_DEBUG */
 
+/****************************************************************************/
+/* VUSB HCD & RH                                                            */
+
 static inline u16
 vusb_speed_to_port_stat(enum usb_device_speed speed)
 {
@@ -382,7 +383,8 @@ vusb_set_link_state(struct vusb_device *vdev)
 	if (vdev->present) {
 		newstatus |= (USB_PORT_STAT_CONNECTION) |
 					vusb_speed_to_port_stat(vdev->speed);
-	} else {
+	}
+	else {
 		newstatus &= ~(USB_PORT_STAT_CONNECTION |
 					USB_PORT_STAT_LOW_SPEED |
 					USB_PORT_STAT_HIGH_SPEED |
@@ -406,9 +408,6 @@ vusb_set_link_state(struct vusb_device *vdev)
 
 	vdev->port_status = newstatus;
 }
-
-/****************************************************************************/
-/* VUSB HCD & RH                                                            */
 
 /* SetFeaturePort(PORT_RESET) */
 static void
@@ -513,6 +512,7 @@ vusb_urbp_dump(struct vusb_urbp *urbp)
 }
 #endif /* VUSB_DEBUG */
 
+/* TODO move this and the debug one above */
 static void
 vusb_urbp_queue_release(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
@@ -1056,9 +1056,12 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 		}
 		kfree(shadow->indirect_reqs);
 		shadow->indirect_reqs = NULL;
+		shadow->indirect_reqs_size = 0;
+	}
+
+	if (shadow->indirect_frames) {
 		kfree(shadow->indirect_frames);
 		shadow->indirect_frames = NULL;
-		shadow->indirect_reqs_size = 0;
 	}
 
 	for (i = 0; i < shadow->req.nr_segments; i++)
@@ -1145,8 +1148,6 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 {
 	usbif_indirect_request_t *indirect_reqs =
 		(usbif_indirect_request_t*)shadow->indirect_reqs;
-	usbif_indirect_frames_t *indirect_frames =
-		(usbif_indirect_frames_t*)shadow->indirect_frames;
 	unsigned long mfn, iso_mfn;
 	u32 nr_mfns = SPAN_PAGES(addr, size);
 	grant_ref_t gref_head;
@@ -1157,8 +1158,10 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 	int ret, i = 0, j = 0, k = 0;
 
 	BUG_ON(!indirect_reqs);
-	BUG_ON(!indirect_frames);
+	BUG_ON(!shadow->indirect_frames);
 
+	/* This routine cannot be called multiple times for a given shadow
+	 * buffer where vusb_allocate_grefs can. */
 	shadow->req.nr_segments = 0;
 
 	/* Set up the descriptors for the indirect pages in the request. */
@@ -1192,7 +1195,7 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 				vdev->xendev->otherend_id, iso_mfn,
 				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
 
-		indirect_frames->frames[0] = mfn_to_pfn(iso_mfn);
+		shadow->indirect_frames[0] = mfn_to_pfn(iso_mfn);
 		indirect_reqs[0].nr_segments++;
 		j++;
 	}
@@ -1209,10 +1212,10 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 				vdev->xendev->otherend_id, mfn,
 				usb_urb_dir_out(shadow->urbp->urb)); /* OUT is write, so RO */
 
-		indirect_frames->frames[i + iso_frame] = mfn_to_pfn(mfn);
+		shadow->indirect_frames[i + iso_frame] = mfn_to_pfn(mfn);
 		indirect_reqs[j].nr_segments++;
 		if (++k ==  USBIF_MAX_SEGMENTS_PER_IREQUEST) {
-			indirect_reqs[++j].nr_segments++;
+			indirect_reqs[++j].nr_segments = 0;
 			k = 0;
 		}
  	}
@@ -1337,14 +1340,14 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	if (nr_mfns > USBIF_MAX_SEGMENTS_PER_REQUEST) {
 		/* Need indirect support here, only used with bulk transfers */
 		if (!usb_pipebulk(urb->pipe)) {
-			eprintk("%p(%s) too many segments for non-bulk transfer: %d\n",
+			eprintk("%p(%s) too many pages for non-bulk transfer: %d\n",
 				vdev, vdev->xendev->nodename, nr_mfns);
 			ret = -E2BIG;
 			goto err0;
 		}
 
-		if (nr_mfns > USBIF_MAX_SEGMENTS_PER_IREQUEST) {
-			eprintk("%p(%s) too many segments for any transfer: %d\n",
+		if (nr_mfns > MAX_PAGES_FOR_INDIRECT_REQUEST) {
+			eprintk("%p(%s) too many pages for any transfer: %d\n",
 				vdev, vdev->xendev->nodename, nr_mfns);
 			ret = -E2BIG;
 			goto err0;
@@ -1353,9 +1356,11 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 		nr_ind_pages = INDIRECT_PAGES_REQUIRED(nr_mfns);
 		shadow->indirect_reqs_size = nr_ind_pages*PAGE_SIZE;
 		shadow->indirect_reqs =
-			kmalloc(nr_ind_pages*PAGE_SIZE,	GFP_ATOMIC);
+			kmalloc(nr_ind_pages*PAGE_SIZE,
+				GFP_ATOMIC);
 		shadow->indirect_frames =
-			kmalloc(sizeof(usbif_indirect_frames_t), GFP_ATOMIC);
+			kmalloc(nr_ind_pages*USBIF_MAX_SEGMENTS_PER_IREQUEST,
+				GFP_ATOMIC);
 		if (!shadow->indirect_reqs || !shadow->indirect_frames) {
 			eprintk("%s out of memory\n", __FUNCTION__);
 			ret = -ENOMEM;
@@ -1411,6 +1416,66 @@ err0:
 	return ret;
 }
 
+static int
+vusb_put_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
+{
+	struct vusb_shadow *shadow;
+	struct urb *urb = urbp->urb;
+	usbif_iso_packet_info_t *iso_packets;
+	u32 nr_mfns = 0, nr_ind_pages;
+	u16 seglen;
+	int ret = 0, i;
+
+	BUG_ON(!urb);
+
+	/* Leave room for resets on ring */
+	if (vdev->shadow_free <= 1)
+		return -EAGAIN;
+
+	shadow = vusb_get_shadow(vdev);
+	BUG_ON(!shadow);
+
+	/* Set the req ID to the shadow value */
+	urbp->id = shadow->req.id;
+	
+	iso_packets = (usbif_iso_packet_info_t*)kzalloc(PAGE_SIZE, GFP_ATOMIC);
+	if (!iso_packets) {
+		ret = -ENOMEM;
+		goto err0;
+	}
+	
+	seglen = (u16)urb->transfer_buffer_length/urb->number_of_packets;
+	for (i = 0; i < urb->number_of_packets; i++) {
+		iso_packets[i].offset = urb->iso_frame_desc[i].offset;
+		iso_packets[i].length = seglen;
+	}
+
+	shadow->iso_packet_descriptor = iso_packets;
+
+	nr_mfns = SPAN_PAGES(urb->transfer_buffer, urb->transfer_buffer_length);
+	if (nr_mfns == 0) {
+		eprintk("ISO URB urbp: %p with no data buffers\n", urbp);
+		ret = -EINVAL;
+		goto err0;
+	}
+
+	if (nr_mfns > USBIF_MAX_ISO_SEGMENTS) {
+		if (nr_mfns > MAX_PAGES_FOR_INDIRECT_ISO_REQUEST) {
+			eprintk("%p(%s) too many pages for ISO transfer: %d\n",
+				vdev, vdev->xendev->nodename, nr_mfns);
+			ret = -E2BIG;
+			goto err0;
+		}
+
+
+	}
+
+	return 0;
+err0:
+	vusb_put_shadow(vdev, shadow);
+	return ret;
+}
+
 /****************************************************************************/
 /* URB Processing                                                           */
 
@@ -1430,7 +1495,7 @@ vusb_urbp_list_dump(const struct vusb_device *vdev, const char *fn)
 
 /* Convert status to errno */
 static int
-vusb_urb_status_to_errno(u32 status)
+vusb_status_to_errno(u32 status)
 {
 	switch (status) {
 	case USBIF_RSP_OKAY:
@@ -1488,7 +1553,7 @@ vusb_urb_common_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
 		return;
 	}
 
-	urb->status = vusb_urb_status_to_errno(urbp->rsp.status);
+	urb->status = vusb_status_to_errno(urbp->rsp.status);
 
 	if (!in) { /* Outbound */
 		dprintk(D_URB2, "Outgoing URB completed status %d\n",
@@ -1534,7 +1599,7 @@ vusb_urb_isochronous_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
 	int i;
 
 	/* TODO get status, handle CANCEL in here and in frames */
-	urb->status = vusb_urb_status_to_errno(urbp->rsp.status);
+	urb->status = vusb_status_to_errno(urbp->rsp.status);
 
 	/* STUB sanity check ISO URB */
 
@@ -1621,9 +1686,11 @@ vusb_urb_finish(struct vusb_device *vdev, struct vusb_urbp *urbp)
 }
 
 static void
-vusb_send(struct vusb_device *vdev, struct vusb_urbp *urbp)
+vusb_send(struct vusb_device *vdev, struct vusb_urbp *urbp, int type)
 {
-	int ret = vusb_put_urb(vdev, urbp);
+	int ret = (type != PIPE_ISOCHRONOUS) ?
+		vusb_put_urb(vdev, urbp) :
+		vusb_put_isochronous_urb(vdev, urbp);
 	if (!ret)
 		urbp->state = VUSB_URBP_SENT;
 	else if (ret == -EAGAIN)
@@ -1675,7 +1742,7 @@ vusb_send_control_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 		return;
 	}
 
-	vusb_send(vdev, urbp);
+	vusb_send(vdev, urbp, PIPE_CONTROL);
 }
 
 static void
@@ -1687,6 +1754,7 @@ vusb_send_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 		usb_pipedevice(urb->pipe), usb_pipeendpoint(urb->pipe),
 		usb_urb_dir_in(urb));
 	/* TODO and yea, the original did something special to handle the iso descriptors too */
+	vusb_send(vdev, urbp, PIPE_ISOCHRONOUS);
 }
 
 static void
@@ -1712,7 +1780,7 @@ vusb_send_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 			break;
 		case PIPE_INTERRUPT:
 		case PIPE_BULK:
-			vusb_send(vdev, urbp);
+			vusb_send(vdev, urbp, type);
 			break;
 		default:
 			wprintk("Unknown urb type %x\n", type);
