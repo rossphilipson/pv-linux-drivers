@@ -1774,42 +1774,31 @@ vusb_send(struct vusb_device *vdev, struct vusb_urbp *urbp, int type)
 	}
 }
 
-/* Not defined by hcd.h */
-#define InterfaceOutRequest 						\
-	((USB_DIR_OUT|USB_TYPE_STANDARD|USB_RECIP_INTERFACE) << 8)
-
 static void
 vusb_send_control_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
 	struct urb *urb = urbp->urb;
 	const struct usb_ctrlrequest *ctrl;
-	u8 bRequestType, bRequest;
-	u16 typeReq, wValue;
-	bool in;
+	u16 ctrl_tr, ctrl_value;
 
 	/* Convenient aliases on setup packet*/
 	ctrl = (struct usb_ctrlrequest *)urb->setup_packet;
-	bRequestType = ctrl->bRequestType;
-	bRequest = ctrl->bRequest;
-	wValue = le16_to_cpu(ctrl->wValue);
+	ctrl_tr = (ctrl->bRequestType << 8) | ctrl->bRequest;
+	ctrl_value = le16_to_cpu(ctrl->wValue);
 
-	typeReq = (bRequestType << 8) | bRequest;
-	in = (bRequestType & USB_DIR_IN) != 0;
-
-	dprintk(D_URB2,
-		"Send Control URB Device: %u Endpoint: %u In: %u Cmd: 0x%x 0x%02x\n",
-		usb_pipedevice(urb->pipe),
-		usb_pipeendpoint(urb->pipe),
-		in, ctrl->bRequest, ctrl->bRequestType);
-
-	dprintk(D_URB2, "Setup packet, tb_len=%d\n", urb->transfer_buffer_length);
-	dprint_hex_dump(D_URB2, "SET: ", DUMP_PREFIX_OFFSET, 16, 1, ctrl, 8, true);
+	dprintk(D_URB2, "Send Control URB dev: %u in: %u cmd: 0x%x 0x%02x\n",
+		usb_pipedevice(urb->pipe), ((bRequestType & USB_DIR_IN) != 0),
+		ctrl->bRequest, ctrl->bRequestType);
+	dprintk(D_URB2, "SETUP packet, tb_len=%d\n",
+		urb->transfer_buffer_length);
+	dprint_hex_dump(D_URB2, "SET: ",
+		DUMP_PREFIX_OFFSET, 16, 1, ctrl, 8, true);
 
 	/* The only special case it a set address request. We can't actually
-	 * let the guest do this in the backend - it would cause chaos and mayhem */
-	if (typeReq == (DeviceOutRequest | USB_REQ_SET_ADDRESS)) {
-		vdev->address = wValue;
-		dprintk(D_URB2, "SET ADDRESS %u\n", vdev->address);
+         * let the guest do this in the backend - it would cause mayhem */
+	if (ctrl_tr == (DeviceOutRequest | USB_REQ_SET_ADDRESS)) {
+		vdev->address = ctrl_value;
+		dprintk(D_URB1, "SET ADDRESS %u\n", vdev->address);
 		urb->status = 0;
 		urbp->state = VUSB_URBP_DONE;
 		return;
@@ -1819,38 +1808,22 @@ vusb_send_control_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 }
 
 static void
-vusb_send_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
-{
-	struct urb *urb = urbp->urb;
-
-	dprintk(D_URB2, "Send Isochronous URB device: %u endpoint: %u in: %u\n",
-		usb_pipedevice(urb->pipe), usb_pipeendpoint(urb->pipe),
-		usb_urb_dir_in(urb));
-	/* TODO and yea, the original did something special to handle the iso descriptors too */
-	vusb_send(vdev, urbp, PIPE_ISOCHRONOUS);
-}
-
-static void
 vusb_send_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
 	struct urb *urb = urbp->urb;
-	unsigned int type;
+	unsigned int type = usb_pipetype(urb->pipe);
 
-	type = usb_pipetype(urb->pipe);
-
-	dprintk(D_URB2, "URB urbp: %p state: %s pipe: %s(t:%u e:%u d:%u)\n",
+	dprintk(D_URB2, "Send URB urbp: %p state: %s pipe: %s(t:%u e:%u d:%u)\n",
 		urbp, vusb_state_to_string(urbp),
 		vusb_pipe_to_string(urb), type, usb_pipeendpoint(urb->pipe),
 		usb_urb_dir_in(urb));
 
 	if (urbp->state == VUSB_URBP_NEW) {
 		switch (type) {
-		case PIPE_ISOCHRONOUS:
-			vusb_send_isochronous_urb(vdev, urbp);
-			break;
 		case PIPE_CONTROL:
 			vusb_send_control_urb(vdev, urbp);
 			break;
+		case PIPE_ISOCHRONOUS:
 		case PIPE_INTERRUPT:
 		case PIPE_BULK:
 			vusb_send(vdev, urbp, type);
