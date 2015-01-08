@@ -26,6 +26,7 @@
  * Use DMA buffers
  * Handle errors on internal cmds
  * Fix reset logic and locking
+ * Deal with USBIF_RSP_USB_DEVRMVD
  * Sleep/resume
  * Refactor vusb_put_urb and vusb_put_isochronous_urb into one function.
  * Add branch prediction
@@ -164,13 +165,14 @@ struct vusb_urbp {
 	struct list_head	urbp_list;
 	int			port;
 	usbif_response_t	rsp;
+	usbif_iso_packet_info_t	*iso_packet_info;
 };
 
 struct vusb_shadow {
 	usbif_request_t		req;
 	unsigned long		frames[USBIF_MAX_SEGMENTS_PER_REQUEST];
 	struct vusb_urbp	*urbp;
-	void			*iso_packet_descriptor;
+	usbif_iso_packet_info_t	*iso_packet_info;
 	void			*indirect_reqs;
 	u32			indirect_reqs_size;
 	unsigned long		*indirect_frames;
@@ -1039,10 +1041,11 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 		return;
 	}
 
-	/* Free any resources in use */
-	if (shadow->iso_packet_descriptor) {
-		kfree(shadow->iso_packet_descriptor);
-		shadow->iso_packet_descriptor = NULL;
+	/* If the iso_packet_info has not been detached for the urbp, take
+	 * care of it here. */
+	if (shadow->iso_packet_info) {
+		kfree(shadow->iso_packet_info);
+		shadow->iso_packet_info = NULL;
 	}
 
 	/* N.B. it turns out he readonly param to gnttab_end_foreign_access is,
@@ -1097,12 +1100,12 @@ vusb_work_handler_callback(void *arg)
 
 static int
 vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
-		void *addr, u32 size, bool restart)
+		void *addr, u32 length, bool restart)
 {
 	grant_ref_t gref_head;
 	unsigned long mfn;
 	u8 *va = (u8*)((unsigned long)addr & PAGE_MASK);
-	u32 ref, nr_mfns = SPAN_PAGES(addr, size);
+	u32 ref, nr_mfns = SPAN_PAGES(addr, length);
 	int i, ret;
 
 	dprintk(D_RING2, "Allocate gref for %d mfns\n", (int)nr_mfns);
@@ -1146,12 +1149,12 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 static int
 vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 			struct vusb_shadow *shadow,
-			void *addr, u32 size, void *iso_addr)
+			void *addr, u32 length, void *iso_addr)
 {
 	usbif_indirect_request_t *indirect_reqs =
 		(usbif_indirect_request_t*)shadow->indirect_reqs;
 	unsigned long mfn, iso_mfn;
-	u32 nr_mfns = SPAN_PAGES(addr, size);
+	u32 nr_mfns = SPAN_PAGES(addr, length);
 	grant_ref_t gref_head;
 	u8 *va = (u8*)((unsigned long)addr & PAGE_MASK);
 	u32 nr_total = nr_mfns + (iso_addr ? 1 : 0);
@@ -1425,7 +1428,7 @@ vusb_put_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	struct urb *urb = urbp->urb;
 	usbif_iso_packet_info_t *iso_packets;
 	u32 nr_mfns = 0, nr_ind_pages;
-	u16 seglen;
+	u16 seg_length;
 	int ret = 0, i;
 
 	BUG_ON(!urb);
@@ -1452,13 +1455,13 @@ vusb_put_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 		goto err;
 	}
 	
-	seglen = (u16)urb->transfer_buffer_length/urb->number_of_packets;
+	seg_length = (u16)urb->transfer_buffer_length/urb->number_of_packets;
 	for (i = 0; i < urb->number_of_packets; i++) {
 		iso_packets[i].offset = urb->iso_frame_desc[i].offset;
-		iso_packets[i].length = seglen;
+		iso_packets[i].length = seg_length;
 	}
 
-	shadow->iso_packet_descriptor = iso_packets;
+	shadow->iso_packet_info = iso_packets;
 
 	nr_mfns = SPAN_PAGES(urb->transfer_buffer, urb->transfer_buffer_length);
 	if (nr_mfns == 0) {
@@ -1614,7 +1617,7 @@ vusb_status_to_errno(u32 status)
 
 static void
 vusb_urb_common_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
-		usbif_response_t *rsp, bool in)
+			bool in)
 {
 	struct urb *urb = urbp->urb;
 
@@ -1628,11 +1631,11 @@ vusb_urb_common_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
 
 	urb->status = vusb_status_to_errno(urbp->rsp.status);
 
-	if (!in) { /* Outbound */
+	if (!in) {
 		dprintk(D_URB2, "Outgoing URB completed status %d\n",
 			urb->status);
 		/* Sanity check on len, should be 0 */
-		if (rsp->actual_length) {
+		if (urbp->rsp.actual_length) {
 			wprintk("Data not expected for outgoing URB\n");
 			urb->status = -EIO;
 		}
@@ -1641,21 +1644,23 @@ vusb_urb_common_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
 			urb->actual_length = urb->transfer_buffer_length;
 		}
 	}
-	else { /* Inbound */
+	else {
 		dprintk(D_URB2, "Incoming URB completed status %d len %u\n",
-			urb->status, rsp->actual_length);
+			urb->status, urbp->rsp.actual_length);
 		/* Sanity check on len, should be less or equal to
 		 * the length of the transfer buffer */
-		if (rsp->actual_length > urb->transfer_buffer_length) {
+		if (urbp->rsp.actual_length > urb->transfer_buffer_length) {
 			wprintk("Incoming URB too large (expect %u got %u)\n",
-				urb->transfer_buffer_length, rsp->actual_length);
+				urb->transfer_buffer_length,
+				urbp->rsp.actual_length);
 			urb->status = -EIO;
 		}
 		else if (!urb->status) {
 			dprintk(D_URB2, "In %u bytes out of %u\n",
-				rsp->actual_length, urb->transfer_buffer_length);
+				urbp->rsp.actual_length,
+				urb->transfer_buffer_length);
 
-			urb->actual_length = rsp->actual_length;
+			urb->actual_length = urbp->rsp.actual_length;
 		}
 	}
 
@@ -1664,55 +1669,74 @@ vusb_urb_common_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
 
 static void
 vusb_urb_isochronous_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
-			u32 len, const u8 *data)
+				bool in)
 {
 	struct urb *urb = urbp->urb;
-	u32 hlen = 0 /* STUB get header lenght */;
-	u32 dlen = 0;
+	struct usb_iso_packet_descriptor *iso_desc = &urb->iso_frame_desc[0];
+	u32 total_length = 0, packet_length;
 	int i;
 
-	/* TODO get status, handle CANCEL in here and in frames */
-	urb->status = vusb_status_to_errno(urbp->rsp.status);
+	BUG_ON(!urbp->iso_packet_info);
 
-	/* STUB sanity check ISO URB */
-
-	/* STUB if data is not the response, move ptr */
-
-	for (i = 0; i < urb->number_of_packets; i++) {
-		struct usb_iso_packet_descriptor *desc = &urb->iso_frame_desc[i];
-		u32 plen = 0 /* STUB ISO response lenght */;
-
-		/* Sanity check on packet length */
-		if (plen > desc->length) {
-			wprintk("iso packet %d too much data\n", i);
-			goto iso_err;
-		}
-
-		desc->actual_length = plen;
-		desc->status = 0 /* STUB ISO status */;
-
-		if (usb_urb_dir_in(urb)) {
-			/* Do sanity check each time on effective data length */
-			if (len < (hlen + dlen + plen)) {
-				wprintk("Short URB Iso Response Data."
-					"Expected %u got %u\n",
-					dlen + plen, len - hlen);
-				goto iso_err;
-			}
-			/* Copy to the right offset */
-			memcpy(&(((u8 *)urb->transfer_buffer)[desc->offset]),
-				&data[dlen], plen);
-		}
-		dlen += plen;
+	/* Same for ISO URBs, clear everything, set the status and release */
+	if (urbp->state == VUSB_URBP_CANCEL) {
+		urb->status = -ECANCELED;
+		goto iso_err;
 	}
 
-	urb->actual_length = dlen;
+	urb->status = vusb_status_to_errno(urbp->rsp.status);
+
+	/* Did the entire ISO request fail? */
+	if (urb->status)
+		goto iso_err;
+
+	/* Reset packet error count */
+	urb->error_count = 0;
+
+	for (i = 0; i < urb->number_of_packets; i++) {
+		packet_length = urbp->iso_packet_info[i].length;
+
+		/* Sanity check on packet length */
+		if (packet_length > iso_desc[i].length) {
+			wprintk("ISO packet %d too much data\n", i);
+			goto iso_io;
+		}
+
+		iso_desc[i].actual_length = packet_length;
+		iso_desc[i].status =
+			vusb_status_to_errno(urbp->iso_packet_info[i].status);
+		iso_desc[i].offset = urbp->iso_packet_info[i].offset;
+
+		/* Do sanity check each time on effective data length */
+		if ((in) && (urb->transfer_buffer_length <
+				(total_length + packet_length))) {
+			wprintk("ISO response %d to much data - "
+				"expected %u got %u\n",
+				i, total_length + packet_length,
+				urb->transfer_buffer_length);
+				goto iso_err;
+		}
+
+		if (!iso_desc[i].status)
+			total_length += packet_length;
+		else
+			urb->error_count++;
+	}
+
+	/* Check for new start frame */
+	if (urb->transfer_flags & URB_ISO_ASAP)
+		urb->start_frame = urbp->rsp.data;
+
+	urb->actual_length = total_length;
+	dprintk(D_URB2, "ISO response urbp: %s total: %u errors: %d\n",
+		urbp, total_length, urb->error_count);
 
 	vusb_urbp_queue_release(vdev, urbp);
 	return;
 
+iso_io:
+        urb->status = -EIO;
 iso_err:
-	urb->status = -EIO;
 	for (i = 0; i < urb->number_of_packets; i++) {
 		urb->iso_frame_desc[i].actual_length = 0;
 		urb->iso_frame_desc[i].status = urb->status;
@@ -1731,10 +1755,7 @@ vusb_urb_finish(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	int type = usb_pipetype(urb->pipe);
 	bool in;
 
-	/* Done with this shadow entry, give it back */
 	shadow = &vdev->shadows[urbp->rsp.id];
-	BUG_ON(!shadow->in_use);
-	vusb_put_shadow(vdev, shadow);
 
 	/* Get direction of request */
 	if (type == PIPE_CONTROL) {
@@ -1746,16 +1767,19 @@ vusb_urb_finish(struct vusb_device *vdev, struct vusb_urbp *urbp)
 
 	switch (type) {
 	case PIPE_ISOCHRONOUS:
-//		vusb_urb_isochronous_finish(vdev, urbp, &shadow->rsp, in);
+		vusb_urb_isochronous_finish(vdev, urbp, in);
 		break;
 	case PIPE_CONTROL:
 	case PIPE_INTERRUPT:
 	case PIPE_BULK:
-		vusb_urb_common_finish(vdev, urbp, &urbp->rsp, in);
+		vusb_urb_common_finish(vdev, urbp, in);
 		break;
 	default:
 		eprintk("Unknown pipe type %u\n", type);
 	}
+
+	/* Done with this shadow entry, give it back */
+	vusb_put_shadow(vdev, shadow);
 }
 
 static void
@@ -1965,6 +1989,8 @@ vusb_urbp_release(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 
 	dprintk(D_URB2, "Giveback URB urpb: %p status %d length %u\n",
 		urbp, urb->status, urb->actual_length);
+	if (urbp->iso_packet_info)
+		kfree(urbp->iso_packet_info);
 	kfree(urbp);
 	usb_hcd_unlink_urb_from_ep(vhcd_to_hcd(vhcd), urb);
 	usb_hcd_giveback_urb(vhcd_to_hcd(vhcd), urb, urb->status);
@@ -2092,6 +2118,11 @@ again:
 		 * Not going to free the shadow here - that could be a lot of work;
 		 * dropping it on the BH to take care of */
 		memcpy(&shadow->urbp->rsp, rsp, sizeof(usbif_response_t));
+
+		/* Detach ISO packet info from the shadow for the urbp */
+		shadow->urbp->iso_packet_info = shadow->iso_packet_info;
+		shadow->iso_packet_info = NULL;
+
 		list_add_tail(&shadow->urbp->urbp_list, &vdev->finish_list);
 	}
 
