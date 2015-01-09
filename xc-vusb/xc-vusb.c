@@ -403,7 +403,7 @@ vusb_set_link_state(struct vusb_device *vdev)
 	diff = vdev->port_status ^ newstatus;
 
 	if ((newstatus & USB_PORT_STAT_POWER) &&
-	    (diff & USB_PORT_STAT_CONNECTION)) {
+		(diff & USB_PORT_STAT_CONNECTION)) {
 		newstatus |= (USB_PORT_STAT_C_CONNECTION << 16);
 		dprintk(D_STATE, "Port %u connection state changed: %08x\n",
 				vdev->port, newstatus);
@@ -849,7 +849,7 @@ vusb_hcd_hub_status(struct usb_hcd *hcd, char *buf)
 			else
 				buf[3] |= 1 << (i - 23);
 			dprintk(D_PORT2, "port %u status 0x%08x has changed\n",
-				    vdev->port, vdev->port_status);
+					vdev->port, vdev->port_status);
 			changed = 1;
 		}
 
@@ -1448,13 +1448,13 @@ vusb_put_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 
 	/* Set the req ID to the shadow value */
 	urbp->id = shadow->req.id;
-	
+
 	iso_packets = (usbif_iso_packet_info_t*)kzalloc(PAGE_SIZE, GFP_ATOMIC);
 	if (!iso_packets) {
 		ret = -ENOMEM;
 		goto err;
 	}
-	
+
 	seg_length = (u16)urb->transfer_buffer_length/urb->number_of_packets;
 	for (i = 0; i < urb->number_of_packets; i++) {
 		iso_packets[i].offset = urb->iso_frame_desc[i].offset;
@@ -1735,7 +1735,7 @@ vusb_urb_isochronous_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
 	return;
 
 iso_io:
-        urb->status = -EIO;
+	urb->status = -EIO;
 iso_err:
 	for (i = 0; i < urb->number_of_packets; i++) {
 		urb->iso_frame_desc[i].actual_length = 0;
@@ -1819,7 +1819,7 @@ vusb_send_control_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 		DUMP_PREFIX_OFFSET, 16, 1, ctrl, 8, true);
 
 	/* The only special case it a set address request. We can't actually
-         * let the guest do this in the backend - it would cause mayhem */
+	 * let the guest do this in the backend - it would cause mayhem */
 	if (ctrl_tr == (DeviceOutRequest | USB_REQ_SET_ADDRESS)) {
 		vdev->address = ctrl_value;
 		dprintk(D_URB1, "SET ADDRESS %u\n", vdev->address);
@@ -1861,8 +1861,8 @@ vusb_send_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 
 	/* This will pick up canceled urbp's from dequeue too */
 	if (urbp->state == VUSB_URBP_DONE ||
-	    urbp->state == VUSB_URBP_DROP ||
-	    urbp->state == VUSB_URBP_CANCEL) {
+		urbp->state == VUSB_URBP_DROP ||
+		urbp->state == VUSB_URBP_CANCEL) {
 		/* Remove URB */
 		dprintk(D_URB1, "URB immediate %s\n",
 			vusb_state_to_string(urbp));
