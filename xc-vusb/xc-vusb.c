@@ -64,7 +64,7 @@
 #define VUSB_INTERFACE_VERSION		3
 #define VUSB_INVALID_REQ_ID		((u64)-1)
 
-#define VUSB_PLATFORM_DRIVER_NAME	"vusb-platform"
+#define VUSB_PLATFORM_DRIVER_NAME	"xen-vusb"
 #define VUSB_HCD_DRIVER_NAME		"vusb-hcd"
 #define VUSB_DRIVER_DESC		"OpenXT Virtual USB Host Controller"
 #define VUSB_DRIVER_VERSION		"1.0.0"
@@ -261,6 +261,8 @@ vusb_process_main(struct vusb_device *vdev, struct vusb_urbp *urbp,
 static int
 vusb_put_internal_request(struct vusb_device *vdev,
 		enum vusb_internal_cmd cmd, u64 cancel_id);
+static void
+vusb_urbp_queue_release(struct vusb_device *vdev, struct vusb_urbp *urbp);
 
 /****************************************************************************/
 /* Miscellaneous Routines                                                   */
@@ -494,38 +496,6 @@ vusb_clear_port_feature(struct vusb_device *vdev, u16 val)
 		/* No change needed */
 		return;
 	}
-}
-
-#ifdef VUSB_DEBUG
-/* Dump URBp */
-static inline void
-vusb_urbp_dump(struct vusb_urbp *urbp)
-{
-	struct urb *urb = urbp->urb;
-	unsigned int type;
-
-	type = usb_pipetype(urb->pipe);
-
-	iprintk("URB urbp: %p state: %s status: %d pipe: %s(%u)\n",
-		urbp, vusb_state_to_string(urbp),
-		urb->status, vusb_pipe_to_string(urb), type);
-	iprintk("device: %u endpoint: %u in: %u\n",
-		usb_pipedevice(urb->pipe), usb_pipeendpoint(urb->pipe),
-		usb_urb_dir_in(urb));
-}
-#endif /* VUSB_DEBUG */
-
-/* TODO move this and the debug one above */
-static void
-vusb_urbp_queue_release(struct vusb_device *vdev, struct vusb_urbp *urbp)
-{
-	/* Remove from the active urbp list and place it on the release list.
-	 * Called from the urb processing routines holding the vdev lock. */
-	list_del(&urbp->urbp_list);
-
-	list_add_tail(&urbp->urbp_list, &vdev->release_list);
-
-	schedule_work(&vdev->work);
 }
 
 /* Hub descriptor */
@@ -1974,6 +1944,25 @@ vusb_check_reset_device(struct vusb_device *vdev)
 	usb_hcd_poll_rh_status(vhcd_to_hcd(vdev->vhcd));
 }
 
+#ifdef VUSB_DEBUG
+/* Dump URBp */
+static inline void
+vusb_urbp_dump(struct vusb_urbp *urbp)
+{
+	struct urb *urb = urbp->urb;
+	unsigned int type;
+
+	type = usb_pipetype(urb->pipe);
+
+	iprintk("URB urbp: %p state: %s status: %d pipe: %s(%u)\n",
+		urbp, vusb_state_to_string(urbp),
+		urb->status, vusb_pipe_to_string(urb), type);
+	iprintk("device: %u endpoint: %u in: %u\n",
+		usb_pipedevice(urb->pipe), usb_pipeendpoint(urb->pipe),
+		usb_urb_dir_in(urb));
+}
+#endif /* VUSB_DEBUG */
+
 static void
 vusb_urbp_release(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 {
@@ -1994,6 +1983,18 @@ vusb_urbp_release(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
 	kfree(urbp);
 	usb_hcd_unlink_urb_from_ep(vhcd_to_hcd(vhcd), urb);
 	usb_hcd_giveback_urb(vhcd_to_hcd(vhcd), urb, urb->status);
+}
+
+static void
+vusb_urbp_queue_release(struct vusb_device *vdev, struct vusb_urbp *urbp)
+{
+	/* Remove from the active urbp list and place it on the release list.
+	 * Called from the urb processing routines holding the vdev lock. */
+	list_del(&urbp->urbp_list);
+
+	list_add_tail(&urbp->urbp_list, &vdev->release_list);
+
+	schedule_work(&vdev->work);
 }
 
 static void
