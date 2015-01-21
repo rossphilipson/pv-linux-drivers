@@ -248,7 +248,7 @@ static struct platform_device *vusb_platform_device = NULL;
 static DEFINE_MUTEX(vusb_xen_pm_mutex);
 
 static bool
-vusb_start_processing(struct vusb_device *vdev);
+vusb_start_processing(struct vusb_device *vdev, const char *caller);
 static void
 vusb_stop_processing(struct vusb_device *vdev);
 static void
@@ -1303,7 +1303,8 @@ vusb_put_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	if (!(urb->transfer_flags & URB_SHORT_NOT_OK) && usb_urb_dir_in(urb))
 		shadow->req.flags |= USBIF_F_SHORTOK;
 
-	/* Set the req ID to the shadow value */
+	/* Set the urbp and req ID to the shadow value */
+	shadow->urbp = urbp;
 	urbp->id = shadow->req.id;
 
 	/* Is there any data to transfer, e.g. a control transaction may
@@ -1416,7 +1417,8 @@ vusb_put_isochronous_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	if (urb->transfer_flags & URB_ISO_ASAP)
 		shadow->req.flags |= USBIF_F_ASAP;
 
-	/* Set the req ID to the shadow value */
+	/* Set the urbp and req ID to the shadow value */
+	shadow->urbp = urbp;
 	urbp->id = shadow->req.id;
 
 	iso_packets = (usbif_iso_packet_info_t*)kzalloc(PAGE_SIZE, GFP_ATOMIC);
@@ -1844,7 +1846,7 @@ vusb_send_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 /* VUSB Devices                                                             */
 
 static bool
-vusb_start_processing(struct vusb_device *vdev)
+vusb_start_processing(struct vusb_device *vdev, const char *caller)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
 	unsigned long flags;
@@ -1852,7 +1854,8 @@ vusb_start_processing(struct vusb_device *vdev)
 	spin_lock_irqsave(&vhcd->lock, flags);
 
 	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
-		eprintk("Start processing called while device(s) in invalid states\n");
+		eprintk("%s called start processing - device %p invalid state\n",
+			caller, vdev);
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		return false;
 	}
@@ -2047,7 +2050,7 @@ vusb_work_handler(struct work_struct *work)
 {
 	struct vusb_device *vdev = container_of(work, struct vusb_device, work);
 
-	if (!vusb_start_processing(vdev))
+	if (!vusb_start_processing(vdev, __FUNCTION__))
 		return;
 
 	/* Start request processing again */
@@ -2061,7 +2064,7 @@ vusb_bh_handler(unsigned long data)
 {
 	struct vusb_device *vdev = (struct vusb_device*)data;
 
-	if (!vusb_start_processing(vdev))
+	if (!vusb_start_processing(vdev, __FUNCTION__))
 		return;
 
 	/* Process only responses in the BH */
@@ -2081,7 +2084,7 @@ vusb_interrupt(int irq, void *dev_id)
 	int more;
 
 	/* Shutting down or not ready? */
-	if (!vusb_start_processing(vdev))
+	if (!vusb_start_processing(vdev, __FUNCTION__))
 		return IRQ_HANDLED;
 
 	spin_lock_irqsave(&vdev->lock, flags);
