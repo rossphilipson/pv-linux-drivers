@@ -25,7 +25,7 @@
  * Modify to use a new HCD interface
  * Use DMA buffers
  * Handle errors on internal cmds
- * Fix reset logic and locking
+ * Fix reset logic and locking - and flag/type inconsistencies
  * Deal with USBIF_RSP_USB_DEVRMVD
  * Sleep/resume
  * Refactor vusb_put_urb and vusb_put_isochronous_urb into one function.
@@ -1259,8 +1259,9 @@ vusb_put_internal_request(struct vusb_device *vdev,
 	shadow->req.flags = 0;
 
 	if (cmd == VUSB_CMD_RESET || cmd == VUSB_CMD_CYCLE) {
-		/* Resets/cycles are easy - no response data. */
-		shadow->req.type = ((cmd == VUSB_CMD_RESET) ? 0 : USBIF_T_RESET);
+		/* Resets/cycles are easy - no response data. Always use the
+		 * reset type even though the backed relies on the flags. */
+		shadow->req.type = USBIF_T_RESET;
 		shadow->req.flags = ((cmd == VUSB_CMD_CYCLE) ?
 			USBIF_F_CYCLE_PORT : USBIF_F_RESET);
 	}
