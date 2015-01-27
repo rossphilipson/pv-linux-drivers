@@ -70,7 +70,8 @@
 #define VUSB_DRIVER_VERSION		"1.0.0"
 #define VUSB_POWER_BUDGET		5000 /* mA */
 
-#define GRANT_INVALID_REF 0
+#define GRANTREF_INVALID 		0
+#define EVTCHN_INVALID			(-1)
 #define USB_RING_SIZE __CONST_RING_SIZE(usbif, PAGE_SIZE)
 #define SHADOW_ENTRIES USB_RING_SIZE
 #define INDIRECT_PAGES_REQUIRED(p) (((p - 1)/USBIF_MAX_SEGMENTS_PER_IREQUEST) + 1)
@@ -1855,8 +1856,9 @@ vusb_start_processing(struct vusb_device *vdev, const char *caller)
 	spin_lock_irqsave(&vhcd->lock, flags);
 
 	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
-		eprintk("%s called start processing - device %p invalid state\n",
-			caller, vdev);
+		eprintk("%s called start processing - device %p"
+			"invalid state - vhcd: %d vdev: %d\n",
+			caller, vdev, vhcd->state, vdev->present);
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		return false;
 	}
@@ -2167,18 +2169,24 @@ vusb_device_clear(struct vusb_device *vdev)
 static void
 vusb_usbif_free(struct vusb_device *vdev, int suspend)
 {
+	struct xenbus_device *dev = vdev->xendev;
+
 	/* Free resources associated with old device channel. */
-	if (vdev->ring_ref != GRANT_INVALID_REF) {
+	if (vdev->ring_ref != GRANTREF_INVALID) {
 		/* This frees the page too */
 		xc_gnttab_end_foreign_access(vdev->ring_ref, 0,
 					(unsigned long)vdev->ring.sring);
-		vdev->ring_ref = GRANT_INVALID_REF;
+		vdev->ring_ref = GRANTREF_INVALID;
 		vdev->ring.sring = NULL;
 	}
 
 	if (vdev->irq)
 		xc_unbind_from_irqhandler(vdev->irq, vdev);
 	vdev->evtchn = vdev->irq = 0;
+
+	if (vdev->evtchn != EVTCHN_INVALID)
+		xenbus_free_evtchn(dev, vdev->evtchn);
+	vdev->evtchn = EVTCHN_INVALID;
 
 	if (vdev->shadows) {
 		kfree(vdev->shadows);
@@ -2198,7 +2206,9 @@ vusb_setup_usbfront(struct vusb_device *vdev)
 	struct usbif_sring *sring;
 	int err, i;
 
-	vdev->ring_ref = GRANT_INVALID_REF;
+	vdev->ring_ref = GRANTREF_INVALID;
+	vdev->evtchn = EVTCHN_INVALID;
+	vdev->irq = 0;
 
 	sring = (struct usbif_sring *)__get_free_page(GFP_NOIO | __GFP_HIGH);
 	if (!sring) {
@@ -2217,17 +2227,12 @@ vusb_setup_usbfront(struct vusb_device *vdev)
 	vdev->ring_ref = err;
 
 	err = xc_xenbus_alloc_evtchn(dev, &vdev->evtchn);
-	if (err)
-		goto fail;
-
-	err = xc_bind_evtchn_to_irqhandler(vdev->evtchn, vusb_interrupt,
-					USBFRONT_IRQF, "usbif", vdev);
-	if (err <= 0) {
-		xc_xenbus_dev_fatal(dev, err,
-				 "bind_evtchn_to_irqhandler failed");
+	if (err) {
+		vdev->evtchn = EVTCHN_INVALID;
 		goto fail;
 	}
-	vdev->irq = err;
+	/* Not binding the IRQ here, we don't want to get interrupts before
+	 * we are ready to process events. */
 
 	/* Allocate the shadow buffers */
 	vdev->shadows = kzalloc(sizeof(struct vusb_shadow)*SHADOW_ENTRIES,
@@ -2397,6 +2402,16 @@ vusb_start_device(struct vusb_device *vdev)
 	vdev->present = 1;
 	vdev->connecting = 0;
 	spin_unlock_irqrestore(&vhcd->lock, flags);
+
+	/* Bind the event channel here, we are ready to process stuffs */
+	ret = xc_bind_evtchn_to_irqhandler(vdev->evtchn, vusb_interrupt,
+					USBFRONT_IRQF, "usbif", vdev);
+	if (ret <= 0) {
+		eprintk("bind_evtchn_to_irqhandler failed device %p ret: %d\n",
+			vdev, ret);
+		return ret;
+	}
+	vdev->irq = ret;
 
 	/* The rest are vdev operations with the device lock */
 	spin_lock_irqsave(&vdev->lock, flags);
