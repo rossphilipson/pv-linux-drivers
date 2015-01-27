@@ -2021,7 +2021,7 @@ vusb_process_main(struct vusb_device *vdev, struct vusb_urbp *urbp,
 
 	/* Always drive any response processing. Even if it would get done by
 	 * the tasklet BH processing, this could make room for requests. */
-	list_for_each_entry_safe(pos, next, &vdev->pending_list, urbp_list) {
+	list_for_each_entry_safe(pos, next, &vdev->finish_list, urbp_list) {
 		vusb_urb_finish(vdev, pos);
 	}
 
