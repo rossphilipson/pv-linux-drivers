@@ -1856,7 +1856,7 @@ vusb_start_processing(struct vusb_device *vdev, const char *caller)
 	spin_lock_irqsave(&vhcd->lock, flags);
 
 	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
-		eprintk("%s called start processing - device %p"
+		eprintk("%s called start processing - device %p "
 			"invalid state - vhcd: %d vdev: %d\n",
 			caller, vdev, vhcd->state, vdev->present);
 		spin_unlock_irqrestore(&vhcd->lock, flags);
