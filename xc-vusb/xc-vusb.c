@@ -231,8 +231,9 @@ struct vusb_rh_port {
 	/* State of device attached to this vRH port */
 	unsigned			connecting:1;
 	unsigned			present:1;
-	unsigned			processing:1;
 	unsigned			closing:1;
+	/* Current counter for jobs processing for device */
+	u32				processing;
 };
 
 struct vusb_vhcd {
@@ -424,8 +425,8 @@ vusb_put_vport(struct vusb_vhcd *vhcd, struct vusb_rh_port *vport)
 	vport->device_id = 0;
 	vport->connecting = 0;
 	vport->present= 0;
-	vport->processing = 0;
 	vport->closing = 0;
+	vport->processing = 0;
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
 
@@ -689,8 +690,8 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 		return ret;
 	}
 
-	/* Set it in the processing state so it is not nuked out from under us */
-	vport->processing = 1; /* TODO ++ */
+	/* Bump the processing counter so it is not nuked out from under us */
+	vport->processing++;
 	vdev = vusb_vdev_by_port(vhcd, urbp->port);
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
@@ -745,8 +746,8 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 		return -ESHUTDOWN;
 	}
 
-	/* Set it in the processing state so it is not nuked out from under us */
-	vport->processing = 1; /* TODO ++ */
+	/* Bump the processing counter so it is not nuked out from under us */
+	vport->processing++;
 	vdev = vusb_vdev_by_port(vhcd, urb->dev->portnum);
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
@@ -1931,7 +1932,7 @@ vusb_start_processing(struct vusb_device *vdev, const char *caller)
 		return false;
 	}
 
-	vport->processing = 1; /* TODO ++ */
+	vport->processing++;
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	return true;
@@ -1946,7 +1947,7 @@ vusb_stop_processing(struct vusb_device *vdev)
 	unsigned long flags;
 
 	spin_lock_irqsave(&vhcd->lock, flags);
-	vport->processing = 0; /* TODO -- */
+	vport->processing--;
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
 
@@ -1961,9 +1962,7 @@ vusb_wait_stop_processing(struct vusb_device *vdev)
 again:
 	spin_lock_irqsave(&vhcd->lock, flags);
 
-	vport->closing = 0; /* Going away now... */
-
-	if (vport->processing) {
+	if (vport->processing > 0) {
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		set_current_state(TASK_INTERRUPTIBLE);
 		schedule_timeout(HZ);
@@ -2515,6 +2514,18 @@ vusb_destroy_device(struct vusb_device *vdev)
 	unsigned long flags;
 	bool update_rh = false;
 
+	spin_lock_irqsave(&vhcd->lock, flags);
+
+	/* First test if it is already closing, if not, set closing */
+	if (vport->closing) {
+		spin_unlock_irqrestore(&vdev->lock, flags);
+		return;
+	}
+
+	vport->closing = 1; /* Going away now... */
+
+	spin_unlock_irqrestore(&vdev->lock, flags);
+	
 	dprintk(D_PORT1, "Remove device from port %u\n", vdev->port);
 
 	INIT_LIST_HEAD(&tmp[0]);
