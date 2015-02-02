@@ -128,15 +128,10 @@
 #endif
 
 /* Port are numbered from 1 in linux */
-#define vusb_device_by_port(v, port) (&(v)->vdev_ports[(port) - 1])
-#define vusb_check_port(req, index)				\
-do {								\
-	if ((index) < 1 || (index) > VUSB_PORTS) {		\
-		wprintk(req" with invalid port %u", (index));	\
-		retval = -EPIPE;				\
-		break;						\
-	}							\
-} while (0)
+#define vusb_vdev_by_port(v, port) (&((v)->vrh_ports[(port) - 1].vdev))
+#define vusb_vport_by_port(v, port) (&(v)->vrh_ports[(port) - 1])
+#define vusb_check_port(index) \
+	(((index) < 1 || (index) > VUSB_PORTS) ? false : true)
 
 #define vusb_process_requests(v) vusb_process_main(v, NULL, true)
 #define vusb_process_new_requests(v, u) vusb_process_main(v, u, true)
@@ -182,14 +177,9 @@ struct vusb_shadow {
 
 /* Virtual USB device on of the RH ports */
 struct vusb_device {
-	u16				device_id;
-	u32				port_status;
+	spinlock_t			lock;
 	u16				address;
-	u16				port;
-	unsigned			present:1;
-	unsigned			connecting:1;
-	unsigned			processing:1;
-	unsigned			closing:1;
+	enum usb_device_speed		speed;
 	unsigned			reset:2;
 
 	/* The Xenbus device associated with this vusb device */
@@ -197,9 +187,6 @@ struct vusb_device {
 
 	/* Pointer back to the virtual HCD core device */
 	struct vusb_vhcd		*vhcd;
-
-	/* Lock for device resources */
-	spinlock_t			lock;
 
 	/* Xen rings and event channel */
 	int				ring_ref;
@@ -221,8 +208,6 @@ struct vusb_device {
 	struct work_struct 		work;
 	struct tasklet_struct		tasklet;
 	wait_queue_head_t		wait_queue;
-
-	enum usb_device_speed		speed;
 };
 
 /* Virtual USB HCD/RH pieces */
@@ -236,13 +221,27 @@ enum vusb_state {
 	VUSB_RUNNING
 };
 
+struct vusb_rh_port {
+	u32				port;
+	u32				port_status;
+
+	u16				device_id;
+	struct vusb_device		vdev;
+
+	/* State of device attached to this vRH port */
+	unsigned			connecting:1;
+	unsigned			present:1;
+	unsigned			processing:1;
+	unsigned			closing:1;
+};
+
 struct vusb_vhcd {
 	spinlock_t			lock;
 
 	enum vusb_state			state;
 	enum vusb_rh_state		rh_state;
 
-	struct vusb_device		vdev_ports[VUSB_PORTS];
+	struct vusb_rh_port		vrh_ports[VUSB_PORTS];
 };
 
 static struct platform_device *vusb_platform_device = NULL;
@@ -306,7 +305,6 @@ vusb_rhstate_to_string(const struct vusb_vhcd *vhcd)
 static const char *
 vusb_pipe_to_string(struct urb *urb)
 {
-
 	switch (usb_pipetype(urb->pipe)) {
 	case PIPE_ISOCHRONOUS:
 		return "ISOCHRONOUS";
@@ -377,18 +375,72 @@ vusb_pipe_type_to_optype(u16 type)
 	}
 }
 
+static struct vusb_rh_port*
+vusb_get_vport(struct vusb_vhcd *vhcd, u16 id)
+{
+	u16 i;
+	unsigned long flags;
+	struct vusb_rh_port *vport;
+
+	spin_lock_irqsave(&vhcd->lock, flags);
+	for (i = 0; i < VUSB_PORTS; i++) {
+		if ((vhcd->vrh_ports[i].connecting)||
+			(vhcd->vrh_ports[i].closing))
+			continue;
+		if (!vhcd->vrh_ports[i].present)
+			break;
+		if (vhcd->vrh_ports[i].device_id == id) {
+			wprintk("Device id 0x%04x already exists on port %d\n",
+				id, vhcd->vrh_ports[i].port);
+			spin_unlock_irqrestore(&vhcd->lock, flags);
+			return NULL;
+		}
+	}
+
+	if (i >= VUSB_PORTS) {
+		wprintk("Attempt to add a device but no free ports on the root hub.\n");
+		spin_unlock_irqrestore(&vhcd->lock, flags);
+		return NULL;
+	}
+
+	vport = &vhcd->vrh_ports[i];
+	vport->device_id = id;
+	vport->connecting = 1;
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+
+	return vport;
+}
+
 static void
-vusb_set_link_state(struct vusb_device *vdev)
+vusb_put_vport(struct vusb_vhcd *vhcd, struct vusb_rh_port *vport)
+{
+	unsigned long flags;
+
+	/* TODO how to reset port status on put */
+
+	/* Restore the port values when no device is attached */
+	spin_lock_irqsave(&vhcd->lock, flags);
+	memset(&vport->vdev, 0, sizeof(struct vusb_device));
+	vport->device_id = 0;
+	vport->connecting = 0;
+	vport->present= 0;
+	vport->processing = 0;
+	vport->closing = 0;
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+}
+
+static void
+vusb_set_link_state(struct vusb_rh_port *vport)
 {
 	u32 newstatus, diff;
 
-	newstatus = vdev->port_status;
+	newstatus = vport->port_status;
 	dprintk(D_STATE, "SLS: Port index %u status 0x%08x\n",
-			vdev->port, newstatus);
+			vport->port, newstatus);
 
-	if (vdev->present) {
+	if (vport->present) {
 		newstatus |= (USB_PORT_STAT_CONNECTION) |
-					vusb_speed_to_port_stat(vdev->speed);
+					vusb_speed_to_port_stat(vport->vdev.speed);
 	}
 	else {
 		newstatus &= ~(USB_PORT_STAT_CONNECTION |
@@ -403,39 +455,37 @@ vusb_set_link_state(struct vusb_device *vdev)
 					USB_PORT_STAT_HIGH_SPEED |
 					USB_PORT_STAT_SUSPEND);
 	}
-	diff = vdev->port_status ^ newstatus;
+	diff = vport->port_status ^ newstatus;
 
 	if ((newstatus & USB_PORT_STAT_POWER) &&
 		(diff & USB_PORT_STAT_CONNECTION)) {
 		newstatus |= (USB_PORT_STAT_C_CONNECTION << 16);
 		dprintk(D_STATE, "Port %u connection state changed: %08x\n",
-				vdev->port, newstatus);
+				vport->port, newstatus);
 	}
 
-	vdev->port_status = newstatus;
+	vport->port_status = newstatus;
 }
 
 /* SetFeaturePort(PORT_RESET) */
 static void
-vusb_port_reset(struct vusb_vhcd *vhcd, struct vusb_device *vdev)
+vusb_port_reset(struct vusb_vhcd *vhcd, struct vusb_rh_port *vport)
 {
 	printk(KERN_DEBUG"vusb: port reset %u 0x%08x",
-		   vdev->port, vdev->port_status);
+		   vport->port, vport->port_status);
 
-	vdev->port_status |= USB_PORT_STAT_ENABLE | USB_PORT_STAT_POWER;
+	vport->port_status |= USB_PORT_STAT_ENABLE | USB_PORT_STAT_POWER;
 
-	vdev->reset = 1;
+	/* TODO reset needs work! */
+	vport->vdev.reset = 1;
 
-	/* Schedule it, can't do it here in the vHCD lock */
-	schedule_work(&vdev->work);
+	/* Schedule it for the device, can't do it here in the vHCD lock */
+	schedule_work(&vport->vdev.work);
 }
 
 static void
-vusb_set_port_feature(struct vusb_vhcd *vhcd, struct vusb_device *vdev, u16 val)
+vusb_set_port_feature(struct vusb_vhcd *vhcd, struct vusb_rh_port *vport, u16 val)
 {
-	if (!vdev)
-		return;
-
 	switch (val) {
 	case USB_PORT_FEAT_INDICATOR:
 	case USB_PORT_FEAT_SUSPEND:
@@ -443,56 +493,51 @@ vusb_set_port_feature(struct vusb_vhcd *vhcd, struct vusb_device *vdev, u16 val)
 		break;
 
 	case USB_PORT_FEAT_POWER:
-		vdev->port_status |= USB_PORT_STAT_POWER;
+		vport->port_status |= USB_PORT_STAT_POWER;
 		break;
 	case USB_PORT_FEAT_RESET:
-		vusb_port_reset(vhcd, vdev);
+		vusb_port_reset(vhcd, vport);
 		break;
 	case USB_PORT_FEAT_C_CONNECTION:
 	case USB_PORT_FEAT_C_RESET:
 	case USB_PORT_FEAT_C_ENABLE:
 	case USB_PORT_FEAT_C_SUSPEND:
 	case USB_PORT_FEAT_C_OVER_CURRENT:
-		vdev->port_status &= ~(1 << val);
+		vport->port_status &= ~(1 << val);
 		break;
-
 	default:
 		/* No change needed */
 		return;
 	}
-	vusb_set_link_state(vdev);
+	vusb_set_link_state(vport);
 }
 
 static void
-vusb_clear_port_feature(struct vusb_device *vdev, u16 val)
+vusb_clear_port_feature(struct vusb_rh_port *vport, u16 val)
 {
 	switch (val) {
 	case USB_PORT_FEAT_INDICATOR:
 	case USB_PORT_FEAT_SUSPEND:
 		/* Ignored now */
 		break;
-
 	case USB_PORT_FEAT_ENABLE:
-		vdev->port_status &= ~USB_PORT_STAT_ENABLE;
-		vusb_set_link_state(vdev);
+		vport->port_status &= ~USB_PORT_STAT_ENABLE;
+		vusb_set_link_state(vport);
 		break;
-
 	case USB_PORT_FEAT_POWER:
-		vdev->port_status &= ~(USB_PORT_STAT_POWER | USB_PORT_STAT_ENABLE);
-		vusb_set_link_state(vdev);
+		vport->port_status &= ~(USB_PORT_STAT_POWER | USB_PORT_STAT_ENABLE);
+		vusb_set_link_state(vport);
 		break;
-
 	case USB_PORT_FEAT_C_CONNECTION:
 	case USB_PORT_FEAT_C_RESET:
 	case USB_PORT_FEAT_C_ENABLE:
 	case USB_PORT_FEAT_C_SUSPEND:
 	case USB_PORT_FEAT_C_OVER_CURRENT:
 		dprintk(D_PORT1, "Clear bit %d, old 0x%08x mask 0x%08x new 0x%08x\n",
-				val, vdev->port_status, ~(1 << val),
-				vdev->port_status & ~(1 << val));
-		vdev->port_status &= ~(1 << val);
+				val, vport->port_status, ~(1 << val),
+				vport->port_status & ~(1 << val));
+		vport->port_status &= ~(1 << val);
 		break;
-
 	default:
 		/* No change needed */
 		return;
@@ -537,20 +582,12 @@ vusb_init_hcd(struct vusb_vhcd *vhcd)
 
 	dprintk(D_PM, "Init the HCD\n");
 
-	/* TODO RJP revisit, may not want to clear the devices on resume path
+	/* TODO RJP revisit, may not need to clear the ports on resume path
 	 * also may need suspend/resume for S3 */
 	/* Initialize ports */
 	for (i = 0; i < VUSB_PORTS; i++) {
-		vhcd->vdev_ports[i].port = i + 1;
-		vhcd->vdev_ports[i].vhcd = vhcd;
-		vhcd->vdev_ports[i].connecting = 0;
-		vhcd->vdev_ports[i].present = 0;
-		vhcd->vdev_ports[i].processing = 0;
-		vhcd->vdev_ports[i].closing = 0;
-		spin_lock_init(&vhcd->vdev_ports[i].lock);
-		INIT_WORK(&vhcd->vdev_ports[i].work, vusb_work_handler);
-		tasklet_init(&vhcd->vdev_ports[i].tasklet, vusb_bh_handler,
-			(unsigned long)(&vhcd->vdev_ports[i]));
+		memset(&vhcd->vrh_ports[i], 0, sizeof(struct vusb_rh_port));
+		vhcd->vrh_ports[i].port = i + 1;
 	}
 
 	vhcd->state = VUSB_INACTIVE;
@@ -604,6 +641,7 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	struct vusb_vhcd *vhcd;
 	unsigned long flags;
 	struct vusb_urbp *urbp;
+	struct vusb_rh_port *vport;
 	struct vusb_device *vdev;
 	int ret = -ENOMEM;
 
@@ -613,6 +651,9 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 
 	if (!urb->transfer_buffer && urb->transfer_buffer_length)
 		return -EINVAL;
+
+	if (!vusb_check_port(urb->dev->portnum))
+		return -EPIPE;
 
 	urbp = kmalloc(sizeof(*urbp), mem_flags);
 	if (!urbp)
@@ -627,15 +668,15 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 
 	spin_lock_irqsave(&vhcd->lock, flags);
 
-	vdev = vusb_device_by_port(vhcd, urbp->port);
-	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
-		eprintk("Enqueue start processing called while device(s) in invalid states\n");
+	vport = vusb_vport_by_port(vhcd, urbp->port);
+	if (vhcd->state == VUSB_INACTIVE || !vport->present) {
+		eprintk("Enqueue processing called with device/port invalid states\n");
 		kfree(urbp);
 		spin_unlock_irqrestore(&vhcd->lock, flags);
-		return -ESHUTDOWN;
+		return -ENXIO;
 	}
 
-	if (vdev->closing) {
+	if (vport->closing) {
 		kfree(urbp);
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		return -ESHUTDOWN;
@@ -644,12 +685,13 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	ret = usb_hcd_link_urb_to_ep(hcd, urb);
 	if (ret) {
 		kfree(urbp);
-		spin_unlock_irqrestore(&vdev->lock, flags);
+		spin_unlock_irqrestore(&vhcd->lock, flags);
 		return ret;
 	}
 
 	/* Set it in the processing state so it is not nuked out from under us */
-	vdev->processing = 1;
+	vport->processing = 1; /* TODO ++ */
+	vdev = vusb_vdev_by_port(vhcd, urbp->port);
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	vusb_process_new_requests(vdev, urbp);
@@ -666,14 +708,20 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 	struct vusb_vhcd *vhcd;
 	unsigned long flags;
 	int ret;
+	struct vusb_rh_port *vport;
 	struct vusb_device *vdev;
 	struct vusb_urbp *urbp;
 
 	dprintk(D_MISC, "*vusb_urb_dequeue\n");
+
+	if (!vusb_check_port(urb->dev->portnum))
+		return -EPIPE;
+
 	vhcd = hcd_to_vhcd(hcd);
 
 	spin_lock_irqsave(&vhcd->lock, flags);
 
+	/* Supposed to hold HCD lock when calling this */
 	ret = usb_hcd_check_unlink_urb(hcd, urb, status);
 	if (ret) {
 		spin_unlock_irqrestore(&vhcd->lock, flags);
@@ -685,20 +733,21 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 	/* If it can't be processed, the urbp and urb will be released
 	 * in the device teardown code which is where this device is going
 	 * (or gone). */
-	vdev = vusb_device_by_port(vhcd, urb->dev->portnum);
-	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
-		eprintk("Dequeue start processing called while device(s) in invalid states\n");
+	vport = vusb_vport_by_port(vhcd, urb->dev->portnum);
+	if (vhcd->state == VUSB_INACTIVE || !vport->present) {
+		eprintk("Dequeue processing called with device/port invalid states\n");
 		spin_unlock_irqrestore(&vhcd->lock, flags);
-		return -ESHUTDOWN;
+		return -ENXIO;
 	}
 
-	if (vdev->closing) {
+	if (vport->closing) {
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		return -ESHUTDOWN;
 	}
 
 	/* Set it in the processing state so it is not nuked out from under us */
-	vdev->processing = 1;
+	vport->processing = 1; /* TODO ++ */
+	vdev = vusb_vdev_by_port(vhcd, urb->dev->portnum);
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	spin_lock_irqsave(&vdev->lock, flags);
@@ -726,7 +775,6 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 		/* Found it in the pending list, see if it is in state 1 */
 		if (urbp->state != VUSB_URBP_SENT) {
 			urbp->state = VUSB_URBP_CANCEL;
-			urbp->urb->status = -ECANCELED;
 			break;
 		}
 
@@ -805,12 +853,12 @@ vusb_hcd_hub_status(struct usb_hcd *hcd, char *buf)
 	spin_lock_irqsave(&vhcd->lock, flags);
 
 	for (i = 0; i < VUSB_PORTS; i++) {
-		struct vusb_device *vdev = &vhcd->vdev_ports[i];
+		struct vusb_rh_port *vport = &vhcd->vrh_ports[i];
 
 		/* Check status for each port */
-		dprintk(D_PORT2, "check port %u (%08x)\n", vdev->port,
-				vdev->port_status);
-		if ((vdev->port_status & PORT_C_MASK) != 0) {
+		dprintk(D_PORT2, "check port %u (%08x)\n", vport->port,
+				vport->port_status);
+		if ((vport->port_status & PORT_C_MASK) != 0) {
 			if (i < 7)
 				buf[0] |= 1 << (i + 1);
 			else if (i < 15)
@@ -820,11 +868,11 @@ vusb_hcd_hub_status(struct usb_hcd *hcd, char *buf)
 			else
 				buf[3] |= 1 << (i - 23);
 			dprintk(D_PORT2, "port %u status 0x%08x has changed\n",
-					vdev->port, vdev->port_status);
+					vport->port, vport->port_status);
 			changed = 1;
 		}
 
-		if (vdev->port_status & USB_PORT_STAT_CONNECTION)
+		if (vport->port_status & USB_PORT_STAT_CONNECTION)
 			resume = 1;
 	}
 
@@ -844,10 +892,11 @@ vusb_hcd_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 		u16 wIndex, char *buf, u16 wLength)
 {
 	struct vusb_vhcd *vhcd;
-	int	retval = 0;
+	int retval = 0;
 	unsigned long flags;
 	u32 status;
 
+	/* TODO fix param names */
 	dprintk(D_CTRL, ">vusb_hub_control %04x %04x %04x\n",
 			typeReq, wIndex, wValue);
 
@@ -864,8 +913,12 @@ vusb_hcd_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 	case ClearPortFeature:
 		dprintk(D_CTRL, "ClearPortFeature port %d val: 0x%04x\n",
 				wIndex, wValue);
-		vusb_check_port("ClearPortFeature", wIndex);
-		vusb_clear_port_feature(vusb_device_by_port(vhcd, wIndex), wValue);
+		if (!vusb_check_port(wIndex)) {
+			wprintk("ClearPortFeature invalid port %u", wIndex);
+        	        retval = -EPIPE;
+	                break;
+		}
+		vusb_clear_port_feature(vusb_vport_by_port(vhcd, wIndex), wValue);
 		break;
 	case GetHubDescriptor:
 		vusb_hub_descriptor((struct usb_hub_descriptor *)buf);
@@ -875,9 +928,12 @@ vusb_hcd_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 		*(__le32 *)buf = cpu_to_le32(0);
 		break;
 	case GetPortStatus:
-		vusb_check_port("GetPortStatus", wIndex);
-		status = vusb_device_by_port(vhcd, wIndex)->port_status;
-		status = vhcd->vdev_ports[wIndex-1].port_status;
+		if (!vusb_check_port(wIndex)) {
+			wprintk("GetPortStatus invalid port %u", wIndex);
+        	        retval = -EPIPE;
+	                break;
+		}
+		status = vusb_vport_by_port(vhcd, wIndex)->port_status;
 		dprintk(D_CTRL, "GetPortStatus port %d = 0x%08x\n", wIndex, status);
 		((__le16 *) buf)[0] = cpu_to_le16(status);
 		((__le16 *) buf)[1] = cpu_to_le16(status >> 16);
@@ -886,9 +942,13 @@ vusb_hcd_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 		retval = -EPIPE;
 		break;
 	case SetPortFeature:
-		vusb_check_port("SetPortStatus", wIndex);
+		if (!vusb_check_port(wIndex)) {
+			wprintk("SetPortFeature invalid port %u", wIndex);
+        	        retval = -EPIPE;
+	                break;
+		}
 		dprintk(D_CTRL, "SetPortFeature port %d val: 0x%04x\n", wIndex, wValue);
-		vusb_set_port_feature(vhcd, vusb_device_by_port(vhcd, wIndex), wValue);
+		vusb_set_port_feature(vhcd, vusb_vport_by_port(vhcd, wIndex), wValue);
 		break;
 
 	default:
@@ -902,7 +962,7 @@ vusb_hcd_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	if (wIndex >= 1 && wIndex <= VUSB_PORTS) {
-		if ((vusb_device_by_port(vhcd, wIndex)->port_status & PORT_C_MASK) != 0)
+		if ((vusb_vport_by_port(vhcd, wIndex)->port_status & PORT_C_MASK) != 0)
 			 usb_hcd_poll_rh_status(hcd);
 	}
 
@@ -1060,7 +1120,7 @@ vusb_put_shadow(struct vusb_device *vdev, struct vusb_shadow *shadow)
 }
 
 static void
-vusb_work_handler_callback(void *arg)
+vusb_grant_available_callback(void *arg)
 {
 	struct vusb_device *vdev = (struct vusb_device*)arg;
 	schedule_work(&vdev->work);
@@ -1091,9 +1151,9 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 		if (!restart)
 			return ret;
 		xc_gnttab_request_free_callback(&vdev->callback,
-			vusb_work_handler_callback,
+			vusb_grant_available_callback,
 			vdev, nr_mfns);
-		return -EBUSY;
+		return -EBUSY; /* TODO not handling it right */
 	}
 
 	for (i = 0; i < nr_mfns; i++, va += PAGE_SIZE) {
@@ -1149,10 +1209,10 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 	ret = xc_gnttab_alloc_grant_references(nr_total, &gref_head);
 	if (ret < 0) {
 		xc_gnttab_request_free_callback(&vdev->callback,
-			vusb_work_handler_callback,
+			vusb_grant_available_callback,
 			vdev, nr_total);
 		/* Clean up what we did above */
-		ret = -EBUSY;
+		ret = -EBUSY; /* TODO not handling it right */
 		goto cleanup;
 	}
 
@@ -1537,8 +1597,8 @@ vusb_urbp_list_dump(const struct vusb_device *vdev, const char *fn)
 
 	dprintk(D_URB2, "===== Current URB List in %s =====\n", fn);
 	list_for_each_entry(urbp, &vdev->pending_list, urbp_list) {
-		dprintk(D_URB2, "URB urbp: %p port %u device %u\n",
-			urbp, urbp->port, vdev->device_id);
+		dprintk(D_URB2, "URB urbp: %p port %u device %p\n",
+			urbp, urbp->port, vdev);
 	}
 	dprintk(D_URB2, "===== End URB List in %s ====\n", fn);
 }
@@ -1851,25 +1911,27 @@ static bool
 vusb_start_processing(struct vusb_device *vdev, const char *caller)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
+	struct vusb_rh_port *vport =
+		container_of(vdev, struct vusb_rh_port, vdev);
 	unsigned long flags;
 
 	spin_lock_irqsave(&vhcd->lock, flags);
 
-	if (vhcd->state == VUSB_INACTIVE || !vdev->present) {
+	if (vhcd->state == VUSB_INACTIVE || !vport->present) {
 		eprintk("%s called start processing - device %p "
-			"invalid state - vhcd: %d vdev: %d\n",
-			caller, vdev, vhcd->state, vdev->present);
+			"invalid state - vhcd: %d vport: %d\n",
+			caller, vdev, vhcd->state, vport->present);
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		return false;
 	}
 
-	if (vdev->closing) {
+	if (vport->closing) {
 		/* Normal, shutdown of this device pending */
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		return false;
 	}
 
-	vdev->processing = 1;
+	vport->processing = 1; /* TODO ++ */
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	return true;
@@ -1879,10 +1941,12 @@ static void
 vusb_stop_processing(struct vusb_device *vdev)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
+	struct vusb_rh_port *vport =
+		container_of(vdev, struct vusb_rh_port, vdev);
 	unsigned long flags;
 
 	spin_lock_irqsave(&vhcd->lock, flags);
-	vdev->processing = 0;
+	vport->processing = 0; /* TODO -- */
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
 
@@ -1890,14 +1954,16 @@ static void
 vusb_wait_stop_processing(struct vusb_device *vdev)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
+	struct vusb_rh_port *vport =
+		container_of(vdev, struct vusb_rh_port, vdev);
 	unsigned long flags;
 
 again:
 	spin_lock_irqsave(&vhcd->lock, flags);
 
-	vdev->closing = 0; /* Going away now... */
+	vport->closing = 0; /* Going away now... */
 
-	if (vdev->processing) {
+	if (vport->processing) {
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		set_current_state(TASK_INTERRUPTIBLE);
 		schedule_timeout(HZ);
@@ -1910,19 +1976,23 @@ again:
 static void
 vusb_check_reset_device(struct vusb_device *vdev)
 {
+	struct vusb_vhcd *vhcd = vdev->vhcd;
+	struct vusb_rh_port *vport =
+		container_of(vdev, struct vusb_rh_port, vdev);
 	unsigned long flags;
 	bool reset = false;
 	int ret;
 
+	/* TODO AFU */
 	/* Lock it and see if this port needs resetting. */
-	spin_lock_irqsave(&vdev->vhcd->lock, flags);
+	spin_lock_irqsave(&vhcd->lock, flags);
 
 	if (vdev->reset == 1) {
 		vdev->reset = 2;
 		reset = true;
 	}
 
-	spin_unlock_irqrestore(&vdev->vhcd->lock, flags);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	if (!reset)
 		return;
@@ -1939,15 +2009,15 @@ vusb_check_reset_device(struct vusb_device *vdev)
 	/* Wait for the reset with no lock */
 	wait_event_interruptible(vdev->wait_queue, (vdev->reset == 0));
 
-	spin_lock_irqsave(&vdev->vhcd->lock, flags);
+	spin_lock_irqsave(&vhcd->lock, flags);
 	/* Signal reset completion */
-	vdev->port_status |= (USB_PORT_STAT_C_RESET << 16);
+	vport->port_status |= (USB_PORT_STAT_C_RESET << 16);
 
-	vusb_set_link_state(vdev);
-	spin_unlock_irqrestore(&vdev->vhcd->lock, flags);
+	vusb_set_link_state(vport);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	/* Update RH outside of critical section */
-	usb_hcd_poll_rh_status(vhcd_to_hcd(vdev->vhcd));
+	usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
 }
 
 #ifdef VUSB_DEBUG
@@ -2153,20 +2223,6 @@ again:
 }
 
 static void
-vusb_device_clear(struct vusb_device *vdev)
-{
-	if (((vdev->connecting) || (vdev->present)) &&
-		(vdev->xendev != NULL))
-		dev_set_drvdata(&vdev->xendev->dev, NULL);
-
-	vdev->xendev = NULL;
-	vdev->device_id = 0;
-	vdev->connecting = 0;
-	vdev->present = 0;
-	vdev->processing = 0;
-}
-
-static void
 vusb_usbif_free(struct vusb_device *vdev, int suspend)
 {
 	struct xenbus_device *dev = vdev->xendev;
@@ -2238,8 +2294,7 @@ vusb_setup_usbfront(struct vusb_device *vdev)
 	vdev->shadows = kzalloc(sizeof(struct vusb_shadow)*SHADOW_ENTRIES,
 				GFP_KERNEL);
 	if (!vdev->shadows) {
-		xc_xenbus_dev_fatal(dev, err,
-				 "allocate shadows failed");
+		xc_xenbus_dev_fatal(dev, err, "allocate shadows failed");
 		err = -ENOMEM;
 		goto fail;
 	}
@@ -2247,8 +2302,7 @@ vusb_setup_usbfront(struct vusb_device *vdev)
 	vdev->shadow_free_list = kzalloc(sizeof(u16)*SHADOW_ENTRIES,
 				GFP_KERNEL);
 	if (!vdev->shadow_free_list) {
-		xc_xenbus_dev_fatal(dev, err,
-				 "allocate shadow free list failed");
+		xc_xenbus_dev_fatal(dev, err, "allocate shadow list failed");
 		err = -ENOMEM;
 		goto fail;
 	}
@@ -2283,7 +2337,7 @@ again:
 	err = xc_xenbus_transaction_start(&xbt);
 	if (err) {
 		xc_xenbus_dev_fatal(dev, err, "starting transaction");
-		goto destroy_blkring;
+		goto free_usbif;
 	}
 
 	err = xc_xenbus_printf(xbt, dev->nodename,
@@ -2312,7 +2366,7 @@ again:
 		if (err == -EAGAIN)
 			goto again;
 		xc_xenbus_dev_fatal(dev, err, "completing transaction");
-		goto destroy_blkring;
+		goto free_usbif;
 	}
 
 	/* Started out in the initialising state, go to initialised */
@@ -2324,7 +2378,7 @@ again:
 	xc_xenbus_transaction_end(xbt, 1);
 	if (message)
 		xc_xenbus_dev_fatal(dev, err, "%s", message);
- destroy_blkring:
+ free_usbif:
 	vusb_usbif_free(vdev, 0);
  out:
 	return err;
@@ -2333,56 +2387,37 @@ again:
 static int
 vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 {
-	u16 i;
 	int ret = 0;
-	unsigned long flags;
+	struct vusb_rh_port *vport;
 	struct vusb_device *vdev;
 
-	/* Find a port/device we can use. */
-	spin_lock_irqsave(&vhcd->lock, flags);
-	for (i = 0; i < VUSB_PORTS; i++) {
-		if ((vhcd->vdev_ports[i].connecting)||(
-			(vhcd->vdev_ports[i].closing)))
-			continue;
-		if (!vhcd->vdev_ports[i].present)
-			break;
-		if (vhcd->vdev_ports[i].device_id == id) {
-			wprintk("Device id 0x%04x already exists on port %d\n",
-				id, vhcd->vdev_ports[i].port);
-			spin_unlock_irqrestore(&vhcd->lock, flags);
-			return -EEXIST;
-		}
-	}
+	/* Find a port we can use. */
+	vport = vusb_get_vport(vhcd, id);
+	if (!vport)
+		return -ENODEV;
 
-	if (i >= VUSB_PORTS) {
-		wprintk("Attempt to add a device but no free ports on the root hub.\n");
-		spin_unlock_irqrestore(&vhcd->lock, flags);
-		return -ENOMEM;
-	}
+	vdev = vusb_vdev_by_port(vhcd, vport->port);
 
-	vdev = &vhcd->vdev_ports[i];
-	vdev->device_id = id;
-	vdev->connecting = 1;
-	/* End of state protected by the vHCD lock, the reset can finish
-	 * without a lock since the device is not in use yet */
-	spin_unlock_irqrestore(&vhcd->lock, flags);
-
-	vdev->vhcd = vhcd;
-	vdev->xendev = dev;
+	spin_lock_init(&vdev->lock);
 	INIT_LIST_HEAD(&vdev->pending_list);
 	INIT_LIST_HEAD(&vdev->release_list);
 	INIT_LIST_HEAD(&vdev->finish_list);
 	init_waitqueue_head(&vdev->wait_queue);
+	INIT_WORK(&vdev->work, vusb_work_handler);
+	tasklet_init(&vdev->tasklet, vusb_bh_handler, (unsigned long)vdev);
 
-	/* Strap our VUSB device onto the Xen device context */
+	/* Strap our vUSB device onto the Xen device context, etc. */
 	dev_set_drvdata(&dev->dev, vdev);
+	vdev->vhcd = vhcd;
+	vdev->xendev = dev;
 
 	/* Setup the rings, event channel and xenstore. Internal failures cleanup
 	 * the usbif bits. Wipe the new VUSB dev and bail out. */
 	ret = vusb_talk_to_usbback(vdev);
 	if (ret) {
-		printk(KERN_ERR "Failed to initialize the device - id: %d\n", id);
-		vusb_device_clear(vdev);
+		eprintk("Failed to initialize the device - id: %d\n", id);
+		dev_set_drvdata(&dev->dev, NULL);
+		vusb_put_vport(vhcd, container_of(vdev, struct vusb_rh_port, vdev));
 	}
 
 	return ret;
@@ -2392,6 +2427,8 @@ static int
 vusb_start_device(struct vusb_device *vdev)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
+	struct vusb_rh_port *vport =
+		container_of(vdev, struct vusb_rh_port, vdev);
 	unsigned long flags;
 	int ret = 0;
 
@@ -2399,8 +2436,8 @@ vusb_start_device(struct vusb_device *vdev)
 
 	/* Take the VHCD lock to change the state flags */
 	spin_lock_irqsave(&vhcd->lock, flags);
-	vdev->present = 1;
-	vdev->connecting = 0;
+	vport->present = 1;
+	vport->connecting = 0;
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	/* Bind the event channel here, we are ready to process stuffs */
@@ -2449,14 +2486,14 @@ vusb_start_device(struct vusb_device *vdev)
 	/* Root hub port state is owned by the VHCD so use its lock */
 	spin_lock_irqsave(&vhcd->lock, flags);
 
-	vdev->port_status |= vusb_speed_to_port_stat(vdev->speed)
+	vport->port_status |= vusb_speed_to_port_stat(vdev->speed)
 					 | USB_PORT_STAT_CONNECTION
 					 | USB_PORT_STAT_C_CONNECTION << 16;
 
-	vusb_set_link_state(vdev);
+	vusb_set_link_state(vport);
 
 	dprintk(D_PORT1, "new status: 0x%08x speed: 0x%04x\n",
-			vdev->port_status, vdev->speed);
+			vport->port_status, vdev->speed);
 
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
@@ -2470,6 +2507,8 @@ static void
 vusb_destroy_device(struct vusb_device *vdev)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
+	struct vusb_rh_port *vport =
+		container_of(vdev, struct vusb_rh_port, vdev);
 	struct list_head tmp[2];
 	struct vusb_urbp *pos;
 	struct vusb_urbp *next;
@@ -2508,6 +2547,10 @@ vusb_destroy_device(struct vusb_device *vdev)
 	/* Copy pending urbps to temp list */
 	list_splice_init(&vdev->pending_list, &tmp[1]);
 
+	/* Final vdev cleanup */
+	dev_set_drvdata(&vdev->xendev->dev, NULL);
+	vusb_usbif_free(vdev, 0);
+
 	spin_unlock_irqrestore(&vdev->lock, flags);
 
 	/* Release all the ready to release and pending URBs - this
@@ -2523,11 +2566,10 @@ vusb_destroy_device(struct vusb_device *vdev)
 
 	spin_lock_irqsave(&vhcd->lock, flags);
 
-	/* Final vHCD operations on device */
-	vusb_usbif_free(vdev, 0);
-	vusb_device_clear(vdev);
-
-	vusb_set_link_state(vdev);
+	/* Final vHCD operations on port */
+	vport->present = 0;
+	vusb_set_link_state(vport);
+	vusb_put_vport(vhcd, vport);
 
 	if (vhcd->state != VUSB_INACTIVE)
 		update_rh = true;
@@ -2730,7 +2772,7 @@ static void
 vusb_platform_cleanup(struct vusb_vhcd *vhcd)
 {
 	unsigned long flags;
-	u16 i = 0;
+	/*u16 i = 0;*/
 
 	dprintk(D_PM, "Clean up the worker\n");
 
@@ -2738,9 +2780,10 @@ vusb_platform_cleanup(struct vusb_vhcd *vhcd)
 	vhcd->state = VUSB_INACTIVE;
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
+	/* TODO fix this */
 	/* Unplug all USB devices */
-	for (i = 0; i < VUSB_PORTS; i++)
-		xc_xenbus_switch_state(vhcd->vdev_ports[i].xendev, XenbusStateClosed);
+/*	for (i = 0; i < VUSB_PORTS; i++)
+		xc_xenbus_switch_state(vhcd->vdev_ports[i].xendev, XenbusStateClosed);*/
 }
 
 /* Platform probe */
