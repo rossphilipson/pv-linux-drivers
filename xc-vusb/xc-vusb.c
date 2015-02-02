@@ -2516,8 +2516,9 @@ vusb_destroy_device(struct vusb_device *vdev)
 
 	spin_lock_irqsave(&vhcd->lock, flags);
 
-	/* First test if it is already closing, if not, set closing */
-	if (vport->closing) {
+	/* First test if it is already closing or not there,
+	 * if not, set closing */
+	if (vport->closing || !vport->present) {
 		spin_unlock_irqrestore(&vdev->lock, flags);
 		return;
 	}
@@ -2578,7 +2579,6 @@ vusb_destroy_device(struct vusb_device *vdev)
 	spin_lock_irqsave(&vhcd->lock, flags);
 
 	/* Final vHCD operations on port */
-	vport->present = 0;
 	vusb_set_link_state(vport);
 	vusb_put_vport(vhcd, vport);
 
@@ -2783,18 +2783,24 @@ static void
 vusb_platform_cleanup(struct vusb_vhcd *vhcd)
 {
 	unsigned long flags;
-	/*u16 i = 0;*/
+	u16 i = 0;
 
 	dprintk(D_PM, "Clean up the worker\n");
 
 	spin_lock_irqsave(&vhcd->lock, flags);
-	vhcd->state = VUSB_INACTIVE;
-	spin_unlock_irqrestore(&vhcd->lock, flags);
 
-	/* TODO fix this */
 	/* Unplug all USB devices */
-/*	for (i = 0; i < VUSB_PORTS; i++)
-		xc_xenbus_switch_state(vhcd->vdev_ports[i].xendev, XenbusStateClosed);*/
+	for (i = 0; i < VUSB_PORTS; i++) {
+		if (vhcd->vrh_ports[i].closing || !vhcd->vrh_ports[i].present)
+			continue;
+
+		/* TODO will this cause the backend to go to closed? */
+		xc_xenbus_switch_state(vhcd->vrh_ports[i].vdev.xendev, XenbusStateClosed);
+	}
+
+	vhcd->state = VUSB_INACTIVE;
+
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
 
 /* Platform probe */
