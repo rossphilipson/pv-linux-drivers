@@ -1823,11 +1823,16 @@ vusb_send(struct vusb_device *vdev, struct vusb_urbp *urbp, int type)
 	int ret = (type != PIPE_ISOCHRONOUS) ?
 		vusb_put_urb(vdev, urbp) :
 		vusb_put_isochronous_urb(vdev, urbp);
-	if (!ret)
+	switch (!ret) {
+	case 0:
 		urbp->state = VUSB_URBP_SENT;
-	else if (ret == -EAGAIN)
+		break;
+	case -EAGAIN:
 		schedule_work(&vdev->work);
-	else {
+	case -EBUSY:
+		/* grant callback restarts work */
+		break;
+	default:
 		urbp->state = VUSB_URBP_DROP;
 		urbp->urb->status = ret;
 	}
