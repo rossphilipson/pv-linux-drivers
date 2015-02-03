@@ -2509,13 +2509,13 @@ vusb_destroy_device(struct vusb_device *vdev)
 	/* First test if it is already closing or not there,
 	 * if not, set closing */
 	if (vport->closing || !vport->present) {
-		spin_unlock_irqrestore(&vdev->lock, flags);
+		spin_unlock_irqrestore(&vhcd->lock, flags);
 		return;
 	}
 
 	vport->closing = 1; /* Going away now... */
 
-	spin_unlock_irqrestore(&vdev->lock, flags);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
 	
 	dprintk(D_PORT1, "Remove device from port %u\n", vdev->port);
 
