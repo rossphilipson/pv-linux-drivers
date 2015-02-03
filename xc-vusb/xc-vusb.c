@@ -262,8 +262,6 @@ vusb_process_main(struct vusb_device *vdev, struct vusb_urbp *urbp,
 static int
 vusb_put_internal_request(struct vusb_device *vdev,
 		enum vusb_internal_cmd cmd, u64 cancel_id);
-static void
-vusb_urbp_queue_release(struct vusb_device *vdev, struct vusb_urbp *urbp);
 
 /****************************************************************************/
 /* Miscellaneous Routines                                                   */
@@ -671,9 +669,9 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 
 	vport = vusb_vport_by_port(vhcd, urbp->port);
 	if (vhcd->state == VUSB_INACTIVE || !vport->present) {
-		eprintk("Enqueue processing called with device/port invalid states\n");
 		kfree(urbp);
 		spin_unlock_irqrestore(&vhcd->lock, flags);
+		eprintk("Enqueue processing called with device/port invalid states\n");
 		return -ENXIO;
 	}
 
@@ -736,8 +734,8 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 	 * (or gone). */
 	vport = vusb_vport_by_port(vhcd, urb->dev->portnum);
 	if (vhcd->state == VUSB_INACTIVE || !vport->present) {
-		eprintk("Dequeue processing called with device/port invalid states\n");
 		spin_unlock_irqrestore(&vhcd->lock, flags);
+		eprintk("Dequeue processing called with device/port invalid states\n");
 		return -ENXIO;
 	}
 
@@ -908,6 +906,7 @@ vusb_hcd_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
 
 	vhcd = hcd_to_vhcd(hcd);
 	spin_lock_irqsave(&vhcd->lock, flags);
+
 	switch (typeReq) {
 	case ClearHubFeature:
 		break;
@@ -1590,18 +1589,57 @@ err:
 /****************************************************************************/
 /* URB Processing                                                           */
 
-/* Dump the URBp list */
+#ifdef VUSB_DEBUG
+/* Dump URBp */
 static inline void
-vusb_urbp_list_dump(const struct vusb_device *vdev, const char *fn)
+vusb_urbp_dump(struct vusb_urbp *urbp)
 {
-	const struct vusb_urbp *urbp;
+	struct urb *urb = urbp->urb;
+	unsigned int type;
 
-	dprintk(D_URB2, "===== Current URB List in %s =====\n", fn);
-	list_for_each_entry(urbp, &vdev->pending_list, urbp_list) {
-		dprintk(D_URB2, "URB urbp: %p port %u device %p\n",
-			urbp, urbp->port, vdev);
-	}
-	dprintk(D_URB2, "===== End URB List in %s ====\n", fn);
+	type = usb_pipetype(urb->pipe);
+
+	iprintk("URB urbp: %p state: %s status: %d pipe: %s(%u)\n",
+		urbp, vusb_state_to_string(urbp),
+		urb->status, vusb_pipe_to_string(urb), type);
+	iprintk("device: %u endpoint: %u in: %u\n",
+		usb_pipedevice(urb->pipe), usb_pipeendpoint(urb->pipe),
+		usb_urb_dir_in(urb));
+}
+#endif /* VUSB_DEBUG */
+
+static void
+vusb_urbp_release(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
+{
+	struct urb *urb = urbp->urb;
+
+	/* Notify USB stack that the URB is finished and release it. This
+	 * has to be done outside the all locks. */
+
+#ifdef VUSB_DEBUG
+	if (urb->status)
+		vusb_urbp_dump(urbp);
+#endif
+
+	dprintk(D_URB2, "Giveback URB urpb: %p status %d length %u\n",
+		urbp, urb->status, urb->actual_length);
+	if (urbp->iso_packet_info)
+		kfree(urbp->iso_packet_info);
+	kfree(urbp);
+	usb_hcd_unlink_urb_from_ep(vhcd_to_hcd(vhcd), urb);
+	usb_hcd_giveback_urb(vhcd_to_hcd(vhcd), urb, urb->status);
+}
+
+static void
+vusb_urbp_queue_release(struct vusb_device *vdev, struct vusb_urbp *urbp)
+{
+	/* Remove from the active urbp list and place it on the release list.
+	 * Called from the urb processing routines holding the vdev lock. */
+	list_del(&urbp->urbp_list);
+
+	list_add_tail(&urbp->urbp_list, &vdev->release_list);
+
+	schedule_work(&vdev->work);
 }
 
 /* Convert status to errno */
@@ -1924,10 +1962,10 @@ vusb_start_processing(struct vusb_device *vdev, const char *caller)
 	spin_lock_irqsave(&vhcd->lock, flags);
 
 	if (vhcd->state == VUSB_INACTIVE || !vport->present) {
+		spin_unlock_irqrestore(&vhcd->lock, flags);
 		eprintk("%s called start processing - device %p "
 			"invalid state - vhcd: %d vport: %d\n",
 			caller, vdev, vhcd->state, vport->present);
-		spin_unlock_irqrestore(&vhcd->lock, flags);
 		return false;
 	}
 
@@ -2022,59 +2060,6 @@ vusb_check_reset_device(struct vusb_device *vdev)
 
 	/* Update RH outside of critical section */
 	usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
-}
-
-#ifdef VUSB_DEBUG
-/* Dump URBp */
-static inline void
-vusb_urbp_dump(struct vusb_urbp *urbp)
-{
-	struct urb *urb = urbp->urb;
-	unsigned int type;
-
-	type = usb_pipetype(urb->pipe);
-
-	iprintk("URB urbp: %p state: %s status: %d pipe: %s(%u)\n",
-		urbp, vusb_state_to_string(urbp),
-		urb->status, vusb_pipe_to_string(urb), type);
-	iprintk("device: %u endpoint: %u in: %u\n",
-		usb_pipedevice(urb->pipe), usb_pipeendpoint(urb->pipe),
-		usb_urb_dir_in(urb));
-}
-#endif /* VUSB_DEBUG */
-
-static void
-vusb_urbp_release(struct vusb_vhcd *vhcd, struct vusb_urbp *urbp)
-{
-	struct urb *urb = urbp->urb;
-
-	/* Notify USB stack that the URB is finished and release it. This
-	 * has to be done outside the all locks. */
-
-#ifdef VUSB_DEBUG
-	if (urb->status)
-		vusb_urbp_dump(urbp);
-#endif
-
-	dprintk(D_URB2, "Giveback URB urpb: %p status %d length %u\n",
-		urbp, urb->status, urb->actual_length);
-	if (urbp->iso_packet_info)
-		kfree(urbp->iso_packet_info);
-	kfree(urbp);
-	usb_hcd_unlink_urb_from_ep(vhcd_to_hcd(vhcd), urb);
-	usb_hcd_giveback_urb(vhcd_to_hcd(vhcd), urb, urb->status);
-}
-
-static void
-vusb_urbp_queue_release(struct vusb_device *vdev, struct vusb_urbp *urbp)
-{
-	/* Remove from the active urbp list and place it on the release list.
-	 * Called from the urb processing routines holding the vdev lock. */
-	list_del(&urbp->urbp_list);
-
-	list_add_tail(&urbp->urbp_list, &vdev->release_list);
-
-	schedule_work(&vdev->work);
 }
 
 static void
