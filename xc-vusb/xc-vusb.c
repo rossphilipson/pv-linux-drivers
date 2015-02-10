@@ -180,7 +180,6 @@ struct vusb_device {
 	spinlock_t			lock;
 	u16				address;
 	enum usb_device_speed		speed;
-	unsigned			reset:2;
 
 	/* The Xenbus device associated with this vusb device */
 	struct xenbus_device		*xendev;
@@ -232,8 +231,13 @@ struct vusb_rh_port {
 	unsigned			connecting:1;
 	unsigned			present:1;
 	unsigned			closing:1;
+
 	/* Current counter for jobs processing for device */
 	u32				processing;
+
+	/* Reset gate for port/device resets */
+	atomic_t			reset_pending;
+	atomic_t			reset_done;
 };
 
 struct vusb_vhcd {
@@ -415,9 +419,8 @@ vusb_put_vport(struct vusb_vhcd *vhcd, struct vusb_rh_port *vport)
 {
 	unsigned long flags;
 
-	/* TODO how to reset port status on put */
-
-	/* Restore the port values when no device is attached */
+	/* Port reset after this call. Restore the port values
+	 * when no device is attached */
 	spin_lock_irqsave(&vhcd->lock, flags);
 	memset(&vport->vdev, 0, sizeof(struct vusb_device));
 	vport->device_id = 0;
@@ -425,6 +428,8 @@ vusb_put_vport(struct vusb_vhcd *vhcd, struct vusb_rh_port *vport)
 	vport->present= 0;
 	vport->closing = 0;
 	vport->processing = 0;
+	atomic_set(&vport->reset_pending, 0);
+	atomic_set(&vport->reset_done, 0);
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
 
@@ -475,8 +480,10 @@ vusb_port_reset(struct vusb_vhcd *vhcd, struct vusb_rh_port *vport)
 
 	vport->port_status |= USB_PORT_STAT_ENABLE | USB_PORT_STAT_POWER;
 
-	/* TODO reset needs work! */
-	vport->vdev.reset = 1;
+	/* Test reset gate, only want one reset in flight at a time per
+	 * port. If the gate is set, it will return the "unless" value. */
+	if (__atomic_add_unless(&vport->reset_pending, 1, 1) == 1)
+		return;
 
 	/* Schedule it for the device, can't do it here in the vHCD lock */
 	schedule_work(&vport->vdev.work);
@@ -2022,21 +2029,10 @@ vusb_check_reset_device(struct vusb_device *vdev)
 	struct vusb_rh_port *vport =
 		container_of(vdev, struct vusb_rh_port, vdev);
 	unsigned long flags;
-	bool reset = false;
 	int ret;
 
-	/* TODO AFU */
-	/* Lock it and see if this port needs resetting. */
-	spin_lock_irqsave(&vhcd->lock, flags);
-
-	if (vdev->reset == 1) {
-		vdev->reset = 2;
-		reset = true;
-	}
-
-	spin_unlock_irqrestore(&vhcd->lock, flags);
-
-	if (!reset)
+	/* Test if a reset is requested */
+	if (atomic_read(&vport->reset_pending) == 0)
 		return;
 
 	spin_lock_irqsave(&vdev->lock, flags);
@@ -2049,7 +2045,11 @@ vusb_check_reset_device(struct vusb_device *vdev)
 	}
 
 	/* Wait for the reset with no lock */
-	wait_event_interruptible(vdev->wait_queue, (vdev->reset == 0));
+	wait_event_interruptible(vdev->wait_queue, (atomic_read(&vport->reset_done) == 1));
+
+	/* Reset the reset gate */
+	atomic_set(&vport->reset_done, 0);
+	atomic_set(&vport->reset_pending, 0);
 
 	spin_lock_irqsave(&vhcd->lock, flags);
 	/* Signal reset completion */
@@ -2139,6 +2139,8 @@ static irqreturn_t
 vusb_interrupt(int irq, void *dev_id)
 {
 	struct vusb_device *vdev = (struct vusb_device*)dev_id;
+	struct vusb_rh_port *vport =
+		container_of(vdev, struct vusb_rh_port, vdev);
 	struct vusb_shadow *shadow;
 	usbif_response_t *rsp;
 	RING_IDX i, rp;
@@ -2169,7 +2171,8 @@ again:
 				wake_up(&vdev->wait_queue);
 			}
 			else if (shadow->req.type == USBIF_T_RESET) {
-				vdev->reset = 0; /* clear reset, wake waiter */
+				/* clear reset, wake waiter */
+				atomic_set(&vport->reset_done, 1);
 				wake_up(&vdev->wait_queue);
 			}
 
