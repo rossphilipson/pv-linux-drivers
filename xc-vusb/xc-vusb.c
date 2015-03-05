@@ -22,7 +22,6 @@
  */
 
 /* TODO
- * Modify to use a new HCD interface
  * Use DMA buffers
  * Handle errors on internal cmds
  * Fix reset logic and locking - and flag/type inconsistencies
@@ -753,18 +752,17 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 	}
 
 	while (urbp) {
+		urbp->state = VUSB_URBP_CANCEL;
+
 		/* Found it in the pending list, see if it is in state 1 */
-		if (urbp->state != VUSB_URBP_SENT) {
-			urbp->state = VUSB_URBP_CANCEL;
+		if (urbp->state != VUSB_URBP_SENT)
 			break;
-		}
 
 		/* State 2, this is the hardest one. The urbp cannot be simply
 		 * discarded because it has shadow associated with it. It will
 		 * have to be flagged as canceled and left for response
 		 * processing to handle later. It also has to be shot down in
 		 * the backend processing. */
-		urbp->state = VUSB_URBP_CANCEL;
 		ret = vusb_put_internal_request(vdev, VUSB_CMD_CANCEL, urbp->id);
 		if (ret) {
 			eprintk("Failed cancel command for URB id: %d, err: %d\n",
@@ -1135,7 +1133,7 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 		xc_gnttab_request_free_callback(&vdev->callback,
 			vusb_grant_available_callback,
 			vdev, nr_mfns);
-		return -EBUSY; /* TODO not handling it right */
+		return -EBUSY;
 	}
 
 	for (i = 0; i < nr_mfns; i++, va += PAGE_SIZE) {
@@ -1194,7 +1192,7 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 			vusb_grant_available_callback,
 			vdev, nr_total);
 		/* Clean up what we did above */
-		ret = -EBUSY; /* TODO not handling it right */
+		ret = -EBUSY;
 		goto cleanup;
 	}
 
@@ -1831,6 +1829,7 @@ vusb_urb_finish(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	vusb_put_shadow(vdev, shadow);
 
 	/* No matter what, move this urbp to the release list */
+	urbp->state = VUSB_URBP_DONE;
 	vusb_urbp_queue_release(vdev, urbp);
 }
 
@@ -2164,6 +2163,9 @@ again:
 		shadow->urbp->iso_packet_info = shadow->iso_packet_info;
 		shadow->iso_packet_info = NULL;
 
+		/* Remove the urbp from the pending list and attach to the
+		 * finish list */
+		list_del(&shadow->urbp->urbp_list);
 		list_add_tail(&shadow->urbp->urbp_list, &vdev->finish_list);
 	}
 
