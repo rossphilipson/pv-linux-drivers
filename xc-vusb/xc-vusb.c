@@ -636,7 +636,7 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	if (!vusb_check_port(urb->dev->portnum))
 		return -EPIPE;
 
-	urbp = kmalloc(sizeof(*urbp), mem_flags);
+	urbp = kzalloc(sizeof(*urbp), mem_flags);
 	if (!urbp)
 		return -ENOMEM;
 
