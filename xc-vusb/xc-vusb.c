@@ -1680,7 +1680,6 @@ vusb_urb_common_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
 	 * just set an error code and don't bother setting values. */
 	if (urbp->state == VUSB_URBP_CANCEL) {
 		urb->status = -ECANCELED;
-		vusb_urbp_queue_release(vdev, urbp);
 		return;
 	}
 
@@ -1718,8 +1717,6 @@ vusb_urb_common_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
 			urb->actual_length = urbp->rsp.actual_length;
 		}
 	}
-
-	vusb_urbp_queue_release(vdev, urbp);
 }
 
 static void
@@ -1786,7 +1783,6 @@ vusb_urb_isochronous_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
 	dprintk(D_URB2, "ISO response urbp: %s total: %u errors: %d\n",
 		urbp, total_length, urb->error_count);
 
-	vusb_urbp_queue_release(vdev, urbp);
 	return;
 
 iso_io:
@@ -1797,8 +1793,6 @@ iso_err:
 		urb->iso_frame_desc[i].status = urb->status;
 	}
 	urb->actual_length = 0;
-
-	vusb_urbp_queue_release(vdev, urbp);
 }
 
 static void
@@ -1835,6 +1829,9 @@ vusb_urb_finish(struct vusb_device *vdev, struct vusb_urbp *urbp)
 
 	/* Done with this shadow entry, give it back */
 	vusb_put_shadow(vdev, shadow);
+
+	/* No matter what, move this urbp to the release list */
+	vusb_urbp_queue_release(vdev, urbp);
 }
 
 static void
