@@ -51,15 +51,7 @@
 #include <xen/interface/memory.h>
 #include <xen/interface/grant_table.h>
 
-#if ( LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,35) || (defined(RHEL_RELEASE_CODE)) )
 #include <linux/usb/hcd.h>
-#else
-#include <linux/old-core-hcd.h>
-#endif
-
-#if ( LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,32) )
-#define flush_work_sync(a) flush_scheduled_work()
-#endif
 
 #define VUSB_INTERFACE_VERSION		3
 #define VUSB_INVALID_REQ_ID		((u64)-1)
@@ -215,9 +207,9 @@ enum vusb_rh_state {
 	VUSB_RH_RUNNING
 };
 
-enum vusb_state {
-	VUSB_INACTIVE,
-	VUSB_RUNNING
+enum vusb_hcd_state {
+	VUSB_HCD_INACTIVE,
+	VUSB_HCD_RUNNING
 };
 
 struct vusb_rh_port {
@@ -243,7 +235,7 @@ struct vusb_rh_port {
 struct vusb_vhcd {
 	spinlock_t			lock;
 
-	enum vusb_state			state;
+	enum vusb_hcd_state		hcd_state;
 	enum vusb_rh_state		rh_state;
 
 	struct vusb_rh_port		vrh_ports[VUSB_PORTS];
@@ -567,14 +559,9 @@ vusb_hub_descriptor(struct usb_hub_descriptor *desc)
 
 	/* bitmaps for DeviceRemovable and PortPwrCtrlMask */
 
-#if ( LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,39) || (defined(RHEL_RELEASE_CODE)) )
 	/* The union was introduced to support USB 3.0 */
 	memset(&desc->u.hs.DeviceRemovable[0], 0, temp);
 	memset(&desc->u.hs.DeviceRemovable[temp], 0xff, temp);
-#else
-	memset(&desc->DeviceRemovable[0], 0, temp);
-	memset(&desc->DeviceRemovable[temp], 0xff, temp);
-#endif
 
 	/* per-port over current reporting and no power switching */
 	temp = 0x00a;
@@ -582,36 +569,24 @@ vusb_hub_descriptor(struct usb_hub_descriptor *desc)
 }
 
 static int
-vusb_init_hcd(struct vusb_vhcd *vhcd)
-{
-	int i;
-
-	dprintk(D_PM, "Init the HCD\n");
-
-	/* TODO RJP revisit, may not need to clear the ports on resume path
-	 * also may need suspend/resume for S3 */
-	/* Initialize ports */
-	for (i = 0; i < VUSB_PORTS; i++) {
-		memset(&vhcd->vrh_ports[i], 0, sizeof(struct vusb_rh_port));
-		vhcd->vrh_ports[i].port = i + 1;
-	}
-
-	vhcd->state = VUSB_INACTIVE;
-
-	return 0;
-}
-
-static int
 vusb_hcd_start(struct usb_hcd *hcd)
 {
 	struct vusb_vhcd *vhcd = hcd_to_vhcd(hcd);
+	int i;
 
 	iprintk("XEN HCD start\n");
 
 	dprintk(D_MISC, ">vusb_start\n");
 
+	/* Initialize root hub ports */
+	for (i = 0; i < VUSB_PORTS; i++) {
+		memset(&vhcd->vrh_ports[i], 0, sizeof(struct vusb_rh_port));
+		vhcd->vrh_ports[i].port = i + 1;
+	}
+
+	/* Enable HCD/RH */
 	vhcd->rh_state = VUSB_RH_RUNNING;
-	vhcd->state = VUSB_RUNNING;
+	vhcd->hcd_state = VUSB_HCD_RUNNING;
 
 	hcd->power_budget = VUSB_POWER_BUDGET;
 	hcd->state = HC_STATE_RUNNING;
@@ -675,7 +650,7 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	spin_lock_irqsave(&vhcd->lock, flags);
 
 	vport = vusb_vport_by_port(vhcd, urbp->port);
-	if (vhcd->state == VUSB_INACTIVE || !vport->present) {
+	if (vhcd->hcd_state == VUSB_HCD_INACTIVE || !vport->present) {
 		kfree(urbp);
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		eprintk("Enqueue processing called with device/port invalid states\n");
@@ -740,7 +715,7 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 	 * in the device teardown code which is where this device is going
 	 * (or gone). */
 	vport = vusb_vport_by_port(vhcd, urb->dev->portnum);
-	if (vhcd->state == VUSB_INACTIVE || !vport->present) {
+	if (vhcd->hcd_state == VUSB_HCD_INACTIVE || !vport->present) {
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		eprintk("Dequeue processing called with device/port invalid states\n");
 		return -ENXIO;
@@ -1006,7 +981,7 @@ vusb_hcd_bus_resume(struct usb_hcd *hcd)
 		ret = -ESHUTDOWN;
 	} else {
 		vhcd->rh_state = VUSB_RH_RUNNING;
-		vhcd->state = VUSB_RUNNING;
+		vhcd->hcd_state = VUSB_HCD_RUNNING;
 		hcd->state = HC_STATE_RUNNING;
 	}
 	spin_unlock_irq(&vhcd->lock);
@@ -1968,11 +1943,11 @@ vusb_start_processing(struct vusb_device *vdev, const char *caller)
 
 	spin_lock_irqsave(&vhcd->lock, flags);
 
-	if (vhcd->state == VUSB_INACTIVE || !vport->present) {
+	if (vhcd->hcd_state == VUSB_HCD_INACTIVE || !vport->present) {
 		spin_unlock_irqrestore(&vhcd->lock, flags);
 		eprintk("%s called start processing - device %p "
 			"invalid state - vhcd: %d vport: %d\n",
-			caller, vdev, vhcd->state, vport->present);
+			caller, vdev, vhcd->hcd_state, vport->present);
 		return false;
 	}
 
@@ -2575,7 +2550,7 @@ vusb_destroy_device(struct vusb_device *vdev)
 	vusb_set_link_state(vport);
 	vusb_put_vport(vhcd, vport);
 
-	if (vhcd->state != VUSB_INACTIVE)
+	if (vhcd->hcd_state != VUSB_HCD_INACTIVE)
 		update_rh = true;
 
 	spin_unlock_irqrestore(&vhcd->lock, flags);
@@ -2791,7 +2766,7 @@ vusb_platform_cleanup(struct vusb_vhcd *vhcd)
 		xc_xenbus_switch_state(vhcd->vrh_ports[i].vdev.xendev, XenbusStateClosed);
 	}
 
-	vhcd->state = VUSB_INACTIVE;
+	vhcd->hcd_state = VUSB_HCD_INACTIVE;
 
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
@@ -2820,12 +2795,11 @@ vusb_platform_probe(struct platform_device *pdev)
 	vhcd = hcd_to_vhcd(hcd);
 
 	spin_lock_init(&vhcd->lock);
+	vhcd->hcd_state = VUSB_HCD_INACTIVE;
 
 	ret = usb_add_hcd(hcd, 0, 0);
 	if (ret != 0)
 		goto err_add;
-
-	vusb_init_hcd(vhcd);
 
 	/* vHCD is up, now initialize this device for xenbus */
 	ret = vusb_xen_init();
@@ -2924,7 +2898,7 @@ vusb_platform_restore(struct device *dev)
 
 	spin_lock_irqsave(&vhcd->lock, flags);
 	set_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
-	vusb_init_hcd(vhcd);
+	/* TODO used to be vusb_init_hcd which was wrong - what needs to happen here */
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
 	return 0;
