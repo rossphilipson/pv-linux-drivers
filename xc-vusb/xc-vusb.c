@@ -77,12 +77,11 @@
 #define D_STATE (1 << 4)
 #define D_PORT1 (1 << 5)
 #define D_PORT2 (1 << 6)
-#define D_CTRL (1 << 8)
-#define D_MISC (1 << 9)
-#define D_WARN (1 << 10) /* only debugging warn */
-#define D_PM (1 << 11)
-#define D_RING1 (1 << 12)
-#define D_RING2 (1 << 13)
+#define D_CTRL  (1 << 8)
+#define D_MISC  (1 << 9)
+#define D_PM    (1 << 10)
+#define D_RING1 (1 << 11)
+#define D_RING2 (1 << 12)
 
 #define DEBUGMASK (D_STATE | D_PORT1 | D_URB1 | D_PM)
 
@@ -123,10 +122,6 @@
 #define vusb_vport_by_port(v, port) (&(v)->vrh_ports[(port) - 1])
 #define vusb_check_port(index) \
 	(((index) < 1 || (index) > VUSB_PORTS) ? false : true)
-
-#define vusb_process_requests(v) vusb_process_main(v, NULL, true)
-#define vusb_process_new_requests(v, u) vusb_process_main(v, u, true)
-#define vusb_process_responses(v) vusb_process_main(v, NULL, false)
 
 /* Possible state of an urbp */
 enum vusb_urbp_state {
@@ -196,7 +191,6 @@ struct vusb_device {
 	struct list_head		finish_list;
 
 	struct work_struct 		work;
-	struct tasklet_struct		tasklet;
 	wait_queue_head_t		wait_queue;
 };
 
@@ -248,12 +242,7 @@ vusb_start_processing(struct vusb_device *vdev, const char *caller);
 static void
 vusb_stop_processing(struct vusb_device *vdev);
 static void
-vusb_work_handler(struct work_struct *work);
-static void
-vusb_bh_handler(unsigned long data);
-static void
-vusb_process_main(struct vusb_device *vdev, struct vusb_urbp *urbp,
-		bool process_reqs);
+vusb_process(struct vusb_device *vdev, struct vusb_urbp *urbp);
 static int
 vusb_put_internal_request(struct vusb_device *vdev,
 		enum vusb_internal_cmd cmd, u64 cancel_id);
@@ -471,11 +460,6 @@ vusb_port_reset(struct vusb_vhcd *vhcd, struct vusb_rh_port *vport)
 
 	vport->port_status |= USB_PORT_STAT_ENABLE | USB_PORT_STAT_POWER;
 
-	/* Test reset gate, only want one reset in flight at a time per
-	 * port. If the gate is set, it will return the "unless" value. */
-	if (__atomic_add_unless(&vport->reset_pending, 1, 1) == 1)
-		return;
-
 	/* Schedule it for the device, can't do it here in the vHCD lock */
 	schedule_work(&vport->vdev.work);
 }
@@ -674,7 +658,7 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	vdev = vusb_vdev_by_port(vhcd, urbp->port);
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 
-	vusb_process_new_requests(vdev, urbp);
+	vusb_process(vdev, urbp);
 
 	/* Finished processing */
 	vusb_stop_processing(vdev);
@@ -778,7 +762,7 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 	spin_unlock_irqrestore(&vdev->lock, flags);
 
 	/* Drive processing requests and responses */
-	vusb_process_requests(vdev);
+	vusb_process(vdev, NULL);
 
 	vusb_stop_processing(vdev);
 
@@ -2002,8 +1986,9 @@ vusb_check_reset_device(struct vusb_device *vdev)
 	unsigned long flags;
 	int ret;
 
-	/* Test if a reset is requested */
-	if (atomic_read(&vport->reset_pending) == 0)
+	/* Test reset gate, only want one reset in flight at a time per
+	 * port. If the gate is set, it will return the "unless" value. */
+	if (__atomic_add_unless(&vport->reset_pending, 1, 1) == 1)
 		return;
 
 	spin_lock_irqsave(&vdev->lock, flags);
@@ -2034,8 +2019,7 @@ vusb_check_reset_device(struct vusb_device *vdev)
 }
 
 static void
-vusb_process_main(struct vusb_device *vdev, struct vusb_urbp *urbp,
-		bool process_reqs)
+vusb_process(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
 	struct vusb_urbp *pos;
@@ -2047,22 +2031,20 @@ vusb_process_main(struct vusb_device *vdev, struct vusb_urbp *urbp,
 
 	spin_lock_irqsave(&vdev->lock, flags);
 
-	/* Always drive any response processing. Even if it would get done by
-	 * the tasklet BH processing, this could make room for requests. */
+	/* Always drive any response processing since this could make room for
+	 * requests. */
 	list_for_each_entry_safe(pos, next, &vdev->finish_list, urbp_list) {
 		vusb_urb_finish(vdev, pos);
 	}
 
-	if (process_reqs) {
-		/* New URB, queue it at the back */
-		if (urbp)
-			list_add_tail(&urbp->urbp_list, &vdev->pending_list);
+	/* New URB, queue it at the back */
+	if (urbp)
+		list_add_tail(&urbp->urbp_list, &vdev->pending_list);
 
-		/* Drive request processing */
-		list_for_each_entry_safe(pos, next, &vdev->pending_list, urbp_list) {
-			/* Work scheduled if 1 or more URBs cannot be sent */
-			vusb_send_urb(vdev, pos);
-		}
+	/* Drive request processing */
+	list_for_each_entry_safe(pos, next, &vdev->pending_list, urbp_list) {
+		/* Work scheduled if 1 or more URBs cannot be sent */
+		vusb_send_urb(vdev, pos);
 	}
 
 	/* Copy off any urbps on the release list that need releasing */
@@ -2088,21 +2070,7 @@ vusb_work_handler(struct work_struct *work)
 	vusb_check_reset_device(vdev);
 
 	/* Start request processing again */
-	vusb_process_requests(vdev);
-
-	vusb_stop_processing(vdev);
-}
-
-static void
-vusb_bh_handler(unsigned long data)
-{
-	struct vusb_device *vdev = (struct vusb_device*)data;
-
-	if (!vusb_start_processing(vdev, __FUNCTION__))
-		return;
-
-	/* Process only responses in the BH */
-	vusb_process_responses(vdev);
+	vusb_process(vdev, NULL);
 
 	vusb_stop_processing(vdev);
 }
@@ -2182,7 +2150,7 @@ again:
 
 	spin_unlock_irqrestore(&vdev->lock, flags);
 
-	tasklet_schedule(&vdev->tasklet);
+	schedule_work(&vdev->work);
 
 	vusb_stop_processing(vdev);
 
@@ -2371,7 +2339,6 @@ vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 	INIT_LIST_HEAD(&vdev->finish_list);
 	init_waitqueue_head(&vdev->wait_queue);
 	INIT_WORK(&vdev->work, vusb_work_handler);
-	tasklet_init(&vdev->tasklet, vusb_bh_handler, (unsigned long)vdev);
 
 	/* Strap our vUSB device onto the Xen device context, etc. */
 	dev_set_drvdata(&dev->dev, vdev);
@@ -2443,6 +2410,10 @@ vusb_start_device(struct vusb_device *vdev)
 	case USB_SPEED_HIGH:
 		iprintk("Speed set to USB_SPEED_HIGH for device %p", vdev);
 		break;
+	case USB_SPEED_SUPER:
+		iprintk("Speed set to USB_SPEED_HIGH for "
+			"USB_SPEED_SUPER device %p", vdev);
+		break;
 	default:
 		wprintk("Warning, setting default USB_SPEED_HIGH"
 			" for device %p - original value: %d",
@@ -2508,10 +2479,6 @@ vusb_destroy_device(struct vusb_device *vdev)
 
 	/* Wait for all processing to stop now */
 	vusb_wait_stop_processing(vdev);
-
-	/* Now the irq handler will no longer process the ring, disable the
-	 * tasklet and wait for it to shutdown */
-	tasklet_disable(&vdev->tasklet);
 
 	/* Final device operations */
 	spin_lock_irqsave(&vdev->lock, flags);
