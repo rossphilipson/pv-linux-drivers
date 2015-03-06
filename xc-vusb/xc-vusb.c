@@ -228,7 +228,7 @@ struct vusb_rh_port {
 
 	/* Reset gate for port/device resets */
 	atomic_t			reset_pending;
-	atomic_t			reset_done;
+	bool				reset_done;
 };
 
 struct vusb_vhcd {
@@ -420,7 +420,7 @@ vusb_put_vport(struct vusb_vhcd *vhcd, struct vusb_rh_port *vport)
 	vport->closing = 0;
 	vport->processing = 0;
 	atomic_set(&vport->reset_pending, 0);
-	atomic_set(&vport->reset_done, 0);
+	vport->reset_done = false;
 	spin_unlock_irqrestore(&vhcd->lock, flags);
 }
 
@@ -2016,10 +2016,10 @@ vusb_check_reset_device(struct vusb_device *vdev)
 	}
 
 	/* Wait for the reset with no lock */
-	wait_event_interruptible(vdev->wait_queue, (atomic_read(&vport->reset_done) == 1));
+	wait_event_interruptible(vdev->wait_queue, (vport->reset_done));
 
 	/* Reset the reset gate */
-	atomic_set(&vport->reset_done, 0);
+	vport->reset_done = false;
 	atomic_set(&vport->reset_pending, 0);
 
 	spin_lock_irqsave(&vhcd->lock, flags);
@@ -2044,8 +2044,6 @@ vusb_process_main(struct vusb_device *vdev, struct vusb_urbp *urbp,
 	unsigned long flags;
 
 	INIT_LIST_HEAD(&tmp);
-
-	vusb_check_reset_device(vdev);
 
 	spin_lock_irqsave(&vdev->lock, flags);
 
@@ -2085,6 +2083,9 @@ vusb_work_handler(struct work_struct *work)
 
 	if (!vusb_start_processing(vdev, __FUNCTION__))
 		return;
+
+	/* First check for resets - only done in the work handler */
+	vusb_check_reset_device(vdev);
 
 	/* Start request processing again */
 	vusb_process_requests(vdev);
@@ -2143,7 +2144,7 @@ again:
 			}
 			else if (shadow->req.type == USBIF_T_RESET) {
 				/* clear reset, wake waiter */
-				atomic_set(&vport->reset_done, 1);
+				vport->reset_done = true;
 				wake_up(&vdev->wait_queue);
 			}
 
