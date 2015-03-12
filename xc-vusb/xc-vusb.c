@@ -1121,7 +1121,7 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 	}
 
 	for (i = 0; i < nr_mfns; i++, va += PAGE_SIZE) {
-		mfn = pfn_to_mfn(virt_to_phys(va) << PAGE_SHIFT);
+		mfn = pfn_to_mfn(virt_to_phys(va) >> PAGE_SHIFT);
 
 		ref = xc_gnttab_claim_grant_reference(&gref_head);
 		BUG_ON(ref == -ENOSPC);
@@ -1184,7 +1184,7 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 	 * the first indirect page. The first gref of the first page points
 	 * to the iso packet descriptor page. */
 	if (iso_addr) {
-		iso_mfn = pfn_to_mfn(virt_to_phys(iso_addr) << PAGE_SHIFT);
+		iso_mfn = pfn_to_mfn(virt_to_phys(iso_addr) >> PAGE_SHIFT);
 
 		ref = xc_gnttab_claim_grant_reference(&gref_head);
 		BUG_ON(ref == -ENOSPC);
@@ -1201,7 +1201,7 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 	}
 
 	for ( ; i < nr_mfns; i++, va += PAGE_SIZE) {
-		mfn = pfn_to_mfn(virt_to_phys(va) << PAGE_SHIFT);
+		mfn = pfn_to_mfn(virt_to_phys(va) >> PAGE_SHIFT);
 
 		ref = xc_gnttab_claim_grant_reference(&gref_head);
 		BUG_ON(ref == -ENOSPC);
@@ -2002,6 +2002,8 @@ vusb_check_reset_device(struct vusb_device *vdev)
 
 	/* Wait for the reset with no lock */
 	wait_event_interruptible(vdev->wait_queue, (vport->reset_done));
+
+	iprintk("Reset complete for vdev: %p on port: %d\n", vdev, vport->port);
 
 	/* Reset the reset gate */
 	vport->reset_done = false;
