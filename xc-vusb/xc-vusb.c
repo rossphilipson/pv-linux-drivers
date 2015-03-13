@@ -122,6 +122,7 @@
 #define vusb_vport_by_port(v, port) (&(v)->vrh_ports[(port) - 1])
 #define vusb_check_port(index) \
 	(((index) < 1 || (index) > VUSB_PORTS) ? false : true)
+#define vusb_dir_to_string(d) (d ? "IN" : "OUT")
 
 /* Possible state of an urbp */
 enum vusb_urbp_state {
@@ -1666,39 +1667,28 @@ vusb_urb_common_finish(struct vusb_device *vdev, struct vusb_urbp *urbp,
 	}
 
 	urb->status = vusb_status_to_errno(urbp->rsp.status);
-
-	if (!in) {
-		dprintk(D_URB2, "Outgoing URB completed status %d\n",
-			urb->status);
-		/* Sanity check on len, should be 0 */
-		if (urbp->rsp.actual_length) {
-			wprintk("Data not expected for outgoing URB\n");
-			urb->status = -EIO;
-		}
-		else if (!urb->status) {
-			/* Set actual to what we said we sent */
-			urb->actual_length = urb->transfer_buffer_length;
-		}
+	if (unlikely(urb->status)) {
+		wprintk("Failed %s URB urbp: %p urb: %p\n",
+			vusb_dir_to_string(in), urbp, urb);
+		return;
 	}
-	else {
-		dprintk(D_URB2, "Incoming URB completed status %d len %u\n",
-			urb->status, urbp->rsp.actual_length);
-		/* Sanity check on len, should be less or equal to
-		 * the length of the transfer buffer */
-		if (urbp->rsp.actual_length > urb->transfer_buffer_length) {
-			wprintk("Incoming URB too large (expect %u got %u)\n",
-				urb->transfer_buffer_length,
-				urbp->rsp.actual_length);
-			urb->status = -EIO;
-		}
-		else if (!urb->status) {
-			dprintk(D_URB2, "In %u bytes out of %u\n",
-				urbp->rsp.actual_length,
-				urb->transfer_buffer_length);
 
-			urb->actual_length = urbp->rsp.actual_length;
-		}
+	dprintk(D_URB2, "%s URB completed status %d len %u\n",
+		vusb_dir_to_string(in), urb->status, urbp->rsp.actual_length);
+
+	/* Sanity check on len, should be less or equal to
+	 * the length of the transfer buffer */
+	if (unlikely(in && urbp->rsp.actual_length >
+		urb->transfer_buffer_length)) {
+		wprintk("IN URB too large (expect %u got %u)\n",
+			urb->transfer_buffer_length,
+			urbp->rsp.actual_length);
+		urb->status = -EIO;
+		return;
 	}
+
+	/* Set to what the backend said we sent or received */
+	urb->actual_length = urbp->rsp.actual_length;
 }
 
 static void
@@ -1823,7 +1813,7 @@ vusb_send(struct vusb_device *vdev, struct vusb_urbp *urbp, int type)
 	int ret = (type != PIPE_ISOCHRONOUS) ?
 		vusb_put_urb(vdev, urbp) :
 		vusb_put_isochronous_urb(vdev, urbp);
-	switch (!ret) {
+	switch (ret) {
 	case 0:
 		urbp->state = VUSB_URBP_SENT;
 		break;
