@@ -224,6 +224,9 @@ struct vusb_rh_port {
 	/* Reset gate for port/device resets */
 	atomic_t			reset_pending;
 	bool				reset_done;
+
+	struct work_struct 		work;
+	wait_queue_head_t		wait_queue;
 };
 
 struct vusb_vhcd {
@@ -247,6 +250,8 @@ vusb_process(struct vusb_device *vdev, struct vusb_urbp *urbp);
 static int
 vusb_put_internal_request(struct vusb_device *vdev,
 		enum vusb_internal_cmd cmd, u64 cancel_id);
+static void
+vusb_port_work_handler(struct work_struct *work);
 
 /****************************************************************************/
 /* Miscellaneous Routines                                                   */
@@ -456,13 +461,18 @@ vusb_set_link_state(struct vusb_rh_port *vport)
 static void
 vusb_port_reset(struct vusb_vhcd *vhcd, struct vusb_rh_port *vport)
 {
-	printk(KERN_DEBUG"vusb: port reset %u 0x%08x",
+	printk(KERN_DEBUG "vusb: port reset %u 0x%08x",
 		   vport->port, vport->port_status);
 
 	vport->port_status |= USB_PORT_STAT_ENABLE | USB_PORT_STAT_POWER;
 
+	/* Test reset gate, only want one reset in flight at a time per
+	 * port. If the gate is set, it will return the "unless" value. */
+	if (__atomic_add_unless(&vport->reset_pending, 1, 1) == 1)
+		return;
+
 	/* Schedule it for the device, can't do it here in the vHCD lock */
-	schedule_work(&vport->vdev.work);
+	schedule_work(&vport->work);
 }
 
 static void
@@ -566,6 +576,8 @@ vusb_hcd_start(struct usb_hcd *hcd)
 	for (i = 0; i < VUSB_PORTS; i++) {
 		memset(&vhcd->vrh_ports[i], 0, sizeof(struct vusb_rh_port));
 		vhcd->vrh_ports[i].port = i + 1;
+		INIT_WORK(&vhcd->vrh_ports[i].work, vusb_port_work_handler);
+		init_waitqueue_head(&vhcd->vrh_ports[i].wait_queue);
 	}
 
 	/* Enable HCD/RH */
@@ -1901,6 +1913,62 @@ vusb_send_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 }
 
 /****************************************************************************/
+/* VUSB Port                                                                */
+
+static void
+vusb_process_reset(struct vusb_rh_port *vport)
+{
+	struct vusb_vhcd *vhcd = vport->vdev.vhcd;
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&vport->vdev.lock, flags);
+	ret = vusb_put_internal_request(&vport->vdev, VUSB_CMD_RESET, 0);
+	spin_unlock_irqrestore(&vport->vdev.lock, flags);
+
+	if (ret) {
+		eprintk("Failed to send reset for device %p on port %d - ret: %d\n",
+			&vport->vdev, vport->port, ret);
+		return;
+	}
+
+	/* Wait for the reset with no lock */
+	wait_event_interruptible(vport->wait_queue, (vport->reset_done));
+
+	iprintk("Reset complete for vdev: %p on port: %d\n",
+		&vport->vdev, vport->port);
+
+	/* Reset the reset gate */
+	vport->reset_done = false;
+	atomic_set(&vport->reset_pending, 0);
+
+	spin_lock_irqsave(&vhcd->lock, flags);
+	/* Signal reset completion */
+	vport->port_status |= (USB_PORT_STAT_C_RESET << 16);
+
+	vusb_set_link_state(vport);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+
+	/* Update RH outside of critical section */
+	usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
+}
+
+static void
+vusb_port_work_handler(struct work_struct *work)
+{
+	struct vusb_rh_port *vport = container_of(work, struct vusb_rh_port, work);
+
+	/* TODO make these port functions */
+	if (!vusb_start_processing(&vport->vdev, __FUNCTION__))
+		return;
+
+	/* Process port/device reset in port work */
+	vusb_process_reset(vport);
+
+	vusb_stop_processing(&vport->vdev);
+}
+
+/****************************************************************************/
 /* VUSB Devices                                                             */
 
 static bool
@@ -1968,49 +2036,6 @@ again:
 }
 
 static void
-vusb_check_reset_device(struct vusb_device *vdev)
-{
-	struct vusb_vhcd *vhcd = vdev->vhcd;
-	struct vusb_rh_port *vport =
-		container_of(vdev, struct vusb_rh_port, vdev);
-	unsigned long flags;
-	int ret;
-
-	/* Test reset gate, only want one reset in flight at a time per
-	 * port. If the gate is set, it will return the "unless" value. */
-	if (__atomic_add_unless(&vport->reset_pending, 1, 1) == 1)
-		return;
-
-	spin_lock_irqsave(&vdev->lock, flags);
-	ret = vusb_put_internal_request(vdev, VUSB_CMD_RESET, 0);
-	spin_unlock_irqrestore(&vdev->lock, flags);
-
-	if (ret) {
-		eprintk("Failed to send reset for device %p - ret: %d\n", vdev, ret);
-		return;
-	}
-
-	/* Wait for the reset with no lock */
-	wait_event_interruptible(vdev->wait_queue, (vport->reset_done));
-
-	iprintk("Reset complete for vdev: %p on port: %d\n", vdev, vport->port);
-
-	/* Reset the reset gate */
-	vport->reset_done = false;
-	atomic_set(&vport->reset_pending, 0);
-
-	spin_lock_irqsave(&vhcd->lock, flags);
-	/* Signal reset completion */
-	vport->port_status |= (USB_PORT_STAT_C_RESET << 16);
-
-	vusb_set_link_state(vport);
-	spin_unlock_irqrestore(&vhcd->lock, flags);
-
-	/* Update RH outside of critical section */
-	usb_hcd_poll_rh_status(vhcd_to_hcd(vhcd));
-}
-
-static void
 vusb_process(struct vusb_device *vdev, struct vusb_urbp *urbp)
 {
 	struct vusb_vhcd *vhcd = vdev->vhcd;
@@ -2051,15 +2076,12 @@ vusb_process(struct vusb_device *vdev, struct vusb_urbp *urbp)
 }
 
 static void
-vusb_work_handler(struct work_struct *work)
+vusb_device_work_handler(struct work_struct *work)
 {
 	struct vusb_device *vdev = container_of(work, struct vusb_device, work);
 
 	if (!vusb_start_processing(vdev, __FUNCTION__))
 		return;
-
-	/* First check for resets - only done in the work handler */
-	vusb_check_reset_device(vdev);
 
 	/* Start request processing again */
 	vusb_process(vdev, NULL);
@@ -2105,7 +2127,7 @@ again:
 			else if (shadow->req.type == USBIF_T_RESET) {
 				/* clear reset, wake waiter */
 				vport->reset_done = true;
-				wake_up(&vdev->wait_queue);
+				wake_up(&vport->wait_queue);
 			}
 
 			/* USBIF_T_CANCEL no waiters, no data*/
@@ -2329,8 +2351,8 @@ vusb_create_device(struct vusb_vhcd *vhcd, struct xenbus_device *dev, u16 id)
 	INIT_LIST_HEAD(&vdev->pending_list);
 	INIT_LIST_HEAD(&vdev->release_list);
 	INIT_LIST_HEAD(&vdev->finish_list);
+	INIT_WORK(&vdev->work, vusb_device_work_handler);
 	init_waitqueue_head(&vdev->wait_queue);
-	INIT_WORK(&vdev->work, vusb_work_handler);
 
 	/* Strap our vUSB device onto the Xen device context, etc. */
 	dev_set_drvdata(&dev->dev, vdev);
