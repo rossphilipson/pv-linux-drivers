@@ -123,6 +123,7 @@
 #define vusb_check_port(index) \
 	(((index) < 1 || (index) > VUSB_PORTS) ? false : true)
 #define vusb_dir_to_string(d) (d ? "IN" : "OUT")
+#define vusb_start_processing(v) vusb_start_processing_caller(v, (__FUNCTION__))
 
 /* Possible state of an urbp */
 enum vusb_urbp_state {
@@ -242,9 +243,10 @@ static struct platform_device *vusb_platform_device = NULL;
 static DEFINE_MUTEX(vusb_xen_pm_mutex);
 
 static bool
-vusb_start_processing(struct vusb_device *vdev, const char *caller);
+vusb_start_processing_caller(struct vusb_rh_port *vport,
+		const char *caller);
 static void
-vusb_stop_processing(struct vusb_device *vdev);
+vusb_stop_processing(struct vusb_rh_port *vport);
 static void
 vusb_process(struct vusb_device *vdev, struct vusb_urbp *urbp);
 static int
@@ -674,7 +676,7 @@ vusb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	vusb_process(vdev, urbp);
 
 	/* Finished processing */
-	vusb_stop_processing(vdev);
+	vusb_stop_processing(vport);
 
 	return 0;
 }
@@ -777,7 +779,7 @@ vusb_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 	/* Drive processing requests and responses */
 	vusb_process(vdev, NULL);
 
-	vusb_stop_processing(vdev);
+	vusb_stop_processing(vport);
 
 	return 0;
 }
@@ -1915,6 +1917,64 @@ vusb_send_urb(struct vusb_device *vdev, struct vusb_urbp *urbp)
 /****************************************************************************/
 /* VUSB Port                                                                */
 
+static bool
+vusb_start_processing_caller(struct vusb_rh_port *vport, const char *caller)
+{
+	struct vusb_vhcd *vhcd = vport->vdev.vhcd;
+	unsigned long flags;
+
+	spin_lock_irqsave(&vhcd->lock, flags);
+
+	if (vhcd->hcd_state == VUSB_HCD_INACTIVE || !vport->present) {
+		spin_unlock_irqrestore(&vhcd->lock, flags);
+		eprintk("%s called start processing - device %p "
+			"invalid state - vhcd: %d vport: %d\n",
+			caller, &vport->vdev, vhcd->hcd_state, vport->present);
+		return false;
+	}
+
+	if (vport->closing) {
+		/* Normal, shutdown of this device pending */
+		spin_unlock_irqrestore(&vhcd->lock, flags);
+		return false;
+	}
+
+	vport->processing++;
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+
+	return true;
+}
+
+static void
+vusb_stop_processing(struct vusb_rh_port *vport)
+{
+	struct vusb_vhcd *vhcd = vport->vdev.vhcd;
+	unsigned long flags;
+
+	spin_lock_irqsave(&vhcd->lock, flags);
+	vport->processing--;
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+}
+
+static void
+vusb_wait_stop_processing(struct vusb_rh_port *vport)
+{
+	struct vusb_vhcd *vhcd = vport->vdev.vhcd;
+	unsigned long flags;
+
+again:
+	spin_lock_irqsave(&vhcd->lock, flags);
+
+	if (vport->processing > 0) {
+		spin_unlock_irqrestore(&vhcd->lock, flags);
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule_timeout(HZ);
+		goto again;
+	}
+
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+}
+
 static void
 vusb_process_reset(struct vusb_rh_port *vport)
 {
@@ -1958,82 +2018,17 @@ vusb_port_work_handler(struct work_struct *work)
 {
 	struct vusb_rh_port *vport = container_of(work, struct vusb_rh_port, work);
 
-	/* TODO make these port functions */
-	if (!vusb_start_processing(&vport->vdev, __FUNCTION__))
+	if (!vusb_start_processing(vport))
 		return;
 
 	/* Process port/device reset in port work */
 	vusb_process_reset(vport);
 
-	vusb_stop_processing(&vport->vdev);
+	vusb_stop_processing(vport);
 }
 
 /****************************************************************************/
 /* VUSB Devices                                                             */
-
-static bool
-vusb_start_processing(struct vusb_device *vdev, const char *caller)
-{
-	struct vusb_vhcd *vhcd = vdev->vhcd;
-	struct vusb_rh_port *vport =
-		container_of(vdev, struct vusb_rh_port, vdev);
-	unsigned long flags;
-
-	spin_lock_irqsave(&vhcd->lock, flags);
-
-	if (vhcd->hcd_state == VUSB_HCD_INACTIVE || !vport->present) {
-		spin_unlock_irqrestore(&vhcd->lock, flags);
-		eprintk("%s called start processing - device %p "
-			"invalid state - vhcd: %d vport: %d\n",
-			caller, vdev, vhcd->hcd_state, vport->present);
-		return false;
-	}
-
-	if (vport->closing) {
-		/* Normal, shutdown of this device pending */
-		spin_unlock_irqrestore(&vhcd->lock, flags);
-		return false;
-	}
-
-	vport->processing++;
-	spin_unlock_irqrestore(&vhcd->lock, flags);
-
-	return true;
-}
-
-static void
-vusb_stop_processing(struct vusb_device *vdev)
-{
-	struct vusb_vhcd *vhcd = vdev->vhcd;
-	struct vusb_rh_port *vport =
-		container_of(vdev, struct vusb_rh_port, vdev);
-	unsigned long flags;
-
-	spin_lock_irqsave(&vhcd->lock, flags);
-	vport->processing--;
-	spin_unlock_irqrestore(&vhcd->lock, flags);
-}
-
-static void
-vusb_wait_stop_processing(struct vusb_device *vdev)
-{
-	struct vusb_vhcd *vhcd = vdev->vhcd;
-	struct vusb_rh_port *vport =
-		container_of(vdev, struct vusb_rh_port, vdev);
-	unsigned long flags;
-
-again:
-	spin_lock_irqsave(&vhcd->lock, flags);
-
-	if (vport->processing > 0) {
-		spin_unlock_irqrestore(&vhcd->lock, flags);
-		set_current_state(TASK_INTERRUPTIBLE);
-		schedule_timeout(HZ);
-		goto again;
-	}
-
-	spin_unlock_irqrestore(&vhcd->lock, flags);
-}
 
 static void
 vusb_process(struct vusb_device *vdev, struct vusb_urbp *urbp)
@@ -2079,14 +2074,16 @@ static void
 vusb_device_work_handler(struct work_struct *work)
 {
 	struct vusb_device *vdev = container_of(work, struct vusb_device, work);
+	struct vusb_rh_port *vport =
+		container_of(vdev, struct vusb_rh_port, vdev);
 
-	if (!vusb_start_processing(vdev, __FUNCTION__))
+	if (!vusb_start_processing(vport))
 		return;
 
 	/* Start request processing again */
 	vusb_process(vdev, NULL);
 
-	vusb_stop_processing(vdev);
+	vusb_stop_processing(vport);
 }
 
 static irqreturn_t
@@ -2102,7 +2099,7 @@ vusb_interrupt(int irq, void *dev_id)
 	int more;
 
 	/* Shutting down or not ready? */
-	if (!vusb_start_processing(vdev, __FUNCTION__))
+	if (!vusb_start_processing(vport))
 		return IRQ_HANDLED;
 
 	spin_lock_irqsave(&vdev->lock, flags);
@@ -2166,7 +2163,7 @@ again:
 
 	schedule_work(&vdev->work);
 
-	vusb_stop_processing(vdev);
+	vusb_stop_processing(vport);
 
 	return IRQ_HANDLED;
 }
@@ -2489,10 +2486,11 @@ vusb_destroy_device(struct vusb_device *vdev)
 	xc_gnttab_cancel_free_callback(&vdev->callback);
 
 	/* Shutdown all work. Must be done with no locks held. */
+	flush_work_sync(&vport->work);
 	flush_work_sync(&vdev->work);
 
 	/* Wait for all processing to stop now */
-	vusb_wait_stop_processing(vdev);
+	vusb_wait_stop_processing(vport);
 
 	/* Final device operations */
 	spin_lock_irqsave(&vdev->lock, flags);
