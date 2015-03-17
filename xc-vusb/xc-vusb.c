@@ -2184,7 +2184,7 @@ vusb_usbif_free(struct vusb_device *vdev, int suspend)
 
 	if (vdev->irq)
 		xc_unbind_from_irqhandler(vdev->irq, vdev);
-	vdev->evtchn = vdev->irq = 0;
+	vdev->irq = 0;
 
 	if (vdev->evtchn != EVTCHN_INVALID)
 		xenbus_free_evtchn(dev, vdev->evtchn);
