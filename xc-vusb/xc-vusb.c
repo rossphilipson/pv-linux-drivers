@@ -2186,8 +2186,12 @@ vusb_usbif_free(struct vusb_device *vdev, int suspend)
 		xc_unbind_from_irqhandler(vdev->irq, vdev);
 	vdev->irq = 0;
 
+	/* TODO this is a mess. Calling this crashes the kernel and somebody's
+	 * "fix" was to just not call this anywhere and leak stuff O_o
+	 * Taking it out for now - fix it in the move to upstream pv drivers.
 	if (vdev->evtchn != EVTCHN_INVALID)
-		xenbus_free_evtchn(dev, vdev->evtchn);
+		xenbus_free_evtchn(dev, vdev->evtchn);*/
+	dev = dev;
 	vdev->evtchn = EVTCHN_INVALID;
 
 	if (vdev->shadows) {
