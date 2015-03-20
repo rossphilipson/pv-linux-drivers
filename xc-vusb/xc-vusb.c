@@ -1114,7 +1114,7 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 {
 	grant_ref_t gref_head;
 	unsigned long mfn;
-	u8 *va = (u8*)((unsigned long)addr & PAGE_MASK);
+	u8 *va = (u8*)addr;
 	u32 ref, nr_mfns = SPAN_PAGES(addr, length);
 	int i, ret;
 
@@ -1136,7 +1136,7 @@ vusb_allocate_grefs(struct vusb_device *vdev, struct vusb_shadow *shadow,
 	}
 
 	for (i = 0; i < nr_mfns; i++, va += PAGE_SIZE) {
-		mfn = pfn_to_mfn(virt_to_phys(va) >> PAGE_SHIFT);
+		mfn = PFN_DOWN(arbitrary_virt_to_machine(va).maddr);
 
 		ref = xc_gnttab_claim_grant_reference(&gref_head);
 		BUG_ON(ref == -ENOSPC);
@@ -1166,7 +1166,7 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 	unsigned long mfn, iso_mfn;
 	u32 nr_mfns = SPAN_PAGES(addr, length);
 	grant_ref_t gref_head;
-	u8 *va = (u8*)((unsigned long)addr & PAGE_MASK);
+	u8 *va = (u8*)addr;
 	u32 nr_total = nr_mfns + (iso_addr ? 1 : 0);
 	u32 ref;
 	int iso_frame = (iso_addr ? 1 : 0);
@@ -1199,7 +1199,7 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 	 * the first indirect page. The first gref of the first page points
 	 * to the iso packet descriptor page. */
 	if (iso_addr) {
-		iso_mfn = pfn_to_mfn(virt_to_phys(iso_addr) >> PAGE_SHIFT);
+		iso_mfn = PFN_DOWN(arbitrary_virt_to_machine(iso_addr).maddr);
 
 		ref = xc_gnttab_claim_grant_reference(&gref_head);
 		BUG_ON(ref == -ENOSPC);
@@ -1216,7 +1216,7 @@ vusb_allocate_indirect_grefs(struct vusb_device *vdev,
 	}
 
 	for ( ; i < nr_mfns; i++, va += PAGE_SIZE) {
-		mfn = pfn_to_mfn(virt_to_phys(va) >> PAGE_SHIFT);
+		mfn = PFN_DOWN(arbitrary_virt_to_machine(va).maddr);
 
 		ref = xc_gnttab_claim_grant_reference(&gref_head);
 		BUG_ON(ref == -ENOSPC);
