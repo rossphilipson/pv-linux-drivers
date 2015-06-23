@@ -22,7 +22,7 @@ ifneq ($(FROM_DKMS),y)
 include Kbuild
 else
 KDIR := /lib/modules/${KVERSION}/build
-ENOSTDINC_FLAGS := -I$(CURDIR)/../include
+ENOSTDINC_FLAGS := -I$(CURDIR)/include
 
 mdkms:
 	make -C $(KDIR) FROM_DKMS=n NOSTDINC_FLAGS="$(ENOSTDINC_FLAGS)" M=$(CURDIR) modules EXTRA_CFLAGS="-g -O2"
@@ -35,7 +35,7 @@ else
 KVERSION ?= $(shell uname -r)
 
 KDIR := /lib/modules/${KVERSION}/build
-export NOSTDINC_FLAGS := -I$(CURDIR)/../include
+export NOSTDINC_FLAGS := -I$(CURDIR)/include
 
 all:
 	make -C $(KDIR) V=1 M=$(CURDIR) modules EXTRA_CFLAGS="-g -O2"
