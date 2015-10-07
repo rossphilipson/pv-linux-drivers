@@ -173,7 +173,9 @@ struct vusb_device {
 	spinlock_t			lock;
 	u16				address;
 	enum usb_device_speed		speed;
+#if 0 /* xHCI */
 	bool				is_ss;
+#endif
 	bool				rflush;
 	bool				resuming;
 
@@ -2708,10 +2710,13 @@ vusb_start_device(struct vusb_device *vdev)
 		iprintk("Speed set to USB_SPEED_HIGH for device %p", vdev);
 		break;
 	case USB_SPEED_SUPER:
+#if 0 /* xHCI */
 		iprintk("Speed set to USB_SPEED_HIGH for "
 			"USB_SPEED_SUPER device %p", vdev);
 		vdev->speed = USB_SPEED_HIGH;
 		vdev->is_ss = true;
+#endif
+		iprintk("Speed set to USB_SPEED_SUPER for device %p", vdev);
 		break;
 	default:
 		wprintk("Warning, setting default USB_SPEED_HIGH"
