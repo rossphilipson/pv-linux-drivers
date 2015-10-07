@@ -29,7 +29,8 @@
 /* TODO
  * Use DMA buffers
  * Handle errors on internal cmds
- * Refactor vusb_put_urb and vusb_put_isochronous_urb into one function.
+ * Better error handling - logging is too noisy.
+ * xHCI stream support maybe.
  */
 
 #include <linux/mm.h>
@@ -117,6 +118,9 @@
 #else
 # define USBFRONT_IRQF IRQF_SAMPLE_RANDOM
 #endif
+
+/* xHCI */
+#define VUSB_SLOTS 256
 
 /* Port are numbered from 1 in linux */
 #define vusb_vdev_by_port(v, port) (&((v)->vrh_ports[(port) - 1].vdev))
@@ -241,6 +245,9 @@ struct vusb_vhcd {
 	enum vusb_rh_state		rh_state;
 
 	struct vusb_rh_port		vrh_ports[VUSB_PORTS];
+
+	/* xHCI */
+	bool				dev_ctx_slots[VUSB_SLOTS];
 };
 
 static struct platform_device *vusb_platform_device = NULL;
@@ -992,12 +999,134 @@ vusb_hcd_bus_resume(struct usb_hcd *hcd)
 }
 #endif /* CONFIG_PM */
 
+static int
+vusb_xhci_alloc_dev(struct usb_hcd *hcd, struct usb_device *udev)
+{
+	struct vusb_vhcd *vhcd = hcd_to_vhcd(hcd);
+	unsigned long flags;
+	int i;
+
+	spin_lock_irqsave(&vhcd->lock, flags);
+	/* Skip slot 0, that is the scratch pad slot */
+	for (i = 1; i < VUSB_SLOTS; i++) {
+		if (!vhcd->dev_ctx_slots[i]) {
+			vhcd->dev_ctx_slots[i] = true;
+			udev->slot_id = i;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+
+	/* Return 0 if no slots available */
+	if (i == VUSB_SLOTS)
+		return 0;
+
+	return 1;
+}
+
+static void
+vusb_xhci_free_dev(struct usb_hcd *hcd, struct usb_device *udev)
+{
+	struct vusb_vhcd *vhcd = hcd_to_vhcd(hcd);
+	unsigned long flags;
+
+	if ((udev->slot_id < 1)||(udev->slot_id >= VUSB_SLOTS)) {
+		eprintk("freeing invalid slot_id: %d\n", udev->slot_id);
+		return;
+	}
+
+	spin_lock_irqsave(&vhcd->lock, flags);
+		if (vhcd->dev_ctx_slots[udev->slot_id])
+			vhcd->dev_ctx_slots[udev->slot_id] = false;
+		else
+			eprintk("freeing unused slot_id: %d\n", udev->slot_id);
+	spin_unlock_irqrestore(&vhcd->lock, flags);
+}
+
+static int
+vusb_xhci_alloc_streams(struct usb_hcd *hcd, struct usb_device *udev,
+			struct usb_host_endpoint **eps, unsigned int num_eps,
+			unsigned int num_streams, gfp_t mem_flags)
+{
+	/*
+	 * This call can fail if any endpoints only support one stream
+	 * (meaning the ep doesn't support streams). This allows an easy
+	 * out for this now - just pretend none do.
+	 */
+	return -EINVAL;
+}
+
+static int
+vusb_xhci_free_streams(struct usb_hcd *hcd, struct usb_device *udev,
+			struct usb_host_endpoint **eps, unsigned int num_eps,
+			gfp_t mem_flags)
+{
+	wprintk("attempting to free streams; xHCI streams not supported.\n");
+	return 0;
+}
+
+static int
+vusb_xhci_add_endpoint(struct usb_hcd *hcd, struct usb_device *udev,
+			struct usb_host_endpoint *ep)
+{
+	return 0;
+}
+
+static int
+vusb_xhci_drop_endpoint(struct usb_hcd *hcd, struct usb_device *udev,
+			struct usb_host_endpoint *ep)
+{
+	return 0;
+}
+
+static int
+vusb_xhci_check_bandwidth(struct usb_hcd *hcd, struct usb_device *udev)
+{
+	return 0;
+}
+
+static void
+vusb_xhci_reset_bandwidth(struct usb_hcd *hcd, struct usb_device *udev)
+{
+}
+
+static int
+vusb_xhci_address_device(struct usb_hcd *hcd, struct usb_device *udev)
+{
+	return 0;
+}
+
+#if ( LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0) )
+static int
+vusb_xhci_enable_device(struct usb_hcd *hcd, struct usb_device *udev)
+{
+	return 0;
+}
+#endif
+
+static int
+vusb_xhci_update_hub_device(struct usb_hcd *hcd, struct usb_device *hdev,
+				struct usb_tt *tt, gfp_t mem_flags)
+{
+	return 0;
+}
+
+static int
+vusb_xhci_reset_device(struct usb_hcd *hcd, struct usb_device *udev)
+{
+	return 0;
+}
+
 static const struct hc_driver vusb_hcd_driver = {
 	.description = VUSB_HCD_DRIVER_NAME,
 	.product_desc =	VUSB_DRIVER_DESC,
 	.hcd_priv_size = sizeof(struct vusb_vhcd),
 
+	/* xHCI */
+#if 0
 	.flags = HCD_USB2,
+#endif
+	.flags = HCD_USB3,
 
 	/* .reset not used since our HCD is so simple, everything is done in start */
 	.start = vusb_hcd_start,
@@ -1014,6 +1143,24 @@ static const struct hc_driver vusb_hcd_driver = {
 	.bus_suspend = vusb_hcd_bus_suspend,
 	.bus_resume = vusb_hcd_bus_resume,
 #endif /* CONFIG_PM */
+
+	/* xHCI */
+	.alloc_dev = vusb_xhci_alloc_dev,
+	.free_dev = vusb_xhci_free_dev,
+	.alloc_streams = vusb_xhci_alloc_streams,
+	.free_streams =	vusb_xhci_free_streams,
+	.add_endpoint =	vusb_xhci_add_endpoint,
+	.drop_endpoint = vusb_xhci_drop_endpoint,
+	.check_bandwidth = vusb_xhci_check_bandwidth,
+	.reset_bandwidth = vusb_xhci_reset_bandwidth,
+	.address_device = vusb_xhci_address_device,
+#if ( LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0) )
+	.enable_device = vusb_xhci_enable_device,
+#endif
+	.update_hub_device = vusb_xhci_update_hub_device,
+	.reset_device = vusb_xhci_reset_device
+
+	/* Leave out Link Power Management, it doesn't need to supported. */
 };
 
 /****************************************************************************/
@@ -1746,9 +1893,11 @@ vusb_urb_control_finish(struct vusb_device *vdev, struct vusb_urbp *urbp)
 	struct urb *urb = urbp->urb;
 	struct usb_ctrlrequest *ctrl
 		= (struct usb_ctrlrequest *)urb->setup_packet;
-	u8 *buf = (u8*)urb->transfer_buffer;
+	/* xHCI u8 *buf = (u8*)urb->transfer_buffer; */
 	bool in;
 
+/* xHCI */
+#if 0
 	/*
 	 * This is fun. If a USB 3 device is in a USB 3 port, we get a USB 3
 	 * device descriptor. Since we are a USB 2 HCD, things get unhappy
@@ -1764,6 +1913,7 @@ vusb_urb_control_finish(struct vusb_device *vdev, struct vusb_urbp *urbp)
 		buf[3] = 0x02;
 		buf[7] = 0x40;
 	}
+#endif
 
 	/* Get direction of control request and do common finish */
 	in = ((ctrl->bRequestType & USB_DIR_IN) != 0) ? true : false;
