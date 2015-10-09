@@ -54,6 +54,14 @@
 
 #include <linux/usb/hcd.h>
 
+/* Missing defs in older kernels */
+#ifndef HUB_CHAR_NO_LPSM
+#define HUB_CHAR_NO_LPSM        0x0002 /* no power switching */
+#endif
+#ifndef HUB_CHAR_INDV_PORT_OCPM
+#define HUB_CHAR_INDV_PORT_OCPM 0x0008 /* per-port Over-current reporting */
+#endif
+
 #define VUSB_INTERFACE_VERSION		3
 #define VUSB_INVALID_REQ_ID		((u64)-1)
 
@@ -536,20 +544,20 @@ vusb_clear_port_feature(struct vusb_rh_port *vport, u16 val)
 	}
 }
 
-/* Hub descriptor */
+/* Hub descriptor - EHCI */
 static void
-vusb_hub_descriptor(struct usb_hub_descriptor *desc)
+vusb_usb2_hub_descriptor(struct usb_hub_descriptor *desc)
 {
 	u16 temp;
 
-	desc->bDescriptorType = 0x29;
+	desc->bDescriptorType = USB_DT_HUB;
 	desc->bPwrOn2PwrGood = 10; /* EHCI 1.0, 2.3.9 says 20ms max */
 	desc->bHubContrCurrent = 0;
 	desc->bNbrPorts = VUSB_PORTS;
 
 	/* Size of DeviceRemovable and PortPwrCtrlMask fields */
 	temp = 1 + (VUSB_PORTS / 8);
-	desc->bDescLength = 7 + 2 * temp;
+	desc->bDescLength = USB_DT_HUB_NONVAR_SIZE + 2 * temp;
 
 	/* Bitmaps for DeviceRemovable and PortPwrCtrlMask */
 
@@ -558,8 +566,39 @@ vusb_hub_descriptor(struct usb_hub_descriptor *desc)
 	memset(&desc->u.hs.DeviceRemovable[temp], 0xff, temp);
 
 	/* Per-port over current reporting and no power switching */
-	temp = 0x00a;
+	temp = HUB_CHAR_NO_LPSM|HUB_CHAR_INDV_PORT_OCPM;
 	desc->wHubCharacteristics = cpu_to_le16(temp);
+}
+
+/* Hub descriptor - xHCI */
+static void
+vusb_usb3_hub_descriptor(struct usb_hub_descriptor *desc)
+{
+	u16 temp;
+
+	desc->bDescriptorType = USB_DT_SS_HUB;
+	desc->bPwrOn2PwrGood = 10; /* EHCI 1.0, 2.3.9 says 20ms max */
+	desc->bHubContrCurrent = 0;
+	desc->bNbrPorts = VUSB_PORTS;
+
+	desc->bDescLength = USB_DT_SS_HUB_SIZE;
+
+	/* Per-port over current reporting and no power switching */
+	temp = HUB_CHAR_NO_LPSM|HUB_CHAR_INDV_PORT_OCPM;
+	desc->wHubCharacteristics = cpu_to_le16(temp);
+
+	/*
+	 * Header decode latency should be zero for roothubs,
+         * see section 4.23.5.2.
+         */
+        desc->u.ss.bHubHdrDecLat = 0;
+        desc->u.ss.wHubDelay = 0;
+
+	/*
+	 * TODO this needs more attention but the xhci driver on Linux always
+	 * reports 0 so this will suffice for now.
+	 */
+	desc->u.ss.DeviceRemovable = 0;
 }
 
 static int
@@ -913,7 +952,10 @@ vusb_hcd_hub_control(struct usb_hcd *hcd, u16 type_req, u16 value,
 		vusb_clear_port_feature(vusb_vport_by_port(vhcd, index), value);
 		break;
 	case GetHubDescriptor:
-		vusb_hub_descriptor((struct usb_hub_descriptor *)buf);
+		if (hcd->flags & HCD_USB3)
+			vusb_usb3_hub_descriptor((struct usb_hub_descriptor *)buf);
+		else
+			vusb_usb2_hub_descriptor((struct usb_hub_descriptor *)buf);
 		break;
 	case GetHubStatus:
 		/* Always local power supply good and no over-current exists. */
